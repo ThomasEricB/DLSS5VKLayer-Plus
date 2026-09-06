@@ -227,7 +227,7 @@ struct InstanceChain {
 };
 
 #define DEVICE_FN_LIST(X) \
-    X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) \
+    X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkGetDeviceQueue2) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) \
     X(vkGetSwapchainImagesKHR) X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkCreateCommandPool) \
     X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
@@ -431,20 +431,37 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
     delete dc;
 }
 
+static DeviceChain* FindDevice(VkDevice device) {
+    std::lock_guard<std::mutex> lk(g_stateMutex);
+    auto it = g_devices.find(device);
+    return it == g_devices.end() ? nullptr : it->second;
+}
+
+static void RememberQueue(DeviceChain* dc, VkQueue queue, uint32_t family) {
+    if (!queue) return;
+    std::lock_guard<std::mutex> lk(dc->lock);
+    dc->queueFamilies[queue] = family;
+}
+
 static VKAPI_ATTR void VKAPI_CALL Hook_GetDeviceQueue(VkDevice device, uint32_t family,
                                                       uint32_t index, VkQueue* pQueue) {
-    DeviceChain* dc = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_stateMutex);
-        auto it = g_devices.find(device);
-        if (it != g_devices.end()) dc = it->second;
-    }
+    DeviceChain* dc = FindDevice(device);
     if (!dc || !dc->vkGetDeviceQueue) return;
     dc->vkGetDeviceQueue(device, family, index, pQueue);
-    if (*pQueue) {
-        std::lock_guard<std::mutex> lk(dc->lock);
-        dc->queueFamilies[*pQueue] = family;
-    }
+    RememberQueue(dc, *pQueue, family);
+}
+
+// The 1.1 way of asking for a queue, and the only way to reach one created with
+// VkDeviceQueueCreateFlags. A game that uses it never registered its queue through the hook above,
+// so the present path could not tell which family the queue belonged to and fell back to family
+// zero -- which is the family the command pool was then created on, and need not be the queue's.
+static VKAPI_ATTR void VKAPI_CALL Hook_GetDeviceQueue2(VkDevice device,
+                                                       const VkDeviceQueueInfo2* pQueueInfo,
+                                                       VkQueue* pQueue) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->vkGetDeviceQueue2) return;
+    dc->vkGetDeviceQueue2(device, pQueueInfo, pQueue);
+    if (pQueueInfo) RememberQueue(dc, *pQueue, pQueueInfo->queueFamilyIndex);
 }
 
 // ---------------------------------------------------------------------------
@@ -771,6 +788,7 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
     if (!std::strcmp(n, "vkCreateDevice")) return (PFN_vkVoidFunction)Hook_CreateDevice;
     if (!std::strcmp(n, "vkDestroyDevice")) return (PFN_vkVoidFunction)Hook_DestroyDevice;
     if (!std::strcmp(n, "vkGetDeviceQueue")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue;
+    if (!std::strcmp(n, "vkGetDeviceQueue2")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue2;
     if (!std::strcmp(n, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction)Hook_CreateSwapchainKHR;
     if (!std::strcmp(n, "vkDestroySwapchainKHR")) return (PFN_vkVoidFunction)Hook_DestroySwapchainKHR;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
@@ -780,6 +798,7 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
 static PFN_vkVoidFunction LookupDeviceHook(const char* n) {
     if (!std::strcmp(n, "vkDestroyDevice")) return (PFN_vkVoidFunction)Hook_DestroyDevice;
     if (!std::strcmp(n, "vkGetDeviceQueue")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue;
+    if (!std::strcmp(n, "vkGetDeviceQueue2")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue2;
     if (!std::strcmp(n, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction)Hook_CreateSwapchainKHR;
     if (!std::strcmp(n, "vkDestroySwapchainKHR")) return (PFN_vkVoidFunction)Hook_DestroySwapchainKHR;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
