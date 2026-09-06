@@ -269,6 +269,10 @@ struct DeviceChain {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice self = VK_NULL_HANDLE;
     PFN_vkGetDeviceProcAddr next_dpa = nullptr;
+
+    // The loader's hook for installing a dispatch table on a dispatchable object a layer creates.
+    // Handed to every layer in its own VkLayerDeviceCreateInfo node; see Hook_CreateDevice.
+    PFN_vkSetDeviceLoaderData setDeviceLoaderData = nullptr;
 #define X(name) PFN_##name name = nullptr;
     DEVICE_FN_LIST(X)
 #undef X
@@ -412,6 +416,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     auto create = (PFN_vkCreateDevice)next_gipa(VK_NULL_HANDLE, "vkCreateDevice");
     if (!create) return VK_ERROR_INITIALIZATION_FAILED;
 
+    // A second node in the same chain carries vkSetDeviceLoaderData. Every dispatchable object this
+    // layer allocates has to be passed through it; see SetLoaderData below for why.
+    PFN_vkSetDeviceLoaderData setLoaderData = nullptr;
+    for (const auto* n = (const VkLayerDeviceCreateInfo*)pCreateInfo->pNext; n;
+         n = (const VkLayerDeviceCreateInfo*)n->pNext) {
+        if (n->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO &&
+            n->function == VK_LOADER_DATA_CALLBACK) {
+            setLoaderData = n->u.pfnSetDeviceLoaderData;
+            break;
+        }
+    }
+
     InstanceChain* ic = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_stateMutex);
@@ -428,6 +444,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     dc->physical = physicalDevice;
     dc->self = *pDevice;
     dc->next_dpa = next_dpa;
+    dc->setDeviceLoaderData = setLoaderData;
 #define X(name) dc->name = (PFN_##name)next_dpa(*pDevice, #name);
     DEVICE_FN_LIST(X)
 #undef X
@@ -610,6 +627,24 @@ static uint32_t ChooseHostMemoryType(const VkPhysicalDeviceMemoryProperties& mp,
     return best >= 0 ? (uint32_t)best : UINT32_MAX;
 }
 
+// Give a dispatchable object this layer allocated the dispatch table the loader expects on it.
+//
+// VkCommandBuffer and VkQueue are dispatchable: their first word points at a dispatch table, and
+// every layer below reads it to find its own state for that object. The loader fills that word in
+// for objects the application allocates through the trampoline -- but a layer that allocates one by
+// calling straight down the chain bypasses the trampoline, so the loader never sees it and the word
+// keeps whatever the ICD left there. The loader hands each layer vkSetDeviceLoaderData precisely so
+// it can do that fill-in itself, and calling it is mandatory, not advisory.
+//
+// Skipping it is invisible with no other layer present: the next call goes straight to the driver,
+// which does not read the word. Add any second layer -- Steam's overlay, MangoHud, validation -- and
+// that layer reads the word, finds the ICD's loader magic instead of a table, and aborts. Validation
+// says so out loud: 'The VkDevice dispatch handle was not found and Validation will crash.'
+static bool SetLoaderData(DeviceChain* dc, void* object) {
+    if (!dc->setDeviceLoaderData) return true;  // no loader in the chain; nothing to fill in
+    return dc->setDeviceLoaderData(dc->self, object) == VK_SUCCESS;
+}
+
 static bool CreateResources(DeviceChain* dc, SwapchainState& sc, uint32_t family) {
     VkDevice d = dc->self;
     size_t bytes = size_t(sc.width) * sc.height * 4;
@@ -640,6 +675,10 @@ static bool CreateResources(DeviceChain* dc, SwapchainState& sc, uint32_t family
     VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     cbai.commandPool = sc.pool; cbai.commandBufferCount = 1;
     if (dc->vkAllocateCommandBuffers(d, &cbai, &sc.cb) != VK_SUCCESS) return false;
+    if (!SetLoaderData(dc, sc.cb)) {
+        Log("[layer] vkSetDeviceLoaderData failed for the present command buffer");
+        return false;
+    }
     VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     if (dc->vkCreateFence(d, &fci, nullptr, &sc.fence) != VK_SUCCESS) return false;
 
