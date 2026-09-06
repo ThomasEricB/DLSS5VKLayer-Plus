@@ -20,13 +20,14 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
 #include <string>
 
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
-static constexpr uint32_t kShmVersion = 2;
+static constexpr uint32_t kShmVersion = 3;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
@@ -299,6 +300,23 @@ struct ShmHeader {
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
+
+// The layout, pinned.
+//
+// Every process that maps this file agrees on where each field is only because they were compiled
+// from the same header. A field inserted anywhere but the end silently moves everything after it, and
+// a build that has not caught up then reads its neighbour's value -- which is not a crash, it is a
+// status display quietly reporting 4861 for a flag that is 0 or 1, and it took a nonsensical number
+// on screen to notice.
+//
+// The version check already existed to prevent exactly that; what was missing was anything to make
+// someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
+// then update these numbers.
+static_assert(sizeof(ShmHeader) == 1860, "the header layout changed -- bump kShmVersion");
+static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
+static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
+static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
+static_assert(offsetof(ShmHeader, pass) == 780, "layout changed -- bump kShmVersion");
 
 inline uint32_t FloatToBits(float f) {
     uint32_t u = 0;

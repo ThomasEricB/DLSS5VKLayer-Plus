@@ -118,6 +118,11 @@ struct ShmMap {
     size_t mappedFrameBytes = 0;
     uint32_t seq = 0;
     uint32_t timeouts = 0;
+
+    // Liveness, so a game is never made to wait on a helper that is not there.
+    uint32_t firstHeartbeat = 0;
+    bool everAnswered = false;
+    double retryAfterMs = 0.0;
     uint32_t lastControlSeq = 0;
     uint32_t lastHeartbeat = 0;
     bool dead = false;
@@ -201,6 +206,7 @@ static bool ShmOpen(ShmMap& s) {
         ShmInitDefaults(s.hdr);
     }
     s.lastHeartbeat = s.hdr->heartbeat.load();
+    s.firstHeartbeat = s.lastHeartbeat;
     Log("[shm] attached %s seq_req=%u seq_resp=%u", p.c_str(),
         s.hdr->seq_req.load(), s.hdr->seq_resp.load());
     return true;
@@ -221,10 +227,14 @@ static bool ShmNeuralEnabled(ShmMap& s) {
     const uint32_t hb = s.hdr->heartbeat.load();
     if (hb != s.lastHeartbeat) {
         s.lastHeartbeat = hb;
-        if (s.dead && ::ShmNeuralEnabled(s.hdr)) {
+        // A heartbeat alone is not a reason to try again immediately. The helper ticks it while it
+        // sits idle, so a helper that is up but not answering used to re-enable the layer the moment
+        // it had given up -- which cost the game another round of full-length waits, over and over.
+        // That is the stutter: recover, stall, give up, recover.
+        if (s.dead && NowMs() >= s.retryAfterMs && ::ShmNeuralEnabled(s.hdr)) {
             s.dead = false;
             s.timeouts = 0;
-            Log("[shm] helper heartbeat, re-enabling");
+            Log("[shm] helper heartbeat, trying again");
         }
     }
     if (s.dead) return false;
@@ -255,11 +265,23 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
     uint32_t req = s.hdr->seq_req.load() + 1;
     s.hdr->seq_req.store(req);
 
+    // How long this frame may wait, which is a question about whether anyone is listening.
+    //
+    // A live helper needs real time: the model is milliseconds of work and building its feature on the
+    // first frame is far more than that. A helper that is not running needs none at all, and the old
+    // fixed second-per-frame budget meant a game whose helper was simply not started froze for eight
+    // seconds before the layer gave up. That is what this is for.
+    const bool helperAlive = s.everAnswered ||
+                             s.hdr->helperState.load() == kHelperRunning ||
+                             s.hdr->heartbeat.load() != s.firstHeartbeat;
+    const double budgetMs = helperAlive ? 1000.0 : 20.0;
+
     // Wait for the helper (fail-open: present the original frame on timeout).
     const double tSignal = NowMs();
     for (;;) {
         if (s.hdr->seq_resp.load() >= req) {
             s.timeouts = 0;
+            s.everAnswered = true;
             std::memcpy(modelOut, s.outPixels, bytes);
             if (time) {
                 static int frameNo = 0;
@@ -273,11 +295,18 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
         }
         if (s.hdr->quit.load()) { s.dead = true; return false; }
         const double elapsed = NowMs() - tSignal;
-        if (elapsed >= 1000.0) break;
+        if (elapsed >= budgetMs) break;
         if (elapsed < 2.0) CpuYield();
         else std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
-    if (++s.timeouts >= 8) { s.dead = true; Log("[shm] helper unresponsive, disabling"); }
+    // Four rather than eight, and with a pause before the next attempt, so giving up costs a
+    // fraction of a second and retrying costs that again only every few seconds.
+    if (++s.timeouts >= 4) {
+        s.dead = true;
+        s.retryAfterMs = NowMs() + 5000.0;
+        Log("[shm] no answer from the helper in %.0f ms x4; passing frames through, retrying in 5s",
+            budgetMs);
+    }
     return false;
 }
 
