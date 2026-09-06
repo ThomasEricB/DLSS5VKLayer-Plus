@@ -23,6 +23,9 @@
 #include <cstddef>
 #include <cstring>
 #include <string>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
@@ -122,13 +125,27 @@ enum HelperState : uint32_t {
     kHelperStopped = 5,
 };
 
-inline std::string ShmDefaultPath() {
-    const char* rt = std::getenv("XDG_RUNTIME_DIR");
-    if (rt && *rt) return std::string(rt) + "/dlssnr/shm.bin";
+// Where the mapping lives.
+//
+// It has to name the same file in every process that touches it, and a Steam game does not share a
+// mount namespace with the helper: pressure-vessel gives the container a private tmpfs at
+// $XDG_RUNTIME_DIR, so a mapping put there is simply absent inside the game. The layer then creates
+// its own empty one at a path that reads identically in the log and waits forever for a helper that
+// is answering on the other file -- the "attached ... seq_req=0 / helper not running" case. /tmp is
+// bind-mounted from the host into the container, so both sides land on one file; it is also what a
+// Wine prefix exposes as Z:\tmp\..., which is how the helper opens it.
+inline std::string ShmRuntimeDir() {
     const char* uid = std::getenv("DLSSNR_UID");
-    if (uid && *uid) return std::string("/tmp/dlssnr-") + uid + "/shm.bin";
-    return "/tmp/dlssnr_shm.bin";
+    if (uid && *uid) return std::string("/tmp/dlssnr-") + uid;
+#ifdef _WIN32
+    // The helper is always handed DLSSNR_SHM by the launcher, so this is only ever a last resort.
+    return "/tmp/dlssnr";
+#else
+    return "/tmp/dlssnr-" + std::to_string((unsigned) getuid());
+#endif
 }
+
+inline std::string ShmDefaultPath() { return ShmRuntimeDir() + "/shm.bin"; }
 
 inline size_t ShmTotalBytes() { return kHeaderBytes + kMaxFrame * 2; }
 

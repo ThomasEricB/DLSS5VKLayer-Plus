@@ -174,9 +174,8 @@ QString MainWindow::configPath() const {
 }
 
 QString MainWindow::defaultShmPath() const {
-    QString rt = qEnvironmentVariable("XDG_RUNTIME_DIR");
-    if (rt.isEmpty()) rt = QString("/tmp/dlssnr-%1").arg(::getuid());
-    return rt + "/dlssnr/shm.bin";
+    // Shared with the layer and the helper -- see ShmDefaultPath() for why it is not $XDG_RUNTIME_DIR.
+    return QString::fromStdString(ShmDefaultPath());
 }
 
 QString MainWindow::defaultLogPath() const {
@@ -200,7 +199,12 @@ void MainWindow::loadConfig() {
         if (key == "runner_type") runnerType = value;
         else if (key == "runner_path") runnerPath = value;
         else if (key == "binaries") binariesPath = value;
-        else if (key == "shm") shmPath = value;
+        // A config written by an older build pins the mapping to $XDG_RUNTIME_DIR, which is exactly
+        // the path a Steam game cannot see. Treat that one value as if it had never been written.
+        else if (key == "shm") {
+            const QString legacy = qEnvironmentVariable("XDG_RUNTIME_DIR") + "/dlssnr/shm.bin";
+            shmPath = (value == legacy) ? QString() : value;
+        }
         else if (key == "log") logPath = value;
         else if (key == "dxvk_vendor") dxvkVendor = value;
         else if (key == "dxvk_device") dxvkDevice = value;
