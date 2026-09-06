@@ -159,7 +159,7 @@ MainWindow::~MainWindow() {
         // Let the helper keep running if the GUI is closed.
         helper->setParent(nullptr);
     }
-    if (shmBase) munmap(shmBase, 4096 + kMaxFrame * 2);
+    if (shmBase) munmap(shmBase, ShmTotalBytes());
 }
 
 QString MainWindow::findProjectDir() const {
@@ -309,7 +309,7 @@ bool MainWindow::ensureShm() {
     const QByteArray p = shmPath.toUtf8();
     int fd = open(p.constData(), O_RDWR | O_CREAT, 0666);
     if (fd < 0) return false;
-    const size_t total = 4096 + kMaxFrame * 2;
+    const size_t total = ShmTotalBytes();
     struct stat st{};
     if (fstat(fd, &st) != 0 || size_t(st.st_size) < total) {
         if (ftruncate(fd, off_t(total)) != 0) {
@@ -322,7 +322,9 @@ bool MainWindow::ensureShm() {
     if (m == MAP_FAILED) return false;
     shmBase = m;
     hdr = (ShmHeader*)m;
-    if (hdr->magic.load() != kShmMagic || hdr->passes.load() == 0) ShmInitDefaults(hdr);
+    if (hdr->magic.load() != kShmMagic || hdr->version.load() != kShmVersion ||
+        hdr->passes.load() == 0)
+        ShmInitDefaults(hdr);
     return true;
 }
 

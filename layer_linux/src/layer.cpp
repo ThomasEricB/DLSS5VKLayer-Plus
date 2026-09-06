@@ -126,7 +126,7 @@ static bool ShmOpen(ShmMap& s) {
     EnsureParentDir(p);
     int fd = open(p.c_str(), O_RDWR | O_CREAT, 0600);
     if (fd < 0) { Log("[shm] open %s failed", p.c_str()); return false; }
-    size_t total = 4096 + kMaxFrame * 2;
+    size_t total = ShmTotalBytes();
     struct stat st{};
     if (fstat(fd, &st) != 0 || (size_t)st.st_size < total) {
         if (ftruncate(fd, (off_t)total) != 0) { close(fd); return false; }
@@ -136,9 +136,12 @@ static bool ShmOpen(ShmMap& s) {
     if (m == MAP_FAILED) { Log("[shm] mmap failed"); return false; }
     s.base = m;
     s.hdr = (ShmHeader*)m;
-    s.inPixels = (uint8_t*)m + 4096;
+    s.inPixels = (uint8_t*)m + kHeaderBytes;
     s.outPixels = s.inPixels + kMaxFrame;
-    if (s.hdr->magic.load() != kShmMagic || s.hdr->passes.load() == 0) {
+    // A mapping left by an older build has a different magic, a different version, or a header
+    // laid out differently; re-initialising is the only safe reading of any of those.
+    if (s.hdr->magic.load() != kShmMagic || s.hdr->version.load() != kShmVersion ||
+        s.hdr->passes.load() == 0) {
         ShmInitDefaults(s.hdr);
     }
     s.lastHeartbeat = s.hdr->heartbeat.load();

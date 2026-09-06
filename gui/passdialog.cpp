@@ -28,10 +28,10 @@ PassDialog::PassDialog(ShmHeader* h, QWidget* parent) : QDialog(parent), hdr(h) 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         auto* page = new QWidget(tabs);
         auto* form = new QFormLayout(page);
-        PassStrength ps = hdr ? ShmGetPassStrength(hdr, i) : PassStrength{};
+        PassTuning ps = hdr ? ShmResolvePass(hdr, i) : PassTuning{};
 
         rows[i].enabled = new QCheckBox("Override global settings", page);
-        rows[i].enabled->setChecked(hdr && hdr->pass[i].enabled.load());
+        rows[i].enabled->setChecked(hdr && hdr->pass[i].overrideMask.load() != 0);
         form->addRow(rows[i].enabled);
 
         rows[i].intensity = makeSpin(0.0, 4.0, 0.05, ps.intensity, page);
@@ -79,7 +79,13 @@ PassDialog::PassDialog(ShmHeader* h, QWidget* parent) : QDialog(parent), hdr(h) 
 void PassDialog::writePass(int pass) {
     if (!hdr || pass < 0 || pass >= int(kMaxPasses)) return;
     auto& r = rows[uint32_t(pass)];
-    hdr->pass[uint32_t(pass)].enabled.store(r.enabled->isChecked() ? 1u : 0u);
+    // The dialog still edits every field together, so it overrides them as a set. The protocol
+    // carries a per-field mask so a later interface can be sparser without changing the contract.
+    const uint32_t mask = r.enabled->isChecked()
+                              ? (kOverrideIntensity | kOverrideLocalTone | kOverrideLocalStructure |
+                                 kOverrideSkinStructure | kOverrideSharpness)
+                              : 0u;
+    hdr->pass[uint32_t(pass)].overrideMask.store(mask);
     hdr->pass[uint32_t(pass)].intensityBits.store(FloatToBits(float(r.intensity->value())));
     hdr->pass[uint32_t(pass)].localToneBits.store(FloatToBits(float(r.localTone->value())));
     hdr->pass[uint32_t(pass)].localStructureBits.store(FloatToBits(float(r.localStructure->value())));

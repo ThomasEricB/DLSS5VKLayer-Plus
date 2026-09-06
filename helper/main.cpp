@@ -79,7 +79,7 @@ static bool ShmOpen(ShmMap& s) {
                          nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (s.file == INVALID_HANDLE_VALUE) { Log("[helper] open %ls failed (%lu)", winPath.c_str(), GetLastError()); return false; }
     LARGE_INTEGER size;
-    size.QuadPart = (LONGLONG)(4096 + kMaxFrame * 2);
+    size.QuadPart = (LONGLONG)ShmTotalBytes();
     SetFilePointerEx(s.file, size, nullptr, FILE_BEGIN);
     SetEndOfFile(s.file);
     s.mapping = CreateFileMappingW(s.file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
@@ -87,9 +87,10 @@ static bool ShmOpen(ShmMap& s) {
     s.base = MapViewOfFile(s.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
     if (!s.base) { Log("[helper] MapViewOfFile failed"); return false; }
     s.hdr = (ShmHeader*)s.base;
-    s.inPixels = (uint8_t*)s.base + 4096;
+    s.inPixels = (uint8_t*)s.base + kHeaderBytes;
     s.outPixels = s.inPixels + kMaxFrame;
-    if (s.hdr->magic.load() != kShmMagic || s.hdr->passes.load() == 0) {
+    if (s.hdr->magic.load() != kShmMagic || s.hdr->version.load() != kShmVersion ||
+        s.hdr->passes.load() == 0) {
         ShmInitDefaults(s.hdr);
     }
     if (s.hdr->quit.load()) Log("[helper] clearing stale quit flag");
@@ -262,7 +263,13 @@ static bool CreateContext(VkCtx& c) {
     VkFenceCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     if (vkCreateFence(c.device, &fci, nullptr, &c.fence) != VK_SUCCESS) return false;
-    return CreateStaging(c, kMaxFrame);
+
+    // Staging is allocated on the first frame, at that frame's size, rather than at the largest
+    // frame the protocol can carry. Every path that needs it grows it on demand already. Reserving
+    // the maximum up front cost two host-visible buffers of kMaxFrame each -- which, once the
+    // protocol grew to cover a supersampled 4K model raster, is a quarter of a gigabyte of pinned
+    // memory for a game that may present at 1080p.
+    return true;
 }
 
 static uint32_t FindMemoryType(VkCtx& c, uint32_t bits, VkMemoryPropertyFlags want) {
@@ -562,7 +569,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     const double tUpload = time ? NowMs() : 0.0;
 
     for (uint32_t pass = 0; pass < passes; ++pass) {
-        const PassStrength ps = ShmGetPassStrength(shm.hdr, pass);
+        const PassTuning ps = ShmResolvePass(shm.hdr, pass);
         NgxSetStrengths(ns.ngx,
             ClampF(ps.intensity, 0.0f, 4.0f),
             ClampF(ps.localTone, 0.0f, 4.0f),
