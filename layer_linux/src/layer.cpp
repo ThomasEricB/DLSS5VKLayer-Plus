@@ -226,6 +226,10 @@ static bool ShmImportOne(const dlssnr::DeviceTable* vk, VkPhysicalDevice pd, con
     mai.memoryTypeIndex = type;
     if (vk->vkAllocateMemory(device, &mai, nullptr, mem) != VK_SUCCESS) return false;
 
+    // vkBindBufferMemory requires a buffer declared for the handle type its memory was imported
+    // from, while vkGetPhysicalDeviceExternalBufferProperties does not report HOST_ALLOCATION as a
+    // compatible buffer handle type at all. The two rules cannot both be satisfied for this handle
+    // type; the bind is the one that governs what the driver actually does, so it wins.
     VkExternalMemoryBufferCreateInfo ext{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
     ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -250,10 +254,20 @@ static bool ShmImportOne(const dlssnr::DeviceTable* vk, VkPhysicalDevice pd, con
 
 // DLSSNR_ZEROCOPY=0 forces the copying path, so the two transports can be compared on one machine
 // without rebuilding. Nothing else should ever need it.
+// One frame of pipeline depth, at the cost of the edit being one frame old. Off by default because
+// that cost is visible in motion and belongs to the person looking at the screen, not to this file.
+
+// Opt-in, with DLSSNR_ZEROCOPY=1.
+//
+// The transport is measured and correct on a synthetic client, but it has not been shown correct in
+// a real game, and it sits on a rough edge of the spec: vkBindBufferMemory requires the buffer to
+// declare the handle type its memory was imported from, while the external-buffer properties query
+// does not report HOST_ALLOCATION as a buffer handle type at all. Until the blocks-of-wrong-colour
+// report is understood, the default is the transport that has been running all along.
 static bool ZeroCopyAllowed() {
     static const bool on = [] {
         const char* v = getenv("DLSSNR_ZEROCOPY");
-        return !(v && v[0] == '0');
+        return v && v[0] == '1';
     }();
     return on;
 }
@@ -621,10 +635,40 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(
     auto create = (PFN_vkCreateInstance)next_gipa(VK_NULL_HANDLE, "vkCreateInstance");
     if (!create) return VK_ERROR_INITIALIZATION_FAILED;
 
+    // VK_EXT_external_memory_host, which the device hook adds for the zero-copy transport, depends on
+    // VK_KHR_external_memory -- and that in turn needs this instance extension on anything below
+    // Vulkan 1.1, where the pair is not yet core. A game asking for 1.0 therefore has to have it
+    // added here or the device creation below is invalid, which validation says out loud.
+    std::vector<const char*> instExts(pCreateInfo->ppEnabledExtensionNames,
+                                      pCreateInfo->ppEnabledExtensionNames +
+                                          pCreateInfo->enabledExtensionCount);
+    {
+        auto enumInstExt = (PFN_vkEnumerateInstanceExtensionProperties)
+            next_gipa(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+        bool present = false;
+        for (const char* e : instExts)
+            if (e && !std::strcmp(e, VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME)) present = true;
+        bool offered = false;
+        if (ZeroCopyAllowed() && !present && enumInstExt) {
+            uint32_t n = 0;
+            enumInstExt(nullptr, &n, nullptr);
+            std::vector<VkExtensionProperties> have(n);
+            if (n) enumInstExt(nullptr, &n, have.data());
+            for (const auto& e : have)
+                if (!std::strcmp(e.extensionName, VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME))
+                    offered = true;
+        }
+        if (offered) instExts.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
+    }
+    VkInstanceCreateInfo ici = *pCreateInfo;
+    ici.enabledExtensionCount = uint32_t(instExts.size());
+    ici.ppEnabledExtensionNames = instExts.empty() ? nullptr : instExts.data();
+
     // Documented pattern: keep the link node in pNext (layers below need it)
     // and advance u.pLayerInfo so the next layer resolves its own chain entry.
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
-    VkResult res = create(pCreateInfo, pAllocator, pInstance);
+    VkResult res = create(&ici, pAllocator, pInstance);
+    if (res != VK_SUCCESS) res = create(pCreateInfo, pAllocator, pInstance);
     if (res != VK_SUCCESS) return res;
 
     InstanceChain chain{};
@@ -721,7 +765,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                                         pCreateInfo->ppEnabledExtensionNames +
                                             pCreateInfo->enabledExtensionCount);
     bool wantHostImport = false;
-    if (ic && ic->vkEnumerateDeviceExtensionProperties) {
+    if (ZeroCopyAllowed() && ic && ic->vkEnumerateDeviceExtensionProperties) {
         uint32_t n = 0;
         ic->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &n, nullptr);
         std::vector<VkExtensionProperties> have(n);
@@ -812,6 +856,9 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
     }
     if (!dc) return;
     if (dc->vkDeviceWaitIdle) dc->vkDeviceWaitIdle(device);
+    // The imported regions are device objects like any other and outlive the swapchains, so they are
+    // released here rather than with them -- validation counts them against the device otherwise.
+    ShmReleaseImports(dc->shm, &dc->table);
     {
         std::lock_guard<std::mutex> lk(dc->lock);
         for (auto& kv : dc->swapchains) {

@@ -100,6 +100,11 @@ class Composition {
     // back in PRESENT_SRC_KHR so a caller that gives up after this still presents something valid.
     bool RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
 
+    // The two halves of it. A pipelined frame grabs before composing and encodes after, so that the
+    // composition sees a proxy, a keep and a model that all belong to one frame.
+    bool RecordGrab(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
+    bool RecordEncode(VkCommandBuffer cb, const FrameSettings& s);
+
     // The two ends of the round trip, when they have to be copied.
     //
     // Both return null once the shared regions have been imported as device memory: the capture leg
@@ -114,7 +119,13 @@ class Composition {
     bool ZeroCopy() const { return _sharedIn && _sharedOut; }
 
     // Leg 2. Composes and leaves the swapchain image holding the result, in PRESENT_SRC_KHR.
-    bool RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
+    //
+    // refreshModel says whether to take a new answer out of the shared region first. It is false on
+    // a pipelined frame that is re-using the last answer, and that is not an optimisation: the helper
+    // may be writing that region right now for the next request, and reading it would tear. The
+    // model image already holds the last answer, so composing from it is both safe and correct.
+    bool RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s,
+                       bool refreshModel = true);
 
     bool HasModelFrame() const { return _haveModel; }
     void MarkModelFrame() { _haveModel = true; }
@@ -159,6 +170,10 @@ class Composition {
     void Transition(VkCommandBuffer cb, Image& img, VkImageLayout to);
     void TransitionSwapchain(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to);
     bool FormatSupportsBlit(VkFormat format) const;
+
+    // Ordering against the process on the other side of the shared regions. See the definitions.
+    void BarrierAfterExternalWrite(VkCommandBuffer cb) const;
+    void BarrierBeforeExternalRead(VkCommandBuffer cb) const;
     void CopyWholeImage(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout, VkImage dst,
                         VkImageLayout dstLayout, uint32_t w, uint32_t h);
 

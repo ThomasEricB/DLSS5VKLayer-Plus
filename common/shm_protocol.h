@@ -30,7 +30,7 @@
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
-static constexpr uint32_t kShmVersion = 4;
+static constexpr uint32_t kShmVersion = 6;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;

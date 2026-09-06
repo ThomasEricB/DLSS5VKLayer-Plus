@@ -790,6 +790,10 @@ static bool ImportOneRegion(VkCtx& c, void* host, size_t bytes, VkDeviceMemory* 
     mai.memoryTypeIndex = type;
     if (vkAllocateMemory(c.device, &mai, nullptr, mem) != VK_SUCCESS) return false;
 
+    // vkBindBufferMemory requires a buffer declared for the handle type its memory was imported
+    // from, while vkGetPhysicalDeviceExternalBufferProperties does not report HOST_ALLOCATION as a
+    // compatible buffer handle type at all. The two rules cannot both be satisfied for this handle
+    // type; the bind is the one that governs what the driver actually does, so it wins.
     VkExternalMemoryBufferCreateInfo ext{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
     ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -815,8 +819,9 @@ static bool ImportOneRegion(VkCtx& c, void* host, size_t bytes, VkDeviceMemory* 
 // the same way, so the two agree on the pages even though the addresses differ.
 static void EnsureFrameImports(VkCtx& c, void* in, void* out, size_t bytes) {
     if (!c.hostImport || !in || !out) return;
-    const char* off = getenv("DLSSNR_ZEROCOPY");
-    if (off && off[0] == '0') return;
+    // Opt-in; see the note beside ZeroCopyAllowed in the layer.
+    const char* on = getenv("DLSSNR_ZEROCOPY");
+    if (!(on && on[0] == '1')) return;
 
     const size_t want = ((bytes + kHostImportAlignment - 1) / kHostImportAlignment) * kHostImportAlignment;
     if (c.frameInBuf && c.importedIn == in && c.importedOut == out && c.importedBytes >= want) return;
@@ -833,6 +838,26 @@ static void EnsureFrameImports(VkCtx& c, void* in, void* out, size_t bytes) {
     Log("[helper] zero copy: the layer's regions imported as device memory (%zu bytes each)", want);
 }
 
+// Ordering against the layer, which is a separate process with its own device writing the same pages.
+// See the matching note in the layer's composition: an external agent touching host-visible memory is
+// ordered as host access, and without it a copy can be scheduled against caches that predate the
+// other side's writes.
+static void BarrierAfterExternalWrite(VkCommandBuffer cb) {
+    VkMemoryBarrier b{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    b.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         1, &b, 0, nullptr, 0, nullptr);
+}
+
+static void BarrierBeforeExternalRead(VkCommandBuffer cb) {
+    VkMemoryBarrier b{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                         1, &b, 0, nullptr, 0, nullptr);
+}
+
 static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes, VkBuffer from = VK_NULL_HANDLE) {
     if (!from && (!c.uploadMap || bytes > c.stagingSize)) return false;
     if (!BeginCmd(c.cmdScratch)) return false;
@@ -842,6 +867,7 @@ static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes, VkBuffer f
     VkBufferImageCopy region{};
     region.imageSubresource = { img.aspect(), 0, 0, 1 };
     region.imageExtent = { img.width, img.height, 1 };
+    if (from) BarrierAfterExternalWrite(c.cmdScratch);
     vkCmdCopyBufferToImage(c.cmdScratch, from ? from : c.uploadStaging, img.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     return SubmitAndWait(c, c.cmdScratch);
@@ -861,6 +887,7 @@ static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes, VkBuffer into 
     region.imageExtent = { img.width, img.height, 1 };
     vkCmdCopyImageToBuffer(c.cmdEval, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            into ? into : c.readStaging, 1, &region);
+    if (into) BarrierBeforeExternalRead(c.cmdEval);
     return SubmitAndWait(c, c.cmdEval);
 }
 
@@ -1643,6 +1670,7 @@ static bool RunOpticalFlow(NeuralState& ns) {
     VkBufferImageCopy upRegion{};
     upRegion.imageSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
     upRegion.imageExtent = { ns.colorIn.width, ns.colorIn.height, 1 };
+    if (ns.vk.frameInBuf) BarrierAfterExternalWrite(cb);
     vkCmdCopyBufferToImage(cb, ns.vk.frameInBuf ? ns.vk.frameInBuf : ns.vk.uploadStaging,
                            ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &upRegion);
     TransitionImage(ns.vk, cb, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,

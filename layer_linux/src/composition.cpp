@@ -544,7 +544,48 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
 // ---------------------------------------------------------------------------
 // Leg 1: the frame the model is shown
 // ---------------------------------------------------------------------------
+// Ordering against the other process, which Vulkan cannot see.
+//
+// The shared regions are imported host memory, and the agent on the other side of them is a separate
+// process with its own device. Nothing in this command buffer knows that, so a copy out of the
+// output region can be scheduled against caches that predate the helper's writes, and a copy into
+// the input region can be considered complete before those writes are visible to it. The spec's
+// answer for an external agent touching host-visible memory is to treat it as host access: a barrier
+// from HOST_WRITE before reading what it wrote, and one to HOST_READ after writing what it will read.
+//
+// Left out, this shows up as blocks of stale or garbage pixels that only appear once something is
+// moving -- which is exactly when the two sides are writing the same pages on consecutive frames.
+void Composition::BarrierAfterExternalWrite(VkCommandBuffer cb) const {
+    VkMemoryBarrier b{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    b.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                              1, &b, 0, nullptr, 0, nullptr);
+}
+
+void Composition::BarrierBeforeExternalRead(VkCommandBuffer cb) const {
+    VkMemoryBarrier b{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                              1, &b, 0, nullptr, 0, nullptr);
+}
+
 bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s) {
+    return RecordGrab(cb, swapchainImage, s) && RecordEncode(cb, s);
+}
+
+// Take this frame's untouched pixels, and nothing else.
+//
+// Split out of the capture leg so a pipelined frame can grab the picture *before* the composition
+// writes the swapchain, and encode it *after*. That ordering is what keeps the composition's inputs
+// consistent: the proxy, the keep and the model it differences against then all belong to the same
+// earlier frame, instead of a model from one frame being differenced against a proxy from the next.
+// A mismatched pair divides a bright answer by a proxy that has since moved to near black, and the
+// ratio that comes out of that is what put saturated red and blue pixels on moving edges.
+bool Composition::RecordGrab(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s) {
+    if (!_usable || !_frame.image) return false;
+
     if (!_usable || !_frame.image) return false;
 
     // Frame hold, on the edge rather than the level, so the white point is snapshotted once at the
@@ -577,6 +618,14 @@ bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, cons
                             VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         _frameCaptured = true;
     }
+
+    return true;
+}
+
+// Everything downstream of the grab: encode, meter, working raster, and the copy out to the shared
+// region. Reads _frame and writes _proxy, _keep and _work.
+bool Composition::RecordEncode(VkCommandBuffer cb, const FrameSettings& s) {
+    if (!_usable || !_frame.image) return false;
 
     Transition(cb, _frame, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     Transition(cb, _proxy, VK_IMAGE_LAYOUT_GENERAL);
@@ -647,21 +696,26 @@ bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, cons
     region.imageExtent = { _modelW, _modelH, 1 };
     _vk->vkCmdCopyImageToBuffer(cb, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 _sharedIn ? _sharedIn : _download.buffer, 1, &region);
+    if (_sharedIn) BarrierBeforeExternalRead(cb);
     return true;
 }
 
 // ---------------------------------------------------------------------------
 // Leg 2: the model's answer, composed back
 // ---------------------------------------------------------------------------
-bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s) {
+bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s,
+                                bool refreshModel) {
     if (!_usable || !_composed.image) return false;
 
-    Transition(cb, _model, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy region{};
-    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.imageExtent = { _modelW, _modelH, 1 };
-    _vk->vkCmdCopyBufferToImage(cb, _sharedOut ? _sharedOut : _upload.buffer, _model.image,
-                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    if (refreshModel) {
+        if (_sharedOut) BarrierAfterExternalWrite(cb);
+        Transition(cb, _model, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.imageExtent = { _modelW, _modelH, 1 };
+        _vk->vkCmdCopyBufferToImage(cb, _sharedOut ? _sharedOut : _upload.buffer, _model.image,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    }
     Transition(cb, _model, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     // When the model worked above the frame its answer is averaged back to native first, and the
