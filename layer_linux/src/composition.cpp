@@ -645,8 +645,8 @@ bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, cons
     VkBufferImageCopy region{};
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = { _modelW, _modelH, 1 };
-    _vk->vkCmdCopyImageToBuffer(cb, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _download.buffer, 1,
-                                &region);
+    _vk->vkCmdCopyImageToBuffer(cb, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                _sharedIn ? _sharedIn : _download.buffer, 1, &region);
     return true;
 }
 
@@ -660,7 +660,8 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     VkBufferImageCopy region{};
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = { _modelW, _modelH, 1 };
-    _vk->vkCmdCopyBufferToImage(cb, _upload.buffer, _model.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    _vk->vkCmdCopyBufferToImage(cb, _sharedOut ? _sharedOut : _upload.buffer, _model.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     Transition(cb, _model, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     // When the model worked above the frame its answer is averaged back to native first, and the

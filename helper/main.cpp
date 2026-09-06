@@ -185,6 +185,16 @@ struct VkCtx {
     VkSemaphore semFlow = VK_NULL_HANDLE;
     VkBuffer uploadStaging = VK_NULL_HANDLE;
     VkBuffer readStaging = VK_NULL_HANDLE;
+
+    // The layer's two shared regions, imported as device memory so the frame is read and written
+    // where it already lies. Null whenever the import is unavailable, and every user falls back to
+    // the staging buffers above.
+    bool hostImport = false;
+    VkDeviceMemory frameInMem = VK_NULL_HANDLE, frameOutMem = VK_NULL_HANDLE;
+    VkBuffer frameInBuf = VK_NULL_HANDLE, frameOutBuf = VK_NULL_HANDLE;
+    void* importedIn = nullptr;
+    void* importedOut = nullptr;
+    size_t importedBytes = 0;
     VkDeviceMemory uploadMem = VK_NULL_HANDLE;
     VkDeviceMemory readMem = VK_NULL_HANDLE;
     void* uploadMap = nullptr;
@@ -345,8 +355,13 @@ static bool CreateContext(VkCtx& c) {
     for (const char* e : { "VK_NVX_binary_import", "VK_NVX_image_view_handle",
                            "VK_KHR_maintenance1", "VK_KHR_maintenance2", "VK_KHR_maintenance3",
                            "VK_KHR_maintenance4", "VK_KHR_buffer_device_address", "VK_KHR_push_descriptor",
-                           "VK_KHR_synchronization2", VK_NV_OPTICAL_FLOW_EXTENSION_NAME })
+                           "VK_KHR_synchronization2", VK_NV_OPTICAL_FLOW_EXTENSION_NAME,
+                           // The other half of the zero-copy transport. winevulkan exposes only the
+                           // Win32 handle types, so an fd from the layer could never cross -- but a
+                           // mapped pointer can, and both sides' mapping of the shared file is one.
+                           "VK_KHR_external_memory", VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME })
         if (HasDeviceExt(c.physical, e)) enabled.push_back(e);
+    c.hostImport = HasDeviceExt(c.physical, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     c.sync2 = HasDeviceExt(c.physical, "VK_KHR_synchronization2");
     VkPhysicalDeviceOpticalFlowFeaturesNV flowFeatures{};
     flowFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV;
@@ -738,8 +753,88 @@ static bool SubmitAndWait(VkCtx& c, VkCommandBuffer cb) {
     return SubmitAndWaitQueue(c, cb, c.queue);
 }
 
-static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes) {
-    if (!c.uploadMap || bytes > c.stagingSize) return false;
+// Import the layer's two shared regions as device memory, so the frame never has to be copied into
+// or out of this process's own staging. Mirrors ShmImportFrames in the layer; see the note there.
+//
+// Best-effort throughout: any failure leaves the buffers null and every user falls back to staging.
+static void ReleaseFrameImports(VkCtx& c) {
+    if (c.frameInBuf) vkDestroyBuffer(c.device, c.frameInBuf, nullptr);
+    if (c.frameOutBuf) vkDestroyBuffer(c.device, c.frameOutBuf, nullptr);
+    if (c.frameInMem) vkFreeMemory(c.device, c.frameInMem, nullptr);
+    if (c.frameOutMem) vkFreeMemory(c.device, c.frameOutMem, nullptr);
+    c.frameInBuf = c.frameOutBuf = VK_NULL_HANDLE;
+    c.frameInMem = c.frameOutMem = VK_NULL_HANDLE;
+    c.importedIn = c.importedOut = nullptr;
+    c.importedBytes = 0;
+}
+
+static bool ImportOneRegion(VkCtx& c, void* host, size_t bytes, VkDeviceMemory* mem, VkBuffer* buf) {
+    auto getProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)
+        g_gipa(c.instance, "vkGetMemoryHostPointerPropertiesEXT");
+    if (!getProps) return false;
+
+    VkMemoryHostPointerPropertiesEXT hp{ VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+    if (getProps(c.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hp) !=
+            VK_SUCCESS || !hp.memoryTypeBits)
+        return false;
+
+    const uint32_t type = FindHostMemoryType(c, hp.memoryTypeBits, false);
+    if (type == UINT32_MAX) return false;
+
+    VkImportMemoryHostPointerInfoEXT imp{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
+    imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    imp.pHostPointer = host;
+    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.pNext = &imp;
+    mai.allocationSize = bytes;
+    mai.memoryTypeIndex = type;
+    if (vkAllocateMemory(c.device, &mai, nullptr, mem) != VK_SUCCESS) return false;
+
+    VkExternalMemoryBufferCreateInfo ext{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.pNext = &ext;
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(c.device, &bci, nullptr, buf) != VK_SUCCESS) {
+        vkFreeMemory(c.device, *mem, nullptr);
+        *mem = VK_NULL_HANDLE;
+        return false;
+    }
+    if (vkBindBufferMemory(c.device, *buf, *mem, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(c.device, *buf, nullptr);
+        vkFreeMemory(c.device, *mem, nullptr);
+        *buf = VK_NULL_HANDLE;
+        *mem = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+// The regions are imported at a page-rounded size covering this frame. The layer maps its own side
+// the same way, so the two agree on the pages even though the addresses differ.
+static void EnsureFrameImports(VkCtx& c, void* in, void* out, size_t bytes) {
+    if (!c.hostImport || !in || !out) return;
+    const char* off = getenv("DLSSNR_ZEROCOPY");
+    if (off && off[0] == '0') return;
+
+    const size_t want = ((bytes + kHostImportAlignment - 1) / kHostImportAlignment) * kHostImportAlignment;
+    if (c.frameInBuf && c.importedIn == in && c.importedOut == out && c.importedBytes >= want) return;
+
+    ReleaseFrameImports(c);
+    if (!ImportOneRegion(c, in, want, &c.frameInMem, &c.frameInBuf)) return;
+    if (!ImportOneRegion(c, out, want, &c.frameOutMem, &c.frameOutBuf)) {
+        ReleaseFrameImports(c);
+        return;
+    }
+    c.importedIn = in;
+    c.importedOut = out;
+    c.importedBytes = want;
+    Log("[helper] zero copy: the layer's regions imported as device memory (%zu bytes each)", want);
+}
+
+static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes, VkBuffer from = VK_NULL_HANDLE) {
+    if (!from && (!c.uploadMap || bytes > c.stagingSize)) return false;
     if (!BeginCmd(c.cmdScratch)) return false;
     TransitionImage(c, c.cmdScratch, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -747,14 +842,16 @@ static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes) {
     VkBufferImageCopy region{};
     region.imageSubresource = { img.aspect(), 0, 0, 1 };
     region.imageExtent = { img.width, img.height, 1 };
-    vkCmdCopyBufferToImage(c.cmdScratch, c.uploadStaging, img.image,
+    vkCmdCopyBufferToImage(c.cmdScratch, from ? from : c.uploadStaging, img.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     return SubmitAndWait(c, c.cmdScratch);
 }
 
-static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes) {
-    if (bytes > c.stagingSize && !CreateStaging(c, bytes)) return false;
-    if (!c.readMap) return false;
+static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes, VkBuffer into = VK_NULL_HANDLE) {
+    if (!into) {
+        if (bytes > c.stagingSize && !CreateStaging(c, bytes)) return false;
+        if (!c.readMap) return false;
+    }
     if (!BeginCmd(c.cmdEval)) return false;
     TransitionImage(c, c.cmdEval, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
@@ -763,7 +860,7 @@ static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes) {
     region.imageSubresource = { img.aspect(), 0, 0, 1 };
     region.imageExtent = { img.width, img.height, 1 };
     vkCmdCopyImageToBuffer(c.cmdEval, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           c.readStaging, 1, &region);
+                           into ? into : c.readStaging, 1, &region);
     return SubmitAndWait(c, c.cmdEval);
 }
 
@@ -1546,8 +1643,8 @@ static bool RunOpticalFlow(NeuralState& ns) {
     VkBufferImageCopy upRegion{};
     upRegion.imageSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
     upRegion.imageExtent = { ns.colorIn.width, ns.colorIn.height, 1 };
-    vkCmdCopyBufferToImage(cb, ns.vk.uploadStaging, ns.colorIn.image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &upRegion);
+    vkCmdCopyBufferToImage(cb, ns.vk.frameInBuf ? ns.vk.frameInBuf : ns.vk.uploadStaging,
+                           ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &upRegion);
     TransitionImage(ns.vk, cb, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -2268,7 +2365,11 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         if (flowBytes > needed) needed = flowBytes;
     }
     if (needed > ns.vk.stagingSize && !CreateStaging(ns.vk, needed)) return false;
-    std::memcpy(ns.vk.uploadMap, shm.inPixels, bytes);
+
+    // With the regions imported there is nothing to move: the layer wrote the proxy into these pages
+    // and the copy below reads them directly.
+    EnsureFrameImports(ns.vk, shm.inPixels, shm.outPixels, bytes);
+    if (!ns.vk.frameInBuf) std::memcpy(ns.vk.uploadMap, shm.inPixels, bytes);
 
     // A cut is not motion. Carrying a flow field across one hands the model a field describing a
     // scene that is no longer on screen, which is worse than handing it nothing.
@@ -2290,7 +2391,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
             ns.mvecResetPending = true;
             ns.lastResetLogged = 0xFFFFFFFFu;
         }
-    } else if (!UploadMappedPixels(ns.vk, ns.colorIn, bytes)) {
+    } else if (!UploadMappedPixels(ns.vk, ns.colorIn, bytes, ns.vk.frameInBuf)) {
         return false;
     }
 
@@ -2340,8 +2441,8 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     ns.firstFrame = false;
     const double tEval = time ? NowMs() : 0.0;
 
-    if (!last || !ReadbackPixels(ns.vk, *last, bytes)) return false;
-    std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
+    if (!last || !ReadbackPixels(ns.vk, *last, bytes, ns.vk.frameOutBuf)) return false;
+    if (!ns.vk.frameOutBuf) std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
     const double tDone = time ? NowMs() : 0.0;
 
     ++ns.evaluates;

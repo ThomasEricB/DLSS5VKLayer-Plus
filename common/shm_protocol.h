@@ -163,6 +163,21 @@ inline std::string ShmDefaultPath() { return ShmRuntimeDir() + "/shm.bin"; }
 
 inline size_t ShmTotalBytes() { return kHeaderBytes + kMaxFrame * 2; }
 
+// Both pixel regions start on a page boundary, and that is load-bearing rather than tidy.
+//
+// VK_EXT_external_memory_host imports an ordinary host pointer as VkDeviceMemory, which is how the
+// layer and the helper come to share one allocation across the Linux/Wine boundary -- winevulkan
+// exposes only the Win32 handle types, so an fd could never cross, but a mapped pointer can. The
+// driver requires the imported pointer to be aligned to minImportedHostPointerAlignment, which is a
+// page on every implementation that offers the extension at all. If either offset stops being a
+// multiple of a page, the import fails and the transport silently falls back to copying.
+static constexpr size_t kHostImportAlignment = 4096;
+static_assert(kHeaderBytes % kHostImportAlignment == 0,
+              "the input region must start on a page boundary to be importable");
+static_assert(kMaxFrame % kHostImportAlignment == 0,
+              "the output region must start on a page boundary to be importable");
+
+
 // One pass's overrides. Every field is present; `overrideMask` says which of them mean anything.
 struct PassControl {
     std::atomic<uint32_t> overrideMask;

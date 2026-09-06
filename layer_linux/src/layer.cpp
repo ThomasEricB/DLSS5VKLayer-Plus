@@ -133,6 +133,15 @@ struct ShmMap {
     double retryAfterMs = 0.0;
     uint32_t lastControlSeq = 0;
     uint32_t lastHeartbeat = 0;
+
+    // The two pixel regions, imported as device memory so the GPU reads and writes them where they
+    // already are. Null when the device could not offer VK_EXT_external_memory_host, in which case
+    // the transport copies through host buffers as it always did.
+    VkDevice zcDevice = VK_NULL_HANDLE;
+    VkDeviceMemory inMem = VK_NULL_HANDLE, outMem = VK_NULL_HANDLE;
+    VkBuffer inBuf = VK_NULL_HANDLE, outBuf = VK_NULL_HANDLE;
+    size_t importedBytes = 0;
+    bool zeroCopy = false;
     bool dead = false;
 };
 
@@ -160,6 +169,119 @@ static bool EnsureParentDir(const std::string& path) {
 }
 
 // Maps the two pixel regions at the size this frame needs, remapping when the size changes.
+// Hand the two mapped regions to the driver as device memory.
+//
+// This is the whole of the zero-copy transport. VK_EXT_external_memory_host imports an ordinary host
+// pointer -- our mmap of the shared file -- as a VkDeviceMemory, so a buffer bound to it *is* the
+// shared pages. The proxy is then written by vkCmdCopyImageToBuffer straight into what the helper
+// reads, and the answer read straight out of what the helper wrote. Two memcpys of a whole frame
+// disappear from each side of every round trip.
+//
+// Everything here is best-effort: a device without the extension, a pointer the driver will not take,
+// no host-visible type that accepts it -- any of those leaves zeroCopy false and the copying path is
+// what runs, unchanged.
+static void ShmReleaseImports(ShmMap& s, const dlssnr::DeviceTable* vk) {
+    if (!vk || s.zcDevice == VK_NULL_HANDLE) return;
+    if (s.inBuf) vk->vkDestroyBuffer(s.zcDevice, s.inBuf, nullptr);
+    if (s.outBuf) vk->vkDestroyBuffer(s.zcDevice, s.outBuf, nullptr);
+    if (s.inMem) vk->vkFreeMemory(s.zcDevice, s.inMem, nullptr);
+    if (s.outMem) vk->vkFreeMemory(s.zcDevice, s.outMem, nullptr);
+    s.inBuf = s.outBuf = VK_NULL_HANDLE;
+    s.inMem = s.outMem = VK_NULL_HANDLE;
+    s.importedBytes = 0;
+    s.zeroCopy = false;
+}
+
+static bool ShmImportOne(const dlssnr::DeviceTable* vk, VkPhysicalDevice pd, const dlssnr::InstanceTable* inst,
+                         VkDevice device, void* host, size_t bytes, VkBufferUsageFlags usage,
+                         VkDeviceMemory* mem, VkBuffer* buf) {
+    auto getProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)
+        vk->next_dpa(device, "vkGetMemoryHostPointerPropertiesEXT");
+    if (!getProps) return false;
+
+    VkMemoryHostPointerPropertiesEXT hp{ VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+    if (getProps(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hp) !=
+            VK_SUCCESS || !hp.memoryTypeBits)
+        return false;
+
+    VkPhysicalDeviceMemoryProperties mp{};
+    inst->vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        if (!(hp.memoryTypeBits & (1u << i))) continue;
+        const VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            type = i;
+            break;
+        }
+    }
+    if (type == UINT32_MAX) return false;
+
+    VkImportMemoryHostPointerInfoEXT imp{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
+    imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    imp.pHostPointer = host;
+    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.pNext = &imp;
+    mai.allocationSize = bytes;
+    mai.memoryTypeIndex = type;
+    if (vk->vkAllocateMemory(device, &mai, nullptr, mem) != VK_SUCCESS) return false;
+
+    VkExternalMemoryBufferCreateInfo ext{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.pNext = &ext;
+    bci.size = bytes;
+    bci.usage = usage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vk->vkCreateBuffer(device, &bci, nullptr, buf) != VK_SUCCESS) {
+        vk->vkFreeMemory(device, *mem, nullptr);
+        *mem = VK_NULL_HANDLE;
+        return false;
+    }
+    if (vk->vkBindBufferMemory(device, *buf, *mem, 0) != VK_SUCCESS) {
+        vk->vkDestroyBuffer(device, *buf, nullptr);
+        vk->vkFreeMemory(device, *mem, nullptr);
+        *buf = VK_NULL_HANDLE;
+        *mem = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+// DLSSNR_ZEROCOPY=0 forces the copying path, so the two transports can be compared on one machine
+// without rebuilding. Nothing else should ever need it.
+static bool ZeroCopyAllowed() {
+    static const bool on = [] {
+        const char* v = getenv("DLSSNR_ZEROCOPY");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+static void ShmImportFrames(ShmMap& s, const dlssnr::DeviceTable* vk, const dlssnr::InstanceTable* inst,
+                            VkPhysicalDevice pd, VkDevice device, bool allowed) {
+    if (!allowed || !ZeroCopyAllowed() || !vk || !inst || !s.inPixels || !s.outPixels) return;
+    if (s.zeroCopy && s.zcDevice == device && s.importedBytes == s.mappedFrameBytes) return;
+
+    ShmReleaseImports(s, vk);
+    s.zcDevice = device;
+
+    const size_t bytes = s.mappedFrameBytes;
+    if (!ShmImportOne(vk, pd, inst, device, s.inPixels, bytes,
+                      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      &s.inMem, &s.inBuf))
+        return;
+    if (!ShmImportOne(vk, pd, inst, device, s.outPixels, bytes,
+                      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      &s.outMem, &s.outBuf)) {
+        ShmReleaseImports(s, vk);
+        return;
+    }
+    s.importedBytes = bytes;
+    s.zeroCopy = true;
+    Log("[shm] zero copy: both regions imported as device memory (%zu bytes each)", bytes);
+}
+
 static bool ShmMapFrames(ShmMap& s, size_t bytes) {
     if (s.mappedFrameBytes >= bytes && s.inPixels && s.outPixels) return true;
     if (bytes > kMaxFrame) return false;
@@ -267,7 +389,9 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
     const double t0 = NowMs();
     const size_t bytes = size_t(w) * h * 4;
     if (!ShmMapFrames(s, bytes)) { s.dead = true; return false; }
-    std::memcpy(s.inPixels, proxy, bytes);
+    // Already there when the regions are imported: the capture leg wrote the proxy straight into the
+    // shared pages, so there is nothing to move.
+    if (proxy) std::memcpy(s.inPixels, proxy, bytes);
     const double tCopy = NowMs();
     s.hdr->width.store(w);
     s.hdr->height.store(h);
@@ -303,7 +427,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
             // answer is worth composing; when it is not, the game's own frame is what to present.
             const bool ok = s.hdr->seq_ok.load() >= req;
             if (!ok) Log("[shm] helper could not use frame %u (ok=%u)", req, s.hdr->seq_ok.load());
-            if (ok) std::memcpy(modelOut, s.outPixels, bytes);
+            if (ok && modelOut) std::memcpy(modelOut, s.outPixels, bytes);
             if (time) {
                 static int frameNo = 0;
                 if (++frameNo % TimeInterval() == 0) {
@@ -384,6 +508,10 @@ struct DeviceChain {
 
     // The same entry points again, in the form the composition takes them.
     dlssnr::DeviceTable table;
+
+    // Whether this device was created with VK_EXT_external_memory_host, which is what decides
+    // between the zero-copy transport and copying through staging.
+    bool hostImport = false;
 
     // The loader's hook for installing a dispatch table on a dispatchable object a layer creates.
     // Handed to every layer in its own VkLayerDeviceCreateInfo node; see Hook_CreateDevice.
@@ -582,11 +710,64 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         if (it != g_phys.end()) ic = it->second;
     }
 
+    // Ask for one extension the game did not.
+    //
+    // VK_EXT_external_memory_host is what lets the proxy be handed to the helper without a copy: both
+    // processes import their own mapping of the same pages as VkDeviceMemory and the GPU reads and
+    // writes them in place. The game has no reason to enable it, so the layer adds it -- which is
+    // allowed, and is what layers that need a device feature do. If the device does not offer it the
+    // list is left exactly as the game wrote it and the transport keeps copying.
+    std::vector<const char*> deviceExts(pCreateInfo->ppEnabledExtensionNames,
+                                        pCreateInfo->ppEnabledExtensionNames +
+                                            pCreateInfo->enabledExtensionCount);
+    bool wantHostImport = false;
+    if (ic && ic->vkEnumerateDeviceExtensionProperties) {
+        uint32_t n = 0;
+        ic->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> have(n);
+        if (n) ic->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &n, have.data());
+        const auto offered = [&](const char* name) {
+            for (const auto& e : have)
+                if (!std::strcmp(e.extensionName, name)) return true;
+            return false;
+        };
+        const auto already = [&](const char* name) {
+            for (const char* e : deviceExts)
+                if (e && !std::strcmp(e, name)) return true;
+            return false;
+        };
+        if (offered(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+            wantHostImport = true;
+            if (!already(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
+                deviceExts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+            if (offered(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME) &&
+                !already(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME))
+                deviceExts.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+        }
+    }
+
+    VkDeviceCreateInfo dci = *pCreateInfo;
+    dci.enabledExtensionCount = uint32_t(deviceExts.size());
+    dci.ppEnabledExtensionNames = deviceExts.empty() ? nullptr : deviceExts.data();
+
+    // The chain link the next layer reads. Saved because a retry has to hand the rest of the chain
+    // the same starting point; the layers below advance it themselves as they call down.
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
-    VkResult res = create(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    auto* const nextLayerInfo = link->u.pLayerInfo;
+    VkResult res = create(physicalDevice, &dci, pAllocator, pDevice);
+    if (res != VK_SUCCESS && wantHostImport) {
+        // The game's own list was fine; ours was not. Never turn a working device into a failed one
+        // for the sake of an optimisation.
+        Log("[layer] vkCreateDevice refused the added extension (%d); retrying with the game's list",
+            (int) res);
+        wantHostImport = false;
+        link->u.pLayerInfo = nextLayerInfo;
+        res = create(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    }
     if (res != VK_SUCCESS) return res;
 
     DeviceChain* dc = new DeviceChain();
+    dc->hostImport = wantHostImport;
     dc->instance = ic;
     dc->physical = physicalDevice;
     dc->self = *pDevice;
@@ -884,6 +1065,17 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         dc->vkResetFences(d, 1, &sc.fence);
         return true;
     };
+
+    // The shared regions have to be mapped at this frame's size before they can be imported, and the
+    // import has to be in place before leg 1 records the copy that writes into them.
+    {
+        const size_t modelBytes = size_t(sc.comp->ModelWidth()) * sc.comp->ModelHeight() * 4;
+        if (ShmOpen(dc->shm) && ShmMapFrames(dc->shm, modelBytes)) {
+            ShmImportFrames(dc->shm, &dc->table, dc->instance ? &dc->instance->table : nullptr,
+                            dc->physical, dc->self, dc->hostImport);
+            sc.comp->UseSharedBuffers(dc->shm.inBuf, dc->shm.outBuf);
+        }
+    }
 
     // ---- leg 1: the frame the model is shown ----
     if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;

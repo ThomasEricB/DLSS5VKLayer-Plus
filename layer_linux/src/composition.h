@@ -100,9 +100,18 @@ class Composition {
     // back in PRESENT_SRC_KHR so a caller that gives up after this still presents something valid.
     bool RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
 
-    // The pixels leg 1 produced, and where the model's answer goes before leg 2.
-    const void* ProxyPixels() const { return _download.mapped; }
-    void* ModelPixels() { return _upload.mapped; }
+    // The two ends of the round trip, when they have to be copied.
+    //
+    // Both return null once the shared regions have been imported as device memory: the capture leg
+    // writes the proxy into the shared pages itself and the compose leg reads the answer from them,
+    // so there is nothing for the caller to move and asking for a pointer would only invite a copy.
+    const void* ProxyPixels() const { return _sharedIn ? nullptr : _download.mapped; }
+    void* ModelPixels() { return _sharedOut ? nullptr : _upload.mapped; }
+
+    // Use the caller's buffers -- the shared regions -- instead of this object's own staging. Passing
+    // two null handles goes back to staging, which is what happens on a device that cannot import.
+    void UseSharedBuffers(VkBuffer in, VkBuffer out) { _sharedIn = in; _sharedOut = out; }
+    bool ZeroCopy() const { return _sharedIn && _sharedOut; }
 
     // Leg 2. Composes and leaves the swapchain image holding the result, in PRESENT_SRC_KHR.
     bool RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
@@ -197,6 +206,9 @@ class Composition {
     uint32_t _meterCount = 0;
     float _meterSteadiness = 0.0f;
     HostBuffer _download{}, _upload{}, _captureBuf{};
+
+    // Not owned. The shared regions, imported by the transport and bound to buffers there.
+    VkBuffer _sharedIn = VK_NULL_HANDLE, _sharedOut = VK_NULL_HANDLE;
 
     CaptureWriter _capture;
     bool _captureRecorded = false;
