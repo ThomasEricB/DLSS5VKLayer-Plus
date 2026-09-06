@@ -86,7 +86,9 @@ private:
     QFormLayout* compositionForm = nullptr;
     QVector<QWidget*> compositionRows;
     bool helperRunning = false;
+    bool firstPoll = true;
     quint64 lastFrames = 0;
+    QSpinBox* rebuildSpin = nullptr;
 
     ShmBinder* binder = nullptr;
     QString lastSettingsBlob;

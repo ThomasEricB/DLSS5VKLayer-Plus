@@ -38,7 +38,9 @@
 #include <QVBoxLayout>
 #include <QGroupBox>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QVariantMap>
+#include <QWidgetAction>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -198,17 +200,49 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     root->addWidget(buildSettings(), 1);
 
     // The gear, bottom right: the things that act on the whole interface rather than one setting.
+    //
+    // Icon only, no arrow section: the menu opens attached under the button the way a submenu hangs off
+    // a menu bar, not at the cursor like a context menu.
     gearBtn = new QToolButton(this);
     gearBtn->setIcon(gearIcon(this));
     gearBtn->setToolTip("Settings");
     gearBtn->setPopupMode(QToolButton::InstantPopup);
     auto* gearMenu = new QMenu(gearBtn);
+
+    // Rebuild spacing lives here rather than on the Rendering tab: it is a knob for how the helper
+    // behaves, not a setting about the picture, and it earns its keep exactly when a chain of
+    // rebuilds has wedged the model -- which is not when you want to be digging through the tab.
+    auto* rebuildAction = new QWidgetAction(gearMenu);
+    auto* rebuildRow = new QWidget(gearBtn);
+    auto* rebuildLay = new QHBoxLayout(rebuildRow);
+    rebuildLay->setContentsMargins(8, 4, 8, 4);
+    auto* rebuildLabel = new QLabel("Rebuild spacing (ms)", rebuildRow);
+    rebuildSpin = new QSpinBox(rebuildRow);
+    rebuildSpin->setRange(0, 5000);
+    rebuildSpin->setToolTip("How long the helper waits after a model setting changes before it "
+                            "rebuilds the pass, and between one rebuild and the next. Rebuilding is "
+                            "expensive, and back-to-back rebuilds have been seen to wedge the model "
+                            "on some drivers. Lower is snappier; 0 rebuilds immediately and chains "
+                            "the rest back to back. Raise it if the model ever stops answering after "
+                            "changing settings.");
+    rebuildLabel->setToolTip(rebuildSpin->toolTip());
+    if (hdr) rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
+    rebuildLay->addWidget(rebuildLabel);
+    rebuildLay->addWidget(rebuildSpin);
+    rebuildAction->setDefaultWidget(rebuildRow);
+    gearMenu->addAction(rebuildAction);
+    gearMenu->addSeparator();
     gearMenu->addAction("Reset all settings...", this, &MainWindow::resetAllSettings);
     gearMenu->addSeparator();
     gearMenu->addAction("Open helper log", this, [this] {
         QDesktopServices::openUrl(QUrl::fromLocalFile(logPath));
     });
     gearBtn->setMenu(gearMenu);
+    connect(rebuildSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        if (!hdr) return;
+        hdr->rebuildSettleMs.store(uint32_t(v));
+        hdr->controlSeq.fetch_add(1);
+    });
     auto* bottom = new QHBoxLayout;
     bottom->addStretch(1);
     bottom->addWidget(gearBtn);
@@ -441,6 +475,10 @@ void MainWindow::resetAllSettings() {
     hdr->tuningSeq.fetch_add(1);
     if (keyCombo) keyCombo->setCurrentIndex(0);
     if (binder) binder->Reload();
+    if (rebuildSpin) {
+        QSignalBlocker block(rebuildSpin);
+        rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
+    }
     updateCompositionVisibility();
     lastSettingsBlob = settingsBlob();
     saveConfig();
@@ -558,6 +596,13 @@ void MainWindow::stopHelper() {
 
 void MainWindow::updateStatus() {
     if (binder) binder->Reload();
+    // The menu spinbox is not a bound control, so the poll keeps it honest the same way the binder
+    // keeps the bound ones honest -- unless the user is mid-edit on it, which is not the moment to
+    // overwrite the number under their cursor.
+    if (hdr && rebuildSpin && !rebuildSpin->hasFocus()) {
+        QSignalBlocker block(rebuildSpin);
+        rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
+    }
     updateCompositionVisibility();
 
     helperRunning = helperRunningNow();
@@ -585,9 +630,14 @@ void MainWindow::updateStatus() {
         // Active means a game is presenting through the layer right now: the composition is up and
         // the frame counter moved since the last poll. A counter that only ever grows would say
         // Active forever after one frame; movement is the point.
+        //
+        // The first poll seeds the counter rather than judging it. Measured against the zero it was
+        // initialised to, any frame the layer had ever presented before this window opened read as
+        // motion, so the interface opened claiming Active and corrected itself a second later.
         const quint64 frames = ShmLoad64(hdr->layerFramesLo, hdr->layerFramesHi);
-        active = hdr->layerCompositionUp.load() && frames != lastFrames;
+        active = !firstPoll && hdr->layerCompositionUp.load() && frames != lastFrames;
         lastFrames = frames;
+        firstPoll = false;
     }
 
     if (mismatch) {
@@ -686,13 +736,6 @@ QWidget* MainWindow::buildSettings() {
                                 "enhancing its own output, which is outside what it was trained for.")
                             .arg(kDefaultMaxPasses)
                             .arg(kMaxPasses));
-        binder->AddInt(f, "Rebuild spacing (ms)", &ShmHeader::rebuildSettleMs, 0, 5000,
-                       "How long the helper waits after a model setting changes before it rebuilds "
-                       "the pass, and between one rebuild and the next. Rebuilding is expensive, and "
-                       "back-to-back rebuilds have been seen to wedge the model on some drivers. "
-                       "Lower is snappier; 0 rebuilds immediately and chains the rest back to back. "
-                       "Raise it if the model ever stops answering after changing settings.",
-                       ShmBinder::Live);
         binder->AddPercent(f, "Model resolution", &ShmHeader::workingScaleBits, 25, 200,
                            "What fraction of the frame the model works at. The frame itself is never "
                            "reduced. Below 100% also cuts what crosses shared memory, quadratically. "
@@ -805,7 +848,8 @@ QWidget* MainWindow::buildSettings() {
                          "What the debug views are multiplied by on their way out.");
         binder->AddChoice(f, "Compare", &ShmHeader::compareMode, { "Off", "Side by side", "Wipe" },
                           "Shows the pass against itself. The wipe cuts one frame and resamples "
-                          "nothing, so it is the one to play with.");
+                          "nothing, so it is the one to play with. Works with composition off too: "
+                          "the model's raw answer is then shown against the frame.");
         binder->AddFloat(f, "Split", &ShmHeader::compareSplitBits, 0.0, 1.0, 0.01, "");
         binder->AddFloat(f, "Zoom", &ShmHeader::compareZoomBits, 1.0, 2.0, 0.05,
                          "Side by side only. 1 fits the whole frame and accepts the bars; 2 fills the "

@@ -67,13 +67,13 @@ The personal package variant includes these DLLs. Only redistribute the personal
 Public package:
 
 ```bash
-sudo rpm -Uvh dist/dlssnr-0.2.2-3.fc44.x86_64.rpm
+sudo rpm -Uvh dist/dlssnr-0.2.2-4.fc44.x86_64.rpm
 ```
 
 Personal package:
 
 ```bash
-sudo rpm -Uvh dist/dlssnr-personal-0.2.2-3.fc44.x86_64.rpm
+sudo rpm -Uvh dist/dlssnr-personal-0.2.2-4.fc44.x86_64.rpm
 ```
 
 `wine` is a recommended package, not a hard dependency, so Proton-only users are not forced to install host Wine.
@@ -83,8 +83,8 @@ sudo rpm -Uvh dist/dlssnr-personal-0.2.2-3.fc44.x86_64.rpm
 Extract the tarball:
 
 ```bash
-tar -xzf dist/dlssnr-0.2.2-3-linux-x86_64.tar.gz
-cd dlssnr-0.2.2-3-linux-x86_64
+tar -xzf dist/dlssnr-0.2.2-4-linux-x86_64.tar.gz
+cd dlssnr-0.2.2-4-linux-x86_64
 ```
 
 User install, no root required:
@@ -341,7 +341,7 @@ PROTON_ENABLE_NVAPI=1 \
 STEAM_COMPAT_DATA_PATH="$HOME/.local/share/dlssnr/prefix" \
 VKLayer_DLSS5=1 \
 DLSSNR_SMOKE_FRAMES=5 \
-"/home/hunter/.local/share/Steam/compatibilitytools.d/Proton-CachyOS Latest/proton" run "$PWD/build/smoke.exe"
+"$HOME/.local/share/Steam/compatibilitytools.d/Proton-CachyOS Latest/proton" run "$PWD/build/smoke.exe"
 ```
 
 Expected helper log lines:
