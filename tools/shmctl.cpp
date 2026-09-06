@@ -22,15 +22,62 @@
 
 namespace {
 
+// Every setting the header carries, by name, so the shell can drive the pass before there is an
+// interface for it. Table-driven on purpose: a field added to the header and not to this table is a
+// setting nobody can reach, and the table is short enough that the omission is obvious.
+struct Setting {
+    const char* name;
+    std::atomic<uint32_t> ShmHeader::*field;
+    bool isFloat;
+    const char* help;
+};
+
+const Setting kSettings[] = {
+    { "enabled", &ShmHeader::enabled, false, "0/1 run the model at all" },
+    { "passes", &ShmHeader::passes, false, "how many times the model runs over one frame" },
+    { "unlockpasses", &ShmHeader::unlockPasses, false, "0/1 lift the pass ceiling" },
+    { "preset", &ShmHeader::preset, false, "model preset" },
+    { "style", &ShmHeader::style, false, "0 default, 1 natural, 2 cinematic" },
+    { "automask", &ShmHeader::autoMask, false, "0/1 automatic skin mask" },
+    { "intensity", &ShmHeader::intensityBits, true, "model intensity" },
+    { "localtone", &ShmHeader::localToneBits, true, "local tone strength" },
+    { "localstructure", &ShmHeader::localStructureBits, true, "local structure strength" },
+    { "skinstructure", &ShmHeader::skinStructureBits, true, "-1 follows local structure" },
+    { "sharpness", &ShmHeader::sharpnessBits, true, "sharpness" },
+    { "detail", &ShmHeader::transferStrengthBits, true, "how much of the edit lands, 0-4" },
+    { "colour", &ShmHeader::colourStrengthBits, true, "how much of its colour comes with it, 0-4" },
+    { "guard", &ShmHeader::maxRatioBits, true, "highlight guard, the most a pixel may move" },
+    { "transfer", &ShmHeader::transfer, false, "0 classic, 1 matched residual" },
+    { "debugview", &ShmHeader::debugView, false, "0 off, 1 proxy, 2 model, 3 amplified edit" },
+    { "debugscale", &ShmHeader::debugScaleBits, true, "what the debug views are multiplied by" },
+    { "whitepoint", &ShmHeader::whitePointBits, true, "paper white" },
+    { "whitepointscale", &ShmHeader::whitePointScaleBits, true, "multiplier on the white point" },
+    { "workingscale", &ShmHeader::workingScaleBits, true, "the fraction of the frame the model works at" },
+    { "downscaler", &ShmHeader::scalingDownscaler, false, "0 bilinear, 1 bicubic, 2 lanczos3" },
+    { "compare", &ShmHeader::compareMode, false, "0 off, 1 side by side, 2 wipe" },
+    { "comparesplit", &ShmHeader::compareSplitBits, true, "where the split sits, 0-1" },
+    { "comparezoom", &ShmHeader::compareZoomBits, true, "side by side only, 1-2" },
+    { "compareswap", &ShmHeader::compareSwap, false, "0/1 which side the edited frame is on" },
+    { "colourmode", &ShmHeader::colourMode, false, "0 auto, 1 display-referred, 2 linear HDR" },
+    { "reversible", &ShmHeader::reversibleMode, false, "0 knee, 1 neutwo, 2 replace, 3 hybrid, 4 hybrid+replace" },
+    { "applymodel", &ShmHeader::applyModel, false, "0 show the clean frame, 1 apply the edit" },
+    { "hold", &ShmHeader::holdFrame, false, "0/1 freeze the frame the pass works on" },
+};
+
 void Usage() {
     std::fprintf(stderr,
-                 "usage: dlssnr-shmctl <shm-path> <command>\n"
+                 "usage: dlssnr-shmctl <shm-path> <command> [args]\n"
                  "\n"
                  "commands:\n"
-                 "  status   print the header, one 'key=value' per line\n"
-                 "  quit     ask the helper and the layer to stand down\n"
-                 "  resume   clear the quit flag and nudge the readers\n"
-                 "  reset    re-initialise the whole header to defaults\n");
+                 "  status          print the header, one 'key=value' per line\n"
+                 "  quit            ask the helper and the layer to stand down\n"
+                 "  resume          clear the quit flag and nudge the readers\n"
+                 "  reset           re-initialise the whole header to defaults\n"
+                 "  capture <n>     write n matched before/after frames\n"
+                 "  set <key> <v>   change one setting\n"
+                 "  settings        list the settings and their current values\n");
+    std::fprintf(stderr, "\nsettings:\n");
+    for (const auto& s : kSettings) std::fprintf(stderr, "  %-16s %s\n", s.name, s.help);
 }
 
 // Maps the header only. The two pixel regions are megabytes and nothing here reads them.
@@ -71,6 +118,35 @@ bool Initialised(const ShmHeader* h) {
     return h->magic.load() == kShmMagic && h->version.load() == kShmVersion;
 }
 
+void PrintSettings(ShmHeader* h) {
+    for (const auto& s : kSettings) {
+        const uint32_t raw = (h->*s.field).load();
+        if (s.isFloat) std::printf("%s=%g\n", s.name, double(BitsToFloat(raw)));
+        else std::printf("%s=%u\n", s.name, raw);
+    }
+}
+
+// Returns false when the name is not a setting, so the caller can say so rather than silently
+// succeeding at nothing.
+bool ApplySetting(ShmHeader* h, const char* name, const char* value) {
+    for (const auto& s : kSettings) {
+        if (std::strcmp(s.name, name) != 0) continue;
+        const double v = std::atof(value);
+        (h->*s.field).store(s.isFloat ? FloatToBits(float(v)) : uint32_t(v < 0 ? 0 : v));
+        h->controlSeq.fetch_add(1);
+        // Anything the model latches when its feature is built also bumps the tuning sequence, which
+        // is what tells the helper to rebuild rather than to keep using a feature built with the old
+        // values. Sharpness is absent: it is read at evaluate, so a running feature follows it.
+        static const char* kCreateTime[] = { "preset", "style", "automask", "intensity",
+                                             "localtone", "localstructure", "skinstructure", "passes" };
+        for (const char* k : kCreateTime) {
+            if (std::strcmp(k, name) == 0) { h->tuningSeq.fetch_add(1); break; }
+        }
+        return true;
+    }
+    return false;
+}
+
 void PrintStatus(const ShmHeader* h) {
     std::printf("initialised=%d\n", Initialised(h) ? 1 : 0);
     std::printf("magic=%#x\nversion=%u\n", h->magic.load(), h->version.load());
@@ -84,14 +160,15 @@ void PrintStatus(const ShmHeader* h) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
+    if (argc < 3) {
         Usage();
         return 2;
     }
     const char* path = argv[1];
     const char* cmd = argv[2];
 
-    const bool create = std::strcmp(cmd, "resume") == 0 || std::strcmp(cmd, "reset") == 0;
+    const bool create = std::strcmp(cmd, "resume") == 0 || std::strcmp(cmd, "reset") == 0 ||
+                        std::strcmp(cmd, "set") == 0 || std::strcmp(cmd, "capture") == 0;
 
     void* base = nullptr;
     int fd = -1;
@@ -115,6 +192,25 @@ int main(int argc, char** argv) {
         h->controlSeq.fetch_add(1);
     } else if (std::strcmp(cmd, "reset") == 0) {
         ShmInitDefaults(h);
+    } else if (std::strcmp(cmd, "settings") == 0) {
+        if (!Initialised(h)) ShmInitDefaults(h);
+        PrintSettings(h);
+    } else if (std::strcmp(cmd, "capture") == 0) {
+        if (argc != 4) { Usage(); rc = 2; }
+        else {
+            if (!Initialised(h)) ShmInitDefaults(h);
+            h->captureRequest.store(uint32_t(std::atoi(argv[3])));
+            h->controlSeq.fetch_add(1);
+        }
+    } else if (std::strcmp(cmd, "set") == 0) {
+        if (argc != 5) { Usage(); rc = 2; }
+        else {
+            if (!Initialised(h)) ShmInitDefaults(h);
+            if (!ApplySetting(h, argv[3], argv[4])) {
+                std::fprintf(stderr, "unknown setting: %s\n", argv[3]);
+                rc = 2;
+            }
+        }
     } else {
         Usage();
         rc = 2;

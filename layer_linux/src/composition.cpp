@@ -128,6 +128,8 @@ void Composition::DropAll() {
     DropHostBuffer(_upload);
     _width = _height = _modelW = _modelH = 0;
     _haveModel = false;
+    _frameCaptured = false;
+    _captureRecorded = false;
 }
 
 bool Composition::FormatSupportsStorage(VkFormat format) const {
@@ -395,7 +397,11 @@ void Composition::CopyWholeImage(VkCommandBuffer cb, VkImage src, VkImageLayout 
 // ---------------------------------------------------------------------------
 DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     DlssNrConstants c{};
-    c.WhitePoint = s.whitePoint;
+
+    // While held, the white point is the one snapshotted when hold came on. Upstream calls this the
+    // key constraint: anything that measures the white point keeps measuring, so leaving it live
+    // would drift the held picture for a reason other than the setting under test.
+    c.WhitePoint = (_holding && _frameCaptured) ? _heldWhitePoint : s.whitePoint;
     c.TransferStrength = s.transferStrength;
     c.ColourStrength = s.colourStrength;
     c.MaxRatio = s.maxRatio;
@@ -430,18 +436,36 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
 bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s) {
     if (!_usable || !_frame.image) return false;
 
-    // Frame hold: keep working on the picture already captured, so a setting changed now is compared
-    // against the same frame rather than against whatever the game has drawn since.
-    if (s.holdFrame && _haveModel) return true;
+    // Frame hold, on the edge rather than the level, so the white point is snapshotted once at the
+    // moment it comes on rather than re-read every frame it stays on.
+    if (s.holdFrame && !_holding) {
+        _holding = true;
+        _heldWhitePoint = s.whitePoint;
+        Log("[comp] frame held (white point %.3f)", double(_heldWhitePoint));
+    } else if (!s.holdFrame && _holding) {
+        _holding = false;
+        Log("[comp] frame released");
+    }
 
-    TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    Transition(cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    CopyWholeImage(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _frame.image,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, _width, _height);
+    // While held the frame is not re-read, but everything downstream of it still runs: the encode
+    // re-encodes, the model re-evaluates and the resolve re-composes, so a setting changed now is
+    // answered on the same picture. Freezing the proxy instead would be wrong -- settings must still
+    // re-encode -- and freezing it would also desynchronise it from the untouched keep.
+    const bool freeze = _holding && _frameCaptured;
 
-    // Straight back, so that every path out of this leg -- including the ones that give up -- leaves
-    // the image in the layout the present engine requires.
-    TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (!freeze) {
+        TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        Transition(cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        CopyWholeImage(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _frame.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, _width, _height);
+
+        // Straight back, so that every path out of this leg -- including the ones that give up --
+        // leaves the image in the layout the present engine requires.
+        TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        _frameCaptured = true;
+    }
 
     Transition(cb, _frame, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     Transition(cb, _proxy, VK_IMAGE_LAYOUT_GENERAL);
@@ -513,9 +537,37 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, _width, _height);
     TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
+    // The pair, taken here because this is the one place that holds both the frame as the game
+    // presented it and the frame the model edited, for the same frame.
+    _captureRecorded = false;
+    if (_capture.Active()) {
+        const size_t bytes = size_t(_width) * _height * (_workFormat == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4);
+        if (_captureBuf.buffer || MakeHostBuffer(_captureBuf, bytes * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+            Transition(cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            Transition(cb, _composed, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy r{};
+            r.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            r.imageExtent = { _width, _height, 1 };
+            _vk->vkCmdCopyImageToBuffer(cb, _frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        _captureBuf.buffer, 1, &r);
+            r.bufferOffset = bytes;
+            _vk->vkCmdCopyImageToBuffer(cb, _composed.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        _captureBuf.buffer, 1, &r);
+            _captureRecorded = true;
+        }
+    }
+
     // The keep is written by the next encode, so it goes back to where that dispatch expects it.
     Transition(cb, _keep, VK_IMAGE_LAYOUT_GENERAL);
     return true;
+}
+
+void Composition::WriteCapturedFrame() {
+    if (!_captureRecorded || !_captureBuf.mapped) return;
+    _captureRecorded = false;
+    const size_t bytes = size_t(_width) * _height * (_workFormat == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4);
+    const uint8_t* base = (const uint8_t*) _captureBuf.mapped;
+    _capture.WriteFrame(base, base + bytes, _width, _height, uint32_t(_workFormat));
 }
 
 }  // namespace dlssnr

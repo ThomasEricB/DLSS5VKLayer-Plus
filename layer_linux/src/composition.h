@@ -18,6 +18,7 @@
 // The composition itself -- what the resolve does with the model's answer -- is entirely the vendored
 // shader's. Everything in this file is plumbing: which image is bound where, in what layout, and what
 // goes in the constant block.
+#include "capture.h"
 #include "dlssnr_pass.h"
 #include "vk_table.h"
 
@@ -97,10 +98,15 @@ class Composition {
     // Leg 2. Composes and leaves the swapchain image holding the result, in PRESENT_SRC_KHR.
     bool RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
 
-    // Leg 2 without a model answer: the pass still runs, so a held frame and the comparison views
-    // keep working, but the model's contribution is whatever was last uploaded.
     bool HasModelFrame() const { return _haveModel; }
     void MarkModelFrame() { _haveModel = true; }
+
+    // Write this many matched before/after pairs, starting with the next composed frame.
+    void RequestCapture(uint32_t frames) { _capture.Begin(frames); }
+    bool CaptureActive() const { return _capture.Active(); }
+
+    // Called after leg 2's fence, when the readback the compose recorded has landed.
+    void WriteCapturedFrame();
 
   private:
     struct Image {
@@ -151,7 +157,17 @@ class Composition {
     bool _haveModel = false;
 
     Image _frame{}, _keep{}, _proxy{}, _work{}, _model{}, _composed{};
-    HostBuffer _download{}, _upload{};
+    HostBuffer _download{}, _upload{}, _captureBuf{};
+
+    CaptureWriter _capture;
+    bool _captureRecorded = false;
+
+    // Frame hold. The freeze point is the raw colour the encode reads, not the proxy: both the proxy
+    // and the untouched keep are derived from it, and freezing further down would stop a setting
+    // change from re-encoding, which is the whole point of holding.
+    bool _holding = false;
+    bool _frameCaptured = false;
+    float _heldWhitePoint = 1.0f;
 };
 
 }  // namespace dlssnr

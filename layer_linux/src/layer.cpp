@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -717,6 +718,13 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         return false;
     }
 
+    // A capture is asked for by writing a frame count into the header; taking it clears the request,
+    // so one press produces one run rather than one per frame for as long as nobody clears it.
+    if (dc->shm.hdr) {
+        if (const uint32_t frames = dc->shm.hdr->captureRequest.exchange(0); frames > 0)
+            sc.comp->RequestCapture(std::min<uint32_t>(frames, 64));
+    }
+
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -771,6 +779,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         return false;
     }
     if (!runLeg()) return false;
+    sc.comp->WriteCapturedFrame();
     const double tReturn = time ? NowMs() : 0.0;
 
     if (dc->shm.hdr) {
