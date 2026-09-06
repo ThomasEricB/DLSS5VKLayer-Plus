@@ -149,6 +149,7 @@ class Composition {
 
     void Transition(VkCommandBuffer cb, Image& img, VkImageLayout to);
     void TransitionSwapchain(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to);
+    bool FormatSupportsBlit(VkFormat format) const;
     void CopyWholeImage(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout, VkImage dst,
                         VkImageLayout dstLayout, uint32_t w, uint32_t h);
 
@@ -168,7 +169,8 @@ class Composition {
     uint32_t _width = 0, _height = 0;
     uint32_t _modelW = 0, _modelH = 0;
     VkFormat _swapchainFormat = VK_FORMAT_UNDEFINED;
-    VkFormat _workFormat = VK_FORMAT_UNDEFINED;  // the UNORM twin everything internal uses
+    VkFormat _workFormat = VK_FORMAT_UNDEFINED;  // usually the swapchain's UNORM twin; see Prepare
+    bool _blitSwapchain = false;                 // set when _workFormat is not the swapchain's twin
     VkFormat _keepFormat = VK_FORMAT_UNDEFINED;
     bool _linearHdr = false;
     bool _haveModel = false;

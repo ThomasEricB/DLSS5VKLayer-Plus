@@ -151,6 +151,15 @@ bool Composition::FormatSupportsStorage(VkFormat format) const {
     return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
 }
 
+// Both directions, because the swapchain is the source of the capture and the destination of the
+// composition, and a blit needs the format to allow each end it is used at.
+bool Composition::FormatSupportsBlit(VkFormat format) const {
+    VkFormatProperties props{};
+    _instance->vkGetPhysicalDeviceFormatProperties(_physicalDevice, format, &props);
+    const VkFormatFeatureFlags both = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    return (props.optimalTilingFeatures & both) == both;
+}
+
 bool Composition::MakeImage(Image& img, uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage) {
     DropImage(img);
 
@@ -277,20 +286,39 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
                           bool linearHdr) {
     if (!_usable) return false;
 
-    const VkFormat work = CompositionFormat(swapchainFormat);
+    VkFormat work = CompositionFormat(swapchainFormat);
     if (work == VK_FORMAT_UNDEFINED) {
         _reason = "unsupported swapchain format";
         return false;
     }
 
-    // The composed surface is written as a storage image and then copied, byte for byte, into the
-    // swapchain. Both halves of that constrain it to the swapchain's own UNORM twin: a different
-    // format would either be rejected by the copy or reinterpret the channels.
+    // The composed surface is written as a storage image and then handed back to the swapchain. When
+    // the swapchain's own UNORM twin can be written that way, that is what everything internal uses:
+    // it shares the swapchain's bit layout, so both ends are a byte-for-byte copy and nothing is
+    // reinterpreted.
+    //
+    // Not every presentable format can be written as a storage image, though. NVIDIA does not expose
+    // A2R10G10B10_UNORM_PACK32 that way, and that is exactly what a 10-bit desktop hands most games
+    // -- so the pass used to switch itself off, for the whole run, on the machines it was written
+    // for. Compose in half float in that case and blit at both ends instead: the blit converts, and
+    // sixteen bits a channel hold more than the ten the swapchain can show, so nothing is lost that
+    // the display could have displayed.
+    bool blit = false;
     if (!FormatSupportsStorage(work)) {
-        _reason = "this device cannot write the swapchain's format as a storage image";
-        Log("[comp] %s (format %d)", _reason.c_str(), (int) work);
-        _usable = false;
-        return false;
+        const VkFormat wide = VK_FORMAT_R16G16B16A16_SFLOAT;
+        if (FormatSupportsStorage(wide) && FormatSupportsBlit(wide) && FormatSupportsBlit(swapchainFormat)) {
+            // Prepare runs every frame; this is only news when the swapchain changed under it.
+            if (swapchainFormat != _swapchainFormat)
+                Log("[comp] format %d cannot be written as a storage image here; composing in half float",
+                    (int) work);
+            work = wide;
+            blit = true;
+        } else {
+            _reason = "this device cannot write the swapchain's format as a storage image";
+            Log("[comp] %s (format %d)", _reason.c_str(), (int) work);
+            _usable = false;
+            return false;
+        }
     }
 
     // A known divergence from the spec, carried deliberately and inherited from upstream.
@@ -350,6 +378,7 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
 
     _swapchainFormat = swapchainFormat;
     _workFormat = work;
+    _blitSwapchain = blit;
     _linearHdr = linearHdr;
 
     // The untouched copy is float only when the frame it holds is: on a display-referred frame the
@@ -442,8 +471,20 @@ void Composition::TransitionSwapchain(VkCommandBuffer cb, VkImage image, VkImage
                               nullptr, 0, nullptr, 1, &b);
 }
 
+// One step in or out of the swapchain. A copy when the two formats share a bit layout, which is the
+// usual case and moves the bytes untouched; a blit when the working format had to differ, which
+// converts between them. Same extent either way -- this never resamples.
 void Composition::CopyWholeImage(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout, VkImage dst,
                                  VkImageLayout dstLayout, uint32_t w, uint32_t h) {
+    if (_blitSwapchain) {
+        VkImageBlit b{};
+        b.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        b.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        b.srcOffsets[1] = { (int32_t) w, (int32_t) h, 1 };
+        b.dstOffsets[1] = { (int32_t) w, (int32_t) h, 1 };
+        _vk->vkCmdBlitImage(cb, src, srcLayout, dst, dstLayout, 1, &b, VK_FILTER_NEAREST);
+        return;
+    }
     VkImageCopy copy{};
     copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
