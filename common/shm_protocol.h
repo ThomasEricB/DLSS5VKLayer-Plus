@@ -111,6 +111,8 @@ enum Downscaler : uint32_t {
 };
 
 // What the helper has managed to do, for the GUI and for the layer's fail-open decision.
+// The layer reads this to decide whether anything is listening, so "nobody" has to be the value a
+// freshly initialised header holds -- not a state that also means "starting".
 enum HelperState : uint32_t {
     kHelperStarting = 0,
     kHelperNoVulkan = 1,   // no NVIDIA device with the NVX extensions
@@ -352,6 +354,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
     std::memset(static_cast<void*>(h), 0, sizeof(ShmHeader));
     h->magic.store(kShmMagic);
     h->version.store(kShmVersion);
+    h->helperState.store(kHelperStopped);
     h->format.store(1);
     h->passes.store(1);
     h->enabled.store(1);

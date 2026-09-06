@@ -271,10 +271,17 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
     // first frame is far more than that. A helper that is not running needs none at all, and the old
     // fixed second-per-frame budget meant a game whose helper was simply not started froze for eight
     // seconds before the layer gave up. That is what this is for.
-    const bool helperAlive = s.everAnswered ||
-                             s.hdr->helperState.load() == kHelperRunning ||
-                             s.hdr->heartbeat.load() != s.firstHeartbeat;
-    const double budgetMs = helperAlive ? 1000.0 : 20.0;
+    // Is anything listening? The helper says so itself, from the moment it attaches until it exits,
+    // which is the only signal that stays true while it is busy. Heartbeats do not: it stops ticking
+    // them precisely while it is building the model's feature.
+    const bool helperPresent = s.hdr->helperState.load() != kHelperStopped;
+
+    // The first frame of a size is not like the others. It makes the helper load the model and build
+    // a feature -- measured at 194 ms for a small frame and more for a large one -- against about 4 ms
+    // once it is warm. Timing that out and giving up is how a working helper gets abandoned before it
+    // has answered once.
+    const bool warmingUp = !s.everAnswered;
+    const double budgetMs = !helperPresent ? 20.0 : (warmingUp ? 10000.0 : 1000.0);
 
     // Wait for the helper (fail-open: present the original frame on timeout).
     const double tSignal = NowMs();
@@ -304,8 +311,8 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
     if (++s.timeouts >= 4) {
         s.dead = true;
         s.retryAfterMs = NowMs() + 5000.0;
-        Log("[shm] no answer from the helper in %.0f ms x4; passing frames through, retrying in 5s",
-            budgetMs);
+        Log("[shm] no answer in %.0f ms x4 (helper %s); passing frames through, retrying in 5s",
+            budgetMs, helperPresent ? "is present but silent" : "not running");
     }
     return false;
 }

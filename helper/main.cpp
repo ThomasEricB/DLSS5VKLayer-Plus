@@ -97,6 +97,12 @@ static bool ShmOpen(ShmMap& s) {
     if (s.hdr->quit.load()) Log("[helper] clearing stale quit flag");
     s.hdr->quit.store(0);
     s.hdr->seq_resp.store(s.hdr->seq_req.load());
+    // Announced before anything slow happens. The first frame at a new size makes the model load a
+    // 165 MB library and build a feature -- hundreds of milliseconds at least -- during which this
+    // process ticks no heartbeat because it is busy. A layer inferring liveness from heartbeats alone
+    // concludes nobody is there at exactly the moment the helper is working hardest, which is how a
+    // running helper came to be ignored.
+    s.hdr->helperState.store(kHelperStarting);
     s.hdr->controlSeq.fetch_add(1);
     s.hdr->heartbeat.fetch_add(1);
     Log("[helper] shm attached: %ls", winPath.c_str());
@@ -804,7 +810,13 @@ int main() {
     }
 
     NeuralState ns{};
-    if (!CreateContext(ns.vk)) return 3;
+    if (!CreateContext(ns.vk)) {
+        shm.hdr->helperState.store(kHelperNoVulkan);
+        ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                       "no NVIDIA device with the NVX extensions");
+        return 3;
+    }
+    shm.hdr->helperState.store(kHelperRunning);
     Log("[helper] context ready, waiting for frames");
 
     uint32_t lastReq = shm.hdr->seq_resp.load();
@@ -830,6 +842,7 @@ int main() {
 
     if (shm.hdr->quit.load()) Log("[helper] quit requested");
     else if (ns.ngx.disabled) Log("[helper] neural disabled");
+    shm.hdr->helperState.store(kHelperStopped);
     Log("[helper] shutting down");
     if (ns.ngx.snippet) NgxTeardown(ns.ngx, ns.vk.device);
     vkDeviceWaitIdle(ns.vk.device);
