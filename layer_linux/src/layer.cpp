@@ -284,8 +284,43 @@ static std::unordered_map<VkPhysicalDevice, InstanceChain*> g_phys;
 static std::unordered_map<VkDevice, DeviceChain*> g_devices;
 static std::mutex g_stateMutex;
 
+// Where this copy of the layer was loaded from, for the duplicate check below.
+static std::string LayerObjectPath() {
+    Dl_info info{};
+    if (dladdr((const void*)&LayerObjectPath, &info) && info.dli_fname && *info.dli_fname)
+        return info.dli_fname;
+    return std::string();
+}
+
+// True when a *different* copy of this layer is already in the chain.
+//
+// build.sh installs an implicit-layer manifest pointing at the build tree while install.sh installs
+// another pointing at the install prefix, and the loader honours both: two copies of the layer, two
+// present hooks, two full round trips, and a single shared-memory file with two writers racing on
+// one sequence number. Only the first copy stays live; the rest declare themselves inert and pass
+// everything through, which turns a corrupted picture or a hang into one warning line.
+//
+// The claim is the object's own path rather than a bare flag, so a second call into the same copy --
+// which is legal, the loader may negotiate more than once -- is told apart from a second copy.
+static bool DuplicateLayerCopy() {
+    static const bool dup = [] {
+        const std::string self = LayerObjectPath();
+        const char* claimed = getenv("DLSSNR_LAYER_OBJECT");
+        if (claimed && *claimed) {
+            if (self.empty() || self == claimed) return false;
+            Log("[layer] another copy is already loaded from %s; this copy (%s) stays inert. "
+                "Remove one of the implicit-layer manifests.", claimed, self.c_str());
+            return true;
+        }
+        if (!self.empty()) setenv("DLSSNR_LAYER_OBJECT", self.c_str(), 0);
+        return false;
+    }();
+    return dup;
+}
+
 static bool LayerEnabled() {
     static const bool e = [] {
+        if (DuplicateLayerCopy()) return false;
         const char* v = getenv("VKLayer_DLSS5");
         if (v && v[0] == '1') return true;
         const char* o = getenv("DLSSNR_ENABLE");
