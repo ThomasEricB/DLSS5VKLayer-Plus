@@ -36,7 +36,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// The layer's name has to differ per architecture.
+//
+// The loader keys implicit layers by name, so two manifests claiming the same name are one layer to
+// it: it keeps whichever it read first and then rejects it for the process's word size, reporting
+// only "Requested layer VK_LAYER_NV_dlssnr was wrong bit-type" -- with the manifest that would have
+// worked sitting unread beside it. Steam hit the same wall and answered it the same way, which is why
+// its overlay is VK_LAYER_VALVE_steam_overlay_32 next to _64 rather than one name twice.
+#ifdef DLSSNR_LAYER_32
+#define VK_LAYER_NAME "VK_LAYER_NV_dlssnr_32"
+#else
 #define VK_LAYER_NAME "VK_LAYER_NV_dlssnr"
+#endif
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -92,10 +103,19 @@ static inline void CpuYield() {
 // Shared memory transport
 // ---------------------------------------------------------------------------
 struct ShmMap {
-    void* base = nullptr;
+    // Three mappings rather than one.
+    //
+    // The file is a header followed by two pixel regions each large enough for the biggest frame the
+    // protocol allows, which is a quarter of a gigabyte in total. Mapping all of it was fine on
+    // 64-bit and is not on 32-bit: a 32-bit game has about 3 GB of address space and would be handing
+    // a tenth of it to a reservation it never touches. Both region offsets are page-aligned by
+    // construction, so each can be mapped on its own at the size actually in use -- a few megabytes
+    // for a real frame instead of 265.
+    int fd = -1;
     ShmHeader* hdr = nullptr;
     uint8_t* inPixels = nullptr;
     uint8_t* outPixels = nullptr;
+    size_t mappedFrameBytes = 0;
     uint32_t seq = 0;
     uint32_t timeouts = 0;
     uint32_t lastControlSeq = 0;
@@ -124,25 +144,56 @@ static std::string ShmDefaultPathLayer() {
     return std::string("/tmp/dlssnr-") + std::to_string(getuid()) + "/shm.bin";
 }
 
+// Maps the two pixel regions at the size this frame needs, remapping when the size changes.
+static bool ShmMapFrames(ShmMap& s, size_t bytes) {
+    if (s.mappedFrameBytes >= bytes && s.inPixels && s.outPixels) return true;
+    if (bytes > kMaxFrame) return false;
+
+    // Round up so a small change in resolution does not remap every frame.
+    const size_t pageSize = size_t(sysconf(_SC_PAGESIZE));
+    const size_t want = ((bytes + pageSize - 1) / pageSize) * pageSize;
+
+    if (s.inPixels) munmap(s.inPixels, s.mappedFrameBytes);
+    if (s.outPixels) munmap(s.outPixels, s.mappedFrameBytes);
+    s.inPixels = s.outPixels = nullptr;
+    s.mappedFrameBytes = 0;
+
+    void* in = mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_SHARED, s.fd, (off_t) kHeaderBytes);
+    if (in == MAP_FAILED) { Log("[shm] could not map the input region (%zu bytes)", want); return false; }
+
+    void* out = mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_SHARED, s.fd,
+                     (off_t) (kHeaderBytes + kMaxFrame));
+    if (out == MAP_FAILED) {
+        munmap(in, want);
+        Log("[shm] could not map the output region (%zu bytes)", want);
+        return false;
+    }
+
+    s.inPixels = (uint8_t*) in;
+    s.outPixels = (uint8_t*) out;
+    s.mappedFrameBytes = want;
+    return true;
+}
+
 static bool ShmOpen(ShmMap& s) {
-    if (s.base) return true;
+    if (s.hdr) return true;
     const char* path = getenv("DLSSNR_SHM");
     std::string p = (path && *path) ? path : ShmDefaultPathLayer();
     EnsureParentDir(p);
     int fd = open(p.c_str(), O_RDWR | O_CREAT, 0600);
     if (fd < 0) { Log("[shm] open %s failed", p.c_str()); return false; }
+    // The file still spans the whole protocol -- the offsets are fixed and both sides agree on them --
+    // but it is sparse, so the size on disk is what has actually been written.
     size_t total = ShmTotalBytes();
     struct stat st{};
     if (fstat(fd, &st) != 0 || (size_t)st.st_size < total) {
         if (ftruncate(fd, (off_t)total) != 0) { close(fd); return false; }
     }
-    void* m = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (m == MAP_FAILED) { Log("[shm] mmap failed"); return false; }
-    s.base = m;
+
+    void* m = mmap(nullptr, kHeaderBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { Log("[shm] mmap of the header failed"); close(fd); return false; }
+    s.fd = fd;
     s.hdr = (ShmHeader*)m;
-    s.inPixels = (uint8_t*)m + kHeaderBytes;
-    s.outPixels = s.inPixels + kMaxFrame;
     // A mapping left by an older build has a different magic, a different version, or a header
     // laid out differently; re-initialising is the only safe reading of any of those.
     if (s.hdr->magic.load() != kShmMagic || s.hdr->version.load() != kShmVersion ||
@@ -195,6 +246,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
     const bool time = TimeEnabled();
     const double t0 = NowMs();
     const size_t bytes = size_t(w) * h * 4;
+    if (!ShmMapFrames(s, bytes)) { s.dead = true; return false; }
     std::memcpy(s.inPixels, proxy, bytes);
     const double tCopy = NowMs();
     s.hdr->width.store(w);
@@ -261,9 +313,9 @@ struct SwapchainState {
     std::vector<VkImage> images;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
-    VkFence fence = nullptr;
-    VkCommandPool pool = nullptr;
-    VkCommandBuffer cb = nullptr;
+    VkFence fence = VK_NULL_HANDLE;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
     bool ready = false;
     bool passThrough = false;
 
@@ -939,7 +991,18 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v) {
         v->pfnGetDeviceProcAddr = vkGetDeviceProcAddr;
         v->pfnGetPhysicalDeviceProcAddr = nullptr;
     }
-    Log("=== VK_LAYER_NV_dlssnr loaded (VKLayer_DLSS5=%s) ===", getenv("VKLayer_DLSS5") ? getenv("VKLayer_DLSS5") : "(unset)");
+    // Once per process, not once per negotiate.
+    //
+    // The loader re-enumerates the implicit layer directory many times during a single instance
+    // creation -- 628 times for one 32-bit vkCreateInstance here, and the same for every other
+    // manifest in the directory -- and loads this library on each pass. That is the loader's
+    // business, but announcing it each time turned one line into 627 in the user's log. Every other
+    // layer stays quiet because none of them log from here.
+    static std::once_flag announced;
+    std::call_once(announced, [] {
+        const char* v = getenv("VKLayer_DLSS5");
+        Log("=== %s loaded (VKLayer_DLSS5=%s) ===", VK_LAYER_NAME, v ? v : "(unset)");
+    });
     return VK_SUCCESS;
 }
 

@@ -130,24 +130,24 @@ struct VkCtx {
     VkDevice device = nullptr;
     VkQueue queue = nullptr;
     uint32_t queueFamily = 0;
-    VkCommandPool cmdPool = nullptr;
-    VkCommandBuffer cmdScratch = nullptr;
-    VkCommandBuffer cmdCreate = nullptr;
-    VkCommandBuffer cmdEval = nullptr;
-    VkFence fence = nullptr;
-    VkBuffer uploadStaging = nullptr;
-    VkBuffer readStaging = nullptr;
-    VkDeviceMemory uploadMem = nullptr;
-    VkDeviceMemory readMem = nullptr;
+    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    VkCommandBuffer cmdScratch = VK_NULL_HANDLE;
+    VkCommandBuffer cmdCreate = VK_NULL_HANDLE;
+    VkCommandBuffer cmdEval = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkBuffer uploadStaging = VK_NULL_HANDLE;
+    VkBuffer readStaging = VK_NULL_HANDLE;
+    VkDeviceMemory uploadMem = VK_NULL_HANDLE;
+    VkDeviceMemory readMem = VK_NULL_HANDLE;
     void* uploadMap = nullptr;
     void* readMap = nullptr;
     size_t stagingSize = 0;
 };
 
 struct GpuImage {
-    VkImage image = nullptr;
-    VkImageView view = nullptr;
-    VkDeviceMemory memory = nullptr;
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -503,23 +503,6 @@ static NgxTuning TuningFor(const ShmHeader* h, uint32_t pass) {
     t.preset = p.preset;
     t.autoMask = p.autoMask ? 1u : 0u;
     return t;
-}
-
-static void Swizzle(uint8_t* dst, const uint8_t* src, size_t px) {
-    uint32_t* d = (uint32_t*)dst;
-    const uint32_t* s = (const uint32_t*)src;
-    size_t i = 0;
-    for (; i + 4 <= px; i += 4) {
-        uint32_t v0 = s[i + 0], v1 = s[i + 1], v2 = s[i + 2], v3 = s[i + 3];
-        d[i + 0] = (v0 & 0xFF00FF00u) | ((v0 & 0x00FF0000u) >> 16) | ((v0 & 0x000000FFu) << 16);
-        d[i + 1] = (v1 & 0xFF00FF00u) | ((v1 & 0x00FF0000u) >> 16) | ((v1 & 0x000000FFu) << 16);
-        d[i + 2] = (v2 & 0xFF00FF00u) | ((v2 & 0x00FF0000u) >> 16) | ((v2 & 0x000000FFu) << 16);
-        d[i + 3] = (v3 & 0xFF00FF00u) | ((v3 & 0x00FF0000u) >> 16) | ((v3 & 0x000000FFu) << 16);
-    }
-    for (; i < px; ++i) {
-        uint32_t v = s[i];
-        d[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16);
-    }
 }
 
 static void PublishStatus(ShmMap& shm, NeuralState& ns, uint32_t state) {

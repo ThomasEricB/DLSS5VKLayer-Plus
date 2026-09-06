@@ -9,17 +9,36 @@ mkdir -p build/layer
 # MinGW CRT (LP64 vs LLP64 uintptr_t conflict + VkPipelineStageFlagBits2 truncation).
 VK_INC="-I standalone_runner/third_party"
 
-echo "[1/5] Linux layer .so"
+LAYER_SRC="layer_linux/src/layer.cpp
+    layer_linux/src/shader_vk.cpp
+    layer_linux/src/dlssnr_pass.cpp
+    layer_linux/src/composition.cpp
+    layer_linux/src/capture.cpp
+    layer_linux/src/scaler_vk.cpp
+    layer_linux/src/hotkey.cpp"
+
+echo "[1/5] Linux layer .so (64-bit)"
 g++ -O2 -std=c++17 -shared -fPIC -Wall $VK_INC -I layer_linux/src \
-    layer_linux/src/layer.cpp \
-    layer_linux/src/shader_vk.cpp \
-    layer_linux/src/dlssnr_pass.cpp \
-    layer_linux/src/composition.cpp \
-    layer_linux/src/capture.cpp \
-    layer_linux/src/scaler_vk.cpp \
-    layer_linux/src/hotkey.cpp \
-    -o build/layer/libVkLayer_NV_dlssnr.so -lpthread
-cp layer_linux/manifest/VK_LAYER_NV_dlssnr.json build/layer/
+    $LAYER_SRC -o build/layer/libVkLayer_NV_dlssnr.so -lpthread
+
+# A 32-bit layer as well, for 32-bit Vulkan games.
+#
+# The Vulkan loader can only load a layer of the process's own word size, so a 32-bit game -- an
+# OpenGL title running on zink, or a Windows game under a Proton that is not in WoW64 mode -- sees
+# nothing at all unless there is a 32-bit build of the layer for it to load. The shared-memory header
+# is laid out identically under both ABIs, so the 32-bit layer talks to the same 64-bit helper.
+#
+# Skipped rather than fatal when there is no 32-bit toolchain: most people do not need it, and a
+# missing multilib compiler should not stop the 64-bit build.
+mkdir -p build/layer32
+if echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null 2>/dev/null; then
+    echo "[1/5] Linux layer .so (32-bit)"
+    g++ -m32 -O2 -std=c++17 -shared -fPIC -Wall -DDLSSNR_LAYER_32 $VK_INC -I layer_linux/src \
+        $LAYER_SRC -o build/layer32/libVkLayer_NV_dlssnr.so -lpthread
+else
+    echo "[1/5] 32-bit layer skipped: no 'g++ -m32' (install a multilib toolchain for 32-bit games)"
+    rm -f build/layer32/libVkLayer_NV_dlssnr.so
+fi
 
 echo "[2/5] Windows helper .exe"
 x86_64-w64-mingw32-g++ -O2 -std=c++17 -static -mwindows -Wall $VK_INC -idirafter /usr/include -I core \
@@ -68,12 +87,29 @@ fi
 if [ "${DLSSNR_SKIP_MANIFEST_INSTALL:-0}" != "1" ]; then
     IMPLICIT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/vulkan/implicit_layer.d"
     mkdir -p "$IMPLICIT_DIR"
+
+    # One manifest per architecture, each naming its own library. The loader reads every manifest in
+    # the directory and skips the one whose library is the wrong word size, which is exactly how Steam
+    # ships its own overlay (steamoverlay_i386.json beside steamoverlay_x86_64.json).
     sed "s#./libVkLayer_NV_dlssnr.so#$PWD/build/layer/libVkLayer_NV_dlssnr.so#" \
-        layer_linux/manifest/VK_LAYER_NV_dlssnr.json > "$IMPLICIT_DIR/VK_LAYER_NV_dlssnr.json"
+        layer_linux/manifest/VK_LAYER_NV_dlssnr.json > "$IMPLICIT_DIR/VK_LAYER_NV_dlssnr.x86_64.json"
+
+    if [ -f build/layer32/libVkLayer_NV_dlssnr.so ]; then
+        sed -e "s#./libVkLayer_NV_dlssnr.so#$PWD/build/layer32/libVkLayer_NV_dlssnr.so#" \
+            -e 's#"VK_LAYER_NV_dlssnr"#"VK_LAYER_NV_dlssnr_32"#' \
+            layer_linux/manifest/VK_LAYER_NV_dlssnr.json > "$IMPLICIT_DIR/VK_LAYER_NV_dlssnr.i686.json"
+    else
+        rm -f "$IMPLICIT_DIR/VK_LAYER_NV_dlssnr.i686.json"
+    fi
+
+    # The single-architecture manifest earlier builds installed. Left in place it would load the
+    # 64-bit layer a second time under a different name, which the layer now refuses but still logs.
+    rm -f "$IMPLICIT_DIR/VK_LAYER_NV_dlssnr.json"
 fi
 
 echo "built:"
-echo "  build/layer/libVkLayer_NV_dlssnr.so (+ installed implicit manifest)"
+echo "  build/layer/libVkLayer_NV_dlssnr.so   (64-bit)"
+echo "  build/layer32/libVkLayer_NV_dlssnr.so (32-bit, if a multilib toolchain is present)"
 echo "  build/dlssnr_helper.exe"
 echo "  build/smoke.exe"
 echo "  build/runner_probe"
