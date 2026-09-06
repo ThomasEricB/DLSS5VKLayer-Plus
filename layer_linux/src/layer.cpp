@@ -593,13 +593,20 @@ static void Barrier(DeviceChain* dc, VkCommandBuffer cb, VkImage img, VkImageLay
 
 // Returns true if the swapchain image now holds the neural-processed frame.
 //
+// The caller's present semaphores are consumed here, by the capture submit, because that submit is
+// the first thing to touch the image and must not start before the game's render has finished. They
+// are therefore unsignalled by the time this returns and must not be handed to vkQueuePresentKHR a
+// second time -- the caller presents with none instead. Everything this records is fenced on the CPU
+// before it returns, so the present needs nothing to wait on.
+//
 // The image arrives in VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, which is what the game transitioned it to
 // before handing it to vkQueuePresentKHR, and it must be back in that layout on every path out --
 // including the fail-open one. It is not COLOR_ATTACHMENT_OPTIMAL: that is where the game's render
 // pass left it, one transition earlier, and naming it here made every barrier a layout mismatch and
 // handed the present engine an image in a layout it does not accept.
 static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
-                           VkImage swapchainImage, uint32_t* outW, uint32_t* outH) {
+                           VkImage swapchainImage, uint32_t waitCount,
+                           const VkSemaphore* waitSemaphores, uint32_t* outW, uint32_t* outH) {
     VkDevice d = dc->self;
     size_t bytes = size_t(sc.width) * sc.height * 4;
     VkCommandBuffer cb = sc.cb;
@@ -610,11 +617,24 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+
+    // Only the capture submit waits. The later ones are ordered behind it on the same queue and are
+    // fenced on the CPU besides, and a semaphore may only be waited on once per signal.
+    std::vector<VkPipelineStageFlags> waitStages(waitCount, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    si.waitSemaphoreCount = waitCount;
+    si.pWaitSemaphores = waitCount ? waitSemaphores : nullptr;
+    si.pWaitDstStageMask = waitCount ? waitStages.data() : nullptr;
+    const auto dropWaits = [&] {
+        si.waitSemaphoreCount = 0;
+        si.pWaitSemaphores = nullptr;
+        si.pWaitDstStageMask = nullptr;
+    };
     VkBufferImageCopy region{};
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = { sc.width, sc.height, 1 };
 
     auto restorePresentLayout = [&]() {
+        dropWaits();
         if (dc->vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
         Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT,
@@ -640,6 +660,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     if (dc->vkQueueSubmit(queue, 1, &si, sc.fence) != VK_SUCCESS) return false;
     if (dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
     dc->vkResetFences(d, 1, &sc.fence);
+    dropWaits();
     const double tCapture = time ? NowMs() : 0.0;
 
     // ---- ship to helper ----
@@ -696,6 +717,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
     }
     if (!dc || !dc->vkQueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
 
+    // Whether this call's wait semaphores have already been consumed by a submit of ours. They are
+    // handed to the first swapchain we actually process; every path after that presents with none,
+    // because a semaphore signalled once may only be waited on once. Presenting with them a second
+    // time is a wait that never completes -- which is what a second layer in the chain, Steam's
+    // overlay among them, turns from a latent bug into a hang.
+    bool waitsConsumed = false;
+
     if (!dc->inert && LayerEnabled()) {
         std::lock_guard<std::mutex> lk(dc->lock);
         if (!ShmNeuralEnabled(dc->shm)) return dc->vkQueuePresentKHR(queue, pPresentInfo);
@@ -712,12 +740,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                 sc.ready = true;
             }
             if (!sc.ready || dc->shm.dead) continue;
+            const uint32_t waitCount = waitsConsumed ? 0u : pPresentInfo->waitSemaphoreCount;
+            waitsConsumed = true;
             uint32_t ow = 0, oh = 0;
-            ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]], &ow, &oh);
-            // On failure we simply present the original frame (fail-open).
+            ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]], waitCount,
+                           pPresentInfo->pWaitSemaphores, &ow, &oh);
+            // On failure we simply present the original frame (fail-open). The semaphores are still
+            // consumed -- the capture submit waits on them before anything can fail -- so the flag
+            // stays set and the present below still drops them.
         }
     }
-    return dc->vkQueuePresentKHR(queue, pPresentInfo);
+
+    if (!waitsConsumed) return dc->vkQueuePresentKHR(queue, pPresentInfo);
+
+    // pNext is carried through untouched: present ids, present timing and the rest belong to the
+    // caller and none of them are about semaphores.
+    VkPresentInfoKHR pi = *pPresentInfo;
+    pi.waitSemaphoreCount = 0;
+    pi.pWaitSemaphores = nullptr;
+    return dc->vkQueuePresentKHR(queue, &pi);
 }
 
 // ---------------------------------------------------------------------------
