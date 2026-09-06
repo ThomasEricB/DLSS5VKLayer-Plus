@@ -46,7 +46,10 @@ static void Log(const char* fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    std::lock_guard<std::mutex> lk(*(new std::mutex));  // leaked by design
+    // One mutex for the sink, not one per line: the previous form allocated a fresh
+    // std::mutex on every call and leaked it, which at present rates is a leak per frame.
+    static std::mutex sinkMutex;
+    std::lock_guard<std::mutex> lk(sinkMutex);
     fprintf(f, "[dlssnr-layer] %s\n", buf);
     fflush(f);
 }
