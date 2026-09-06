@@ -503,6 +503,7 @@ cmd_start() {
 
   export WINEPREFIX="$WINE_PREFIX_DIR"
   export DLSSNR_SHM="$shm"
+  export DLSSNR_UID="$UID"
   export DLSSNR_LOG="$log"
   export DXVK_CONFIG_FILE="$DXVK_CONFIG_FILE"
   export WINEDEBUG="${WINEDEBUG:--all}"

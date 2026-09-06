@@ -66,9 +66,15 @@ static bool ShmOpen(ShmMap& s) {
     // DLSSNR_SHM holds the POSIX path (used by the Linux layer); translate to
     // the Wine-visible drive path (Z:\...) for CreateFileW.
     const char* posix = getenv("DLSSNR_SHM");
-    std::string p = (posix && *posix) ? posix : "/tmp/dlssnr_shm.bin";
+    std::string p = (posix && *posix) ? posix : ShmDefaultPath();
     std::wstring winPath = L"Z:";
     for (char c : p) winPath += (c == '/') ? L'\\' : (wchar_t)c;
+    std::wstring dir = winPath;
+    size_t slash = dir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        dir.resize(slash);
+        if (!dir.empty()) CreateDirectoryW(dir.c_str(), nullptr);
+    }
     s.file = CreateFileW(winPath.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                          nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (s.file == INVALID_HANDLE_VALUE) { Log("[helper] open %ls failed (%lu)", winPath.c_str(), GetLastError()); return false; }
@@ -86,6 +92,8 @@ static bool ShmOpen(ShmMap& s) {
     if (s.hdr->magic.load() != kShmMagic || s.hdr->passes.load() == 0) {
         ShmInitDefaults(s.hdr);
     }
+    s.hdr->controlSeq.fetch_add(1);
+    s.hdr->heartbeat.fetch_add(1);
     Log("[helper] shm attached: %ls", winPath.c_str());
     return true;
 }
@@ -671,7 +679,10 @@ int main() {
                 if (shm.hdr->quit.load() || shm.hdr->seq_req.load() != lastReq) break;
                 CpuYield();
             }
-            if (!shm.hdr->quit.load() && shm.hdr->seq_req.load() == lastReq) Sleep(1);
+            if (!shm.hdr->quit.load() && shm.hdr->seq_req.load() == lastReq) {
+                shm.hdr->heartbeat.fetch_add(1);
+                Sleep(1);
+            }
             continue;
         }
         bool ok = ProcessFrame(ns, shm);

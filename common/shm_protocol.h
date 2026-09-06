@@ -1,12 +1,22 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
-static constexpr uint32_t kShmMagic = 0x524E5346;  // 'FNSR'
+static constexpr uint32_t kShmMagic = 0x524E5347;  // 'GNSR'
 static constexpr uint32_t kMaxW = 4096, kMaxH = 2160;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
 static constexpr uint32_t kMaxPasses = 8;
+
+inline std::string ShmDefaultPath() {
+    const char* rt = std::getenv("XDG_RUNTIME_DIR");
+    if (rt && *rt) return std::string(rt) + "/dlssnr/shm.bin";
+    const char* uid = std::getenv("DLSSNR_UID");
+    if (uid && *uid) return std::string("/tmp/dlssnr-") + uid + "/shm.bin";
+    return "/tmp/dlssnr_shm.bin";
+}
 
 struct PassControl {
     std::atomic<uint32_t> enabled;
@@ -42,7 +52,7 @@ struct ShmHeader {
     std::atomic<uint32_t> sharpnessBits;
     std::atomic<uint32_t> controlSeq;
     PassControl pass[kMaxPasses];
-    uint32_t reserved[1];
+    std::atomic<uint32_t> heartbeat;
 };
 
 inline uint32_t FloatToBits(float f) {
@@ -73,6 +83,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->skinStructureBits.store(FloatToBits(-1.0f));
     h->sharpnessBits.store(FloatToBits(0.0f));
     h->controlSeq.store(0);
+    h->heartbeat.store(0);
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].enabled.store(0);
         h->pass[i].intensityBits.store(FloatToBits(1.0f));

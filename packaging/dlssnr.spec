@@ -4,7 +4,7 @@
 
 Name:           dlssnr
 Version:        0.1.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        DLSS5 Neural Rendering Vulkan layer and helper
 License:        MIT
 Source0:        %{name}-%{version}-linux-x86_64.tar.gz
@@ -44,5 +44,10 @@ cp -a root/usr %{buildroot}/usr
 %doc %{_datadir}/doc/dlssnr/dxvk-license.txt
 
 %changelog
+* Sat Sep 05 2026 DLSS5VKLayer - 0.1.0-2
+- Use XDG runtime shared-memory path by default.
+- Add helper heartbeat recovery.
+- Build helper as a GUI-subsystem executable to avoid Proton console windows.
+
 * Sat Sep 05 2026 DLSS5VKLayer - 0.1.0-1
 - Initial packaged build.

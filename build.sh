@@ -15,7 +15,7 @@ g++ -O2 -std=c++17 -shared -fPIC -Wall $VK_INC \
 cp layer_linux/manifest/VK_LAYER_NV_dlssnr.json build/layer/
 
 echo "[2/5] Windows helper .exe"
-x86_64-w64-mingw32-g++ -O2 -std=c++17 -static -Wall $VK_INC -idirafter /usr/include -I core \
+x86_64-w64-mingw32-g++ -O2 -std=c++17 -static -mwindows -Wall $VK_INC -idirafter /usr/include -I core \
     helper/main.cpp core/ngx_snippet.cpp core/guard.cpp -o build/dlssnr_helper.exe
 
 echo "[3/5] smoke .exe"

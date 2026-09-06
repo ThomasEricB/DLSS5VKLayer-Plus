@@ -91,14 +91,37 @@ struct ShmMap {
     uint32_t seq = 0;
     uint32_t timeouts = 0;
     uint32_t lastControlSeq = 0;
+    uint32_t lastHeartbeat = 0;
     bool dead = false;
 };
+
+static void EnsureParentDir(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos || slash == 0) return;
+    std::string dir = path.substr(0, slash);
+    size_t pos = 1;
+    while ((pos = dir.find('/', pos)) != std::string::npos) {
+        std::string part = dir.substr(0, pos);
+        mkdir(part.c_str(), 0700);
+        pos += 1;
+    }
+    mkdir(dir.c_str(), 0700);
+}
+
+static std::string ShmDefaultPathLayer() {
+    const char* rt = getenv("XDG_RUNTIME_DIR");
+    if (rt && *rt) return std::string(rt) + "/dlssnr/shm.bin";
+    const char* uid = getenv("DLSSNR_UID");
+    if (uid && *uid) return std::string("/tmp/dlssnr-") + uid + "/shm.bin";
+    return std::string("/tmp/dlssnr-") + std::to_string(getuid()) + "/shm.bin";
+}
 
 static bool ShmOpen(ShmMap& s) {
     if (s.base) return true;
     const char* path = getenv("DLSSNR_SHM");
-    std::string p = (path && *path) ? path : "/tmp/dlssnr_shm.bin";
-    int fd = open(p.c_str(), O_RDWR | O_CREAT, 0666);
+    std::string p = (path && *path) ? path : ShmDefaultPathLayer();
+    EnsureParentDir(p);
+    int fd = open(p.c_str(), O_RDWR | O_CREAT, 0600);
     if (fd < 0) { Log("[shm] open %s failed", p.c_str()); return false; }
     size_t total = 4096 + kMaxFrame * 2;
     struct stat st{};
@@ -115,6 +138,7 @@ static bool ShmOpen(ShmMap& s) {
     if (s.hdr->magic.load() != kShmMagic || s.hdr->passes.load() == 0) {
         ShmInitDefaults(s.hdr);
     }
+    s.lastHeartbeat = s.hdr->heartbeat.load();
     Log("[shm] attached %s seq_req=%u seq_resp=%u", p.c_str(),
         s.hdr->seq_req.load(), s.hdr->seq_resp.load());
     return true;
@@ -130,6 +154,15 @@ static bool ShmNeuralEnabled(ShmMap& s) {
             s.dead = false;
             s.timeouts = 0;
             Log("[shm] control changed, re-enabling");
+        }
+    }
+    const uint32_t hb = s.hdr->heartbeat.load();
+    if (hb != s.lastHeartbeat) {
+        s.lastHeartbeat = hb;
+        if (s.dead && ::ShmNeuralEnabled(s.hdr)) {
+            s.dead = false;
+            s.timeouts = 0;
+            Log("[shm] helper heartbeat, re-enabling");
         }
     }
     if (s.dead) return false;

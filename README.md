@@ -187,6 +187,15 @@ dlssnr-helper status
 dlssnr-helper config
 ```
 
+If you previously used an older build, remove stale shared-memory files:
+
+```bash
+rm -f /tmp/dlssnr_shm.bin
+rm -f "${XDG_RUNTIME_DIR:-/tmp/dlssnr-$UID}/dlssnr/shm.bin"
+```
+
+Current builds use the XDG runtime path by default, so games and the helper should not need `DLSSNR_SHM` set manually.
+
 Logs are written to the XDG state directory:
 
 ```text
