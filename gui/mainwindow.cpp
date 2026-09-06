@@ -68,7 +68,15 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     auto* runnerPathRow = new QHBoxLayout;
     runnerPathRow->addWidget(runnerPathEdit);
     runnerPathRow->addWidget(browseRunnerBtn);
-    runnerForm->addRow("Runner", runnerCombo);
+    // Said plainly, because the obvious reading is the wrong one: this is what the *helper* runs
+    // under, not what the game runs under. The helper is a Windows executable -- it has to be, the
+    // model is a Windows DLL -- so it needs Proton or Wine whatever the game is. A native Linux game
+    // is unaffected by this setting; the layer inside it is a native library either way.
+    runnerCombo->setToolTip("Proton or Wine for the helper process, which is a Windows executable "
+                            "because the model is a Windows DLL. This is not what the game runs "
+                            "under -- native Linux games work with this set too.");
+    runnerPathEdit->setToolTip(runnerCombo->toolTip());
+    runnerForm->addRow("Runner (for the helper)", runnerCombo);
     runnerForm->addRow("Path", runnerPathRow);
     root->addLayout(runnerForm);
 

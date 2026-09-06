@@ -821,7 +821,25 @@ int main() {
 
     uint32_t lastReq = shm.hdr->seq_resp.load();
     while (!shm.hdr->quit.load()) {
+        // Restated every pass, not announced once.
+        //
+        // Four processes can re-initialise this header -- the layer, the interface, the control tool
+        // and this one -- and a freshly initialised header says there is no helper. A helper that
+        // announced itself only when it attached would be erased by any of them and never correct
+        // the record, after which every game passes its frames through while this process sits here
+        // waiting for frames that are no longer being sent. One atomic store per pass ends that.
+        shm.hdr->helperState.store(ns.ngx.disabled ? kHelperModelFailed : kHelperRunning);
+
         uint32_t req = shm.hdr->seq_req.load();
+
+        // The counter only ever climbs, so a smaller value than last time means the header was
+        // re-initialised under us. Resynchronise rather than treat the difference as a new frame.
+        if (req < lastReq) {
+            Log("[helper] shared memory was re-initialised; resynchronising at %u", req);
+            lastReq = req;
+            shm.hdr->seq_resp.store(req);
+            continue;
+        }
         if (req == lastReq) {
             for (int i = 0; i < 20000; ++i) {
                 if (shm.hdr->quit.load() || shm.hdr->seq_req.load() != lastReq) break;
