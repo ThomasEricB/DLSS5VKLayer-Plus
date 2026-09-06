@@ -620,11 +620,45 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(
     auto create = (PFN_vkCreateInstance)next_gipa(VK_NULL_HANDLE, "vkCreateInstance");
     if (!create) return VK_ERROR_INITIALIZATION_FAILED;
 
+    // Ask for the two instance extensions the zero-copy transport's device extension depends on.
+    //
+    // Below Vulkan 1.1 the external-memory family is not core, and VK_KHR_external_memory -- which
+    // the device hook adds -- needs VK_KHR_external_memory_capabilities here. That one in turn needs
+    // VK_KHR_get_physical_device_properties2, so it is both or neither.
+    //
+    // Without them the driver cannot be asked whether an imported host pointer is a valid buffer
+    // handle type, and every such question is answered "no" by default -- which is what made the
+    // transport look invalid when it is not.
+    //
+    // Tried rather than enumerated: a layer cannot reliably enumerate instance extensions through the
+    // chain's own vkGetInstanceProcAddr, and an instance that refuses them simply gets created the
+    // way the game asked. Nothing here may turn a working instance into a failed one.
+    const uint32_t api =
+        pCreateInfo->pApplicationInfo ? pCreateInfo->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
+    std::vector<const char*> instExts(pCreateInfo->ppEnabledExtensionNames,
+                                      pCreateInfo->ppEnabledExtensionNames +
+                                          pCreateInfo->enabledExtensionCount);
+    const bool preVulkan11 = VK_API_VERSION_MAJOR(api) == 1 && VK_API_VERSION_MINOR(api) < 1;
+    if (preVulkan11) {
+        const auto want = [&](const char* name) {
+            for (const char* e : instExts)
+                if (e && !std::strcmp(e, name)) return;
+            instExts.push_back(name);
+        };
+        want(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+        want(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
+    }
+
 
     // Documented pattern: keep the link node in pNext (layers below need it)
     // and advance u.pLayerInfo so the next layer resolves its own chain entry.
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
-    VkResult res = create(pCreateInfo, pAllocator, pInstance);
+    VkInstanceCreateInfo ici = *pCreateInfo;
+    ici.enabledExtensionCount = uint32_t(instExts.size());
+    ici.ppEnabledExtensionNames = instExts.empty() ? nullptr : instExts.data();
+
+    VkResult res = create(preVulkan11 ? &ici : pCreateInfo, pAllocator, pInstance);
+    if (res != VK_SUCCESS && preVulkan11) res = create(pCreateInfo, pAllocator, pInstance);
     if (res != VK_SUCCESS) return res;
 
     InstanceChain chain{};
