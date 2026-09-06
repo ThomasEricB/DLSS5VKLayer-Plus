@@ -272,7 +272,7 @@ struct DeviceChain {
 #define X(name) PFN_##name name = nullptr;
     DEVICE_FN_LIST(X)
 #undef X
-    bool inert = false;
+    std::atomic<bool> inert{false};
     std::mutex lock;
     std::unordered_map<VkSwapchainKHR, SwapchainState> swapchains;
     std::unordered_map<VkQueue, uint32_t> queueFamilies;
@@ -451,7 +451,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     std::lock_guard<std::mutex> lk(g_stateMutex);
     g_devices[*pDevice] = dc;
     Log("[layer] vkCreateDevice -> %p on %s (inert=%d enabled=%d)", (void*)*pDevice, deviceName,
-        dc->inert, LayerEnabled());
+        (int) dc->inert.load(), (int) LayerEnabled());
     return VK_SUCCESS;
 }
 
@@ -659,6 +659,26 @@ static void Barrier(DeviceChain* dc, VkCommandBuffer cb, VkImage img, VkImageLay
     dc->vkCmdPipelineBarrier(cb, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
+// Every Vulkan result on the present path, looked at rather than collapsed into a bool.
+//
+// A failure here was previously indistinguishable from 'nothing to do': the call returned false, the
+// caller presented the original frame, and the next frame tried exactly the same thing again. That is
+// the right answer for a transient failure and the wrong one for VK_ERROR_DEVICE_LOST, where the
+// device is gone, every subsequent call will fail the same way, and the log fills with it.
+//
+// Losing the device also latches the layer inert, because after that point the fail-open path is the
+// only correct one and it costs nothing to take it directly.
+static bool NoteVk(DeviceChain* dc, VkResult r, const char* what) {
+    if (r == VK_SUCCESS) return true;
+    if (r == VK_ERROR_DEVICE_LOST) {
+        if (!dc->inert.exchange(true)) Log("[layer] %s -> DEVICE_LOST; layer inert for this device", what);
+        return false;
+    }
+    static std::atomic<uint32_t> reported{0};
+    if (reported.fetch_add(1) < 8) Log("[layer] %s -> %d", what, (int) r);
+    return false;
+}
+
 // Returns true if the swapchain image now holds the neural-processed frame.
 //
 // The caller's present semaphores are consumed here, by the capture submit, because that submit is
@@ -703,20 +723,20 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
 
     auto restorePresentLayout = [&]() {
         dropWaits();
-        if (dc->vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
+        if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
         Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT,
                 VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-        if (dc->vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
-        if (dc->vkQueueSubmit(queue, 1, &si, sc.fence) != VK_SUCCESS) return false;
-        if (dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+        if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
+        if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence), "vkQueueSubmit")) return false;
+        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return false;
         dc->vkResetFences(d, 1, &sc.fence);
         return true;
     };
 
     // ---- capture: swapchain -> bufIn ----
-    if (dc->vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
+    if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
     Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
@@ -724,9 +744,9 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             VK_PIPELINE_STAGE_TRANSFER_BIT);
     dc->vkCmdCopyImageToBuffer(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                sc.bufIn.buffer, 1, &region);
-    if (dc->vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
-    if (dc->vkQueueSubmit(queue, 1, &si, sc.fence) != VK_SUCCESS) return false;
-    if (dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+    if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
+    if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence), "vkQueueSubmit")) return false;
+    if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return false;
     dc->vkResetFences(d, 1, &sc.fence);
     dropWaits();
     const double tCapture = time ? NowMs() : 0.0;
@@ -743,7 +763,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
 
     // ---- return: bufOut -> swapchain ----
     std::memcpy(sc.bufOut.mapped, dc->shm.outPixels, bytes);
-    if (dc->vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
+    if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
     Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -754,9 +774,9 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    if (dc->vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
-    if (dc->vkQueueSubmit(queue, 1, &si, sc.fence) != VK_SUCCESS) return false;
-    if (dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+    if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
+    if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence), "vkQueueSubmit")) return false;
+    if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return false;
     dc->vkResetFences(d, 1, &sc.fence);
     const double tReturn = time ? NowMs() : 0.0;
 
