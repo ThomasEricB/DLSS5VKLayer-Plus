@@ -128,25 +128,27 @@ struct ShmMap {
     bool dead = false;
 };
 
-static void EnsureParentDir(const std::string& path) {
+// The directory now lives under /tmp, which is world-writable, so it is worth checking that what we
+// are about to open really is ours: a directory, owned by this uid, with nothing granted to anyone
+// else. Anything else and we refuse rather than create the file inside it.
+static bool EnsureParentDir(const std::string& path) {
     size_t slash = path.find_last_of('/');
-    if (slash == std::string::npos || slash == 0) return;
+    if (slash == std::string::npos || slash == 0) return true;
     std::string dir = path.substr(0, slash);
     size_t pos = 1;
     while ((pos = dir.find('/', pos)) != std::string::npos) {
-        std::string part = dir.substr(0, pos);
-        mkdir(part.c_str(), 0700);
+        mkdir(dir.substr(0, pos).c_str(), 0700);
         pos += 1;
     }
     mkdir(dir.c_str(), 0700);
-}
 
-static std::string ShmDefaultPathLayer() {
-    const char* rt = getenv("XDG_RUNTIME_DIR");
-    if (rt && *rt) return std::string(rt) + "/dlssnr/shm.bin";
-    const char* uid = getenv("DLSSNR_UID");
-    if (uid && *uid) return std::string("/tmp/dlssnr-") + uid + "/shm.bin";
-    return std::string("/tmp/dlssnr-") + std::to_string(getuid()) + "/shm.bin";
+    struct stat st{};
+    if (lstat(dir.c_str(), &st) != 0) { Log("[shm] %s is missing", dir.c_str()); return false; }
+    if (!S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        Log("[shm] refusing %s: it is not a private directory owned by this user", dir.c_str());
+        return false;
+    }
+    return true;
 }
 
 // Maps the two pixel regions at the size this frame needs, remapping when the size changes.
@@ -183,9 +185,9 @@ static bool ShmMapFrames(ShmMap& s, size_t bytes) {
 static bool ShmOpen(ShmMap& s) {
     if (s.hdr) return true;
     const char* path = getenv("DLSSNR_SHM");
-    std::string p = (path && *path) ? path : ShmDefaultPathLayer();
-    EnsureParentDir(p);
-    int fd = open(p.c_str(), O_RDWR | O_CREAT, 0600);
+    std::string p = (path && *path) ? path : ShmDefaultPath();
+    if (!EnsureParentDir(p)) return false;
+    int fd = open(p.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if (fd < 0) { Log("[shm] open %s failed", p.c_str()); return false; }
     // The file still spans the whole protocol -- the offsets are fixed and both sides agree on them --
     // but it is sparse, so the size on disk is what has actually been written.

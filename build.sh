@@ -18,8 +18,13 @@ LAYER_SRC="layer_linux/src/layer.cpp
     layer_linux/src/hotkey.cpp"
 
 echo "[1/5] Linux layer .so (64-bit)"
+# Keep the loader's entry points, and nothing else, visible -- and bind our own references to them
+# locally, so a game that links libvulkan.so.1 cannot preempt them with the loader's copies. Without
+# this the layer hands the loader the loader's own vkGetInstanceProcAddr and the chain calls itself.
+LAYER_LDFLAGS="-Wl,--version-script=layer_linux/dlssnr.map -Wl,-Bsymbolic"
+
 g++ -O2 -std=c++17 -shared -fPIC -Wall $VK_INC -I layer_linux/src \
-    $LAYER_SRC -o build/layer/libVkLayer_NV_dlssnr.so -lpthread
+    $LAYER_SRC -o build/layer/libVkLayer_NV_dlssnr.so $LAYER_LDFLAGS -lpthread
 
 # A 32-bit layer as well, for 32-bit Vulkan games.
 #
@@ -34,7 +39,7 @@ mkdir -p build/layer32
 if echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null 2>/dev/null; then
     echo "[1/5] Linux layer .so (32-bit)"
     g++ -m32 -O2 -std=c++17 -shared -fPIC -Wall -DDLSSNR_LAYER_32 $VK_INC -I layer_linux/src \
-        $LAYER_SRC -o build/layer32/libVkLayer_NV_dlssnr.so -lpthread
+        $LAYER_SRC -o build/layer32/libVkLayer_NV_dlssnr.so $LAYER_LDFLAGS -lpthread
 else
     echo "[1/5] 32-bit layer skipped: no 'g++ -m32' (install a multilib toolchain for 32-bit games)"
     rm -f build/layer32/libVkLayer_NV_dlssnr.so
