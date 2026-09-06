@@ -46,6 +46,7 @@ bool ColourIsLinearHdr(VkFormat swapchainFormat, uint32_t colourMode) {
 FrameSettings FrameSettings::Read(const ShmHeader* h) {
     FrameSettings s;
     if (!h) return s;
+    s.pipelined = ShmPipelined(h);
     s.transferStrength = BitsToFloat(h->transferStrengthBits.load());
     s.colourStrength = BitsToFloat(h->colourStrengthBits.load());
     s.maxRatio = BitsToFloat(h->maxRatioBits.load());
@@ -126,6 +127,9 @@ void Composition::DropAll() {
     DropImage(_keep);
     DropImage(_proxy);
     DropImage(_work);
+    DropImage(_proxySent);
+    DropImage(_workSent);
+    _sentValid = false;
     DropImage(_model);
     DropImage(_composed);
     DropImage(_modelNative);
@@ -394,6 +398,7 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
         MakeImage(_frame, width, height, work, sampled | dst) &&
         MakeImage(_keep, width, height, _keepFormat, sampled | storage) &&
         MakeImage(_proxy, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | storage | src) &&
+        MakeImage(_proxySent, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
         MakeImage(_model, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
         MakeImage(_composed, width, height, work, storage | src) &&
         MakeHostBuffer(_download, size_t(modelW) * modelH * 4, dst) &&
@@ -410,8 +415,10 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
                         VK_BUFFER_USAGE_TRANSFER_DST_BIT));
 
     const bool needWork = (modelW != width || modelH != height);
-    const bool okWork = !needWork || MakeImage(_work, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
-                                               sampled | storage | src);
+    const bool okWork = (!needWork || MakeImage(_work, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
+                                                sampled | storage | src)) &&
+                        (!needWork || MakeImage(_workSent, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
+                                                sampled | dst));
 
     // The averaged answer, and the two filters that get there. Built only when supersampling.
     bool okSuper = true;
@@ -516,6 +523,7 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.TransferStrength = s.transferStrength;
     c.ColourStrength = s.colourStrength;
     c.MaxRatio = s.maxRatio;
+    c.Pipelined = s.pipelined ? 1u : 0u;
     c.DebugView = s.debugView;
     c.DebugScale = s.debugScale;
     c.Transfer = s.transfer;
@@ -700,6 +708,28 @@ bool Composition::RecordEncode(VkCommandBuffer cb, const FrameSettings& s) {
     return true;
 }
 
+// Put aside the picture the model is being shown, so the answer can be differenced against it rather
+// than against whatever the encode has written by the time it comes back.
+bool Composition::RecordKeepSent(VkCommandBuffer cb) {
+    if (!_usable || !_proxySent.image) return false;
+
+    const auto copy = [&](Image& from, Image& to) {
+        Transition(cb, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        Transition(cb, to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy r{};
+        r.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        r.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        r.extent = { from.width, from.height, 1 };
+        _vk->vkCmdCopyImage(cb, from.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, to.image,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        Transition(cb, to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    };
+    copy(_proxy, _proxySent);
+    if (_work.image && _workSent.image) copy(_work, _workSent);
+    _sentValid = true;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Leg 2: the model's answer, composed back
 // ---------------------------------------------------------------------------
@@ -722,14 +752,18 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     // composition then sees a native proxy against a native answer -- which is what it should see,
     // because from its point of view the model effectively ran at the frame's own resolution.
     Image* answer = &_model;
-    Image* source = _work.image ? &_work : &_proxy;
+    // Pipelined, the answer is a frame behind, so it is differenced against the proxy that went with
+    // it rather than the one the encode has since overwritten.
+    const bool sent = s.pipelined && _sentValid && _proxySent.image;
+    Image* source = sent ? (_workSent.image ? &_workSent : &_proxySent)
+                         : (_work.image ? &_work : &_proxy);
     if (_superSample) {
         Transition(cb, _modelNative, VK_IMAGE_LAYOUT_GENERAL);
         if (!_superDown->Dispatch(cb, _model.view, _modelNative.view, _modelW, _modelH, _width, _height))
             return false;
         Transition(cb, _modelNative, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         answer = &_modelNative;
-        source = &_proxy;
+        source = sent ? &_proxySent : &_proxy;
     }
 
     Transition(cb, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

@@ -184,6 +184,11 @@ struct alignas(256) DlssNrConstants
     // preExposure * trim, so the live white point is ExposurePreMul / exposure. Mirrored in the cbuffer.
     uint32_t UseGameExposure;
     float ExposurePreMul;
+
+    // Set when the model's answer is for an earlier frame than the one being written, which forces
+    // the additive path: the frame keeps its own pixels and only the edit is a frame behind. Last in
+    // the block on purpose -- everything above it has a pinned offset.
+    uint32_t Pipelined;
 };
 
 class DlssNr_Common

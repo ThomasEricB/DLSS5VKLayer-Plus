@@ -30,7 +30,7 @@
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
-static constexpr uint32_t kShmVersion = 6;
+static constexpr uint32_t kShmVersion = 7;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
@@ -350,6 +350,14 @@ struct ShmHeader {
 
     // Appended after the pass array on purpose: everything before it has a pinned offset, and a new
     // field inserted higher up would move all of them. Motion vectors, from bmitch87's work.
+    // Whether the layer waits for the model or lets it work alongside the game's next frame.
+    //
+    // Waiting is exact and it is also the whole cost of the pass: nothing overlaps, so the model's
+    // time adds to the game's instead of hiding inside it. Running alongside costs one frame of
+    // staleness -- in the *edit* only. The frame under it is always the one being presented, and the
+    // shader takes an additive path for it so the game's own pixels survive; the layer keeps the
+    // proxy that went with each answer so the difference it applies is the edit and nothing else.
+    std::atomic<uint32_t> pipeline;
     std::atomic<uint32_t> mvecEnabled;
     std::atomic<uint32_t> mvecScaleMode;
     std::atomic<uint32_t> mvecQuality;
@@ -371,12 +379,12 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1876, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1880, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, pass) == 780, "layout changed -- bump kShmVersion");
-static_assert(offsetof(ShmHeader, mvecEnabled) == 1860, "layout changed -- bump kShmVersion");
+static_assert(offsetof(ShmHeader, pipeline) == 1860, "layout changed -- bump kShmVersion");
 
 inline uint32_t FloatToBits(float f) {
     uint32_t u = 0;
@@ -441,6 +449,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->holdFrame.store(0);
     h->scalingDownscaler.store(kDownscaleLanczos3);
 
+    h->pipeline.store(0);
     h->mvecEnabled.store(1);
     h->mvecScaleMode.store(kMVecPixels);
     h->mvecQuality.store(kMVecBalanced);
@@ -509,6 +518,8 @@ inline void ShmStore64(std::atomic<uint32_t>& lo, std::atomic<uint32_t>& hi, uin
     hi.store(uint32_t(v >> 32));
     lo.store(uint32_t(v & 0xFFFFFFFFu));
 }
+
+inline bool ShmPipelined(const ShmHeader* h) { return h && h->pipeline.load() != 0; }
 
 inline bool ShmMVecEnabled(const ShmHeader* h) { return h->mvecEnabled.load() != 0; }
 

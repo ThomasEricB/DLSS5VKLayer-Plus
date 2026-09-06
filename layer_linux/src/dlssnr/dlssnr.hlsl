@@ -29,6 +29,7 @@ cbuffer Params : register(b0)
     uint  gApplyModel;     // 0 output the clean frame (pass still runs), 1 apply the model's edit
     uint  gUseGameExposure;// D3D12 source-1 only: 1 = read the game's live exposure in-shader (t4)
     float gExposurePreMul; // preExposure * trim, so the live white point is gExposurePreMul / exposure
+    uint  gPipelined;      // 1 when the answer is for an earlier frame than the one being written
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -831,7 +832,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     gSource.GetDimensions(proxyW, proxyH);
     const bool modelRanSmall = proxyW != gWidth || proxyH != gHeight;
 
-    if (gTransfer == 1 && modelRanSmall)
+    if (gTransfer == 1 && modelRanSmall && gPipelined == 0)
     {
         // Saturated, because that is what the encode does and this has to reproduce it exactly.
         //
@@ -883,10 +884,19 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // branch as well: an empty model makes the edit the negated proxy, which subtracts the frame.
         upgraded = original;
     }
-    else if (gTransfer == 2 && modelRanSmall)
+    else if (gPipelined != 0 || (gTransfer == 2 && modelRanSmall))
     {
         // Native + edit. The frame's own pixels are the result and only the model's difference is
         // laid on top of them.
+        //
+        // Also the only honest composition when the answer is for an earlier frame, which is why
+        // gPipelined takes this branch whatever Transfer says. Every other mode rebuilds the output
+        // picture from the model's own raster, so a stale answer would put a stale *picture* on the
+        // screen rather than a stale *edit* on a current one. Here the frame under the edit is always
+        // the one being presented; only what is added to it is a frame behind, and the guard below
+        // bounds how far that can push a pixel. The proxy and the model are still a matched pair --
+        // the layer keeps the proxy that was sent with the answer -- so the difference between them
+        // is the edit and nothing else.
         //
         // The other two modes build every output pixel out of the model's raster, so below frame size
         // the whole picture arrives through the enlargement and geometry, text and edges the model

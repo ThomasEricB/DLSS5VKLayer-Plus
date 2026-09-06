@@ -49,5 +49,6 @@ DLSSNR_PIN(ApplyModel, 80);
 // leaves UseGameExposure at 0 and the shader never reads either.
 DLSSNR_PIN(UseGameExposure, 84);
 DLSSNR_PIN(ExposurePreMul, 88);
+DLSSNR_PIN(Pipelined, 92);
 
 #undef DLSSNR_PIN

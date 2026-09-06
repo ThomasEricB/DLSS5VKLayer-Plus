@@ -53,6 +53,10 @@ struct FrameSettings {
     uint32_t compareMode = 0;
     uint32_t compareSwap = 0;
     uint32_t reversibleMode = kReversibleKnee;
+
+    // Not a header setting: the layer decides it per frame, from whether it is running the round trip
+    // in front of the frame or alongside it.
+    bool pipelined = false;
     uint32_t applyModel = 1;
     uint32_t holdFrame = 0;
     uint32_t downscaler = kScalerLanczos3;
@@ -104,6 +108,11 @@ class Composition {
     // composition sees a proxy, a keep and a model that all belong to one frame.
     bool RecordGrab(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
     bool RecordEncode(VkCommandBuffer cb, const FrameSettings& s);
+
+    // Keep a copy of what this frame is about to send, so the answer can be differenced against it
+    // when it arrives. Recorded straight after the encode, in the same command buffer.
+    bool RecordKeepSent(VkCommandBuffer cb);
+    bool HasSentProxy() const { return _sentValid; }
 
     // The two ends of the round trip, when they have to be copied.
     //
@@ -200,6 +209,15 @@ class Composition {
     bool _haveModel = false;
 
     Image _frame{}, _keep{}, _proxy{}, _work{}, _model{}, _composed{};
+
+    // The proxy and working raster that went to the model with the answer now in _model.
+    //
+    // Only allocated for the pipelined path, where the answer is a frame behind what the encode has
+    // since written. The resolve differences the model against the proxy it was actually computed
+    // from; differencing it against the proxy of a newer frame is not an approximation, it is a
+    // ratio between two unrelated pictures, and that is what put saturated pixels on moving edges.
+    Image _proxySent{}, _workSent{};
+    bool _sentValid = false;
 
     // Supersampling: the model works above the frame, so the proxy is enlarged on the way in and the
     // answer averaged back on the way out. _modelNative holds that average; without it the resolve

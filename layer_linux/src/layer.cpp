@@ -126,6 +126,7 @@ struct ShmMap {
     size_t mappedFrameBytes = 0;
     uint32_t seq = 0;
     uint32_t timeouts = 0;
+    uint32_t pendingReq = 0;  // pipelined: the request the helper has not answered yet
 
     // Liveness, so a game is never made to wait on a helper that is not there.
     uint32_t firstHeartbeat = 0;
@@ -370,6 +371,53 @@ static bool ShmNeuralEnabled(ShmMap& s) {
     }
     if (s.dead) return false;
     return ::ShmNeuralEnabled(s.hdr);
+}
+
+// The pipelined transport: publish, and do not wait.
+//
+// The blocking round trip below is exact and it is also the whole frame cost -- the game's GPU idles
+// while the model runs and the model's idles while the game draws, so the two times add rather than
+// overlap. Publishing without waiting lets them overlap, at the price of the answer being a frame
+// old when it lands.
+//
+// That price is only payable because the shader has an additive path for it: the frame under the
+// edit is always the one being presented and only what is added to it is behind. The composition
+// still differences a matched pair, because the layer keeps the proxy that went with each answer.
+//
+// Whether the input region may be written again is not guessed: seq_resp says the helper has
+// finished reading the last one, and a frame that cannot publish simply does not.
+static bool ShmAnswerReady(ShmMap& s) {
+    return s.hdr && s.pendingReq != 0 && s.hdr->seq_resp.load() >= s.pendingReq;
+}
+
+static bool ShmInputFree(ShmMap& s) {
+    return s.hdr && (s.pendingReq == 0 || s.hdr->seq_resp.load() >= s.pendingReq);
+}
+
+// Take delivery of an answer that has already arrived. Never blocks.
+static bool ShmCollect(ShmMap& s, size_t bytes, void* modelOut) {
+    if (!ShmAnswerReady(s)) return false;
+    const bool ok = s.hdr->seq_ok.load() >= s.pendingReq;
+    s.pendingReq = 0;
+    if (!ok) return false;
+    s.everAnswered = true;
+    if (modelOut) std::memcpy(modelOut, s.outPixels, bytes);
+    return true;
+}
+
+// Hand over a frame whose pixels the GPU has already finished writing. Never blocks.
+static bool ShmPublish(ShmMap& s, uint32_t w, uint32_t h, const void* proxy) {
+    if (s.dead || !s.hdr || w > kMaxW || h > kMaxH) return false;
+    const size_t bytes = size_t(w) * h * 4;
+    if (!ShmMapFrames(s, bytes)) { s.dead = true; return false; }
+    if (proxy) std::memcpy(s.inPixels, proxy, bytes);
+    s.hdr->width.store(w);
+    s.hdr->height.store(h);
+    s.hdr->format.store(1u);
+    const uint32_t req = s.hdr->seq_req.load() + 1;
+    s.hdr->seq_req.store(req);
+    s.pendingReq = req;
+    return true;
 }
 
 // One round trip: publish the proxy, wait for the model's answer, copy it back.
@@ -1053,7 +1101,7 @@ static bool NoteVk(DeviceChain* dc, VkResult r, const char* what) {
 // Every path out leaves the swapchain image in PRESENT_SRC_KHR, including the ones that give up.
 static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
                            VkImage swapchainImage, uint32_t waitCount,
-                           const VkSemaphore* waitSemaphores) {
+                           const VkSemaphore* waitSemaphores, bool* consumedWaits) {
     if (!sc.comp) return false;
     VkDevice d = dc->self;
     VkCommandBuffer cb = sc.cb;
@@ -1096,6 +1144,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
 
     const auto runLeg = [&]() {
         if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
+        if (si.waitSemaphoreCount && consumedWaits) *consumedWaits = true;
         if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence), "vkQueueSubmit")) return false;
         if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
             return false;
@@ -1112,6 +1161,65 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
                             dc->physical, dc->self, dc->hostImport);
             sc.comp->UseSharedBuffers(dc->shm.inBuf, dc->shm.outBuf);
         }
+    }
+
+    if (fs.pipelined) {
+        // One command buffer, one submit, and no waiting on the helper at all.
+        //
+        // Order: grab this frame, encode it, put the encode aside as what is being sent, then compose
+        // the answer that arrived for an earlier frame onto this one. The encode runs before the
+        // composition so the keep the resolve reads as "the untouched frame" is *this* frame -- that
+        // is what the additive path lays the stale edit onto -- while the pair being differenced is
+        // the one kept aside when it was sent.
+        const size_t modelBytes = size_t(sc.comp->ModelWidth()) * sc.comp->ModelHeight() * 4;
+        const bool haveAnswer = ShmCollect(dc->shm, modelBytes, sc.comp->ModelPixels());
+        const bool mayPublish = ShmInputFree(dc->shm) && !dc->shm.dead;
+        if (haveAnswer) sc.comp->MarkModelFrame();
+        const bool willCompose = sc.comp->HasModelFrame() && sc.comp->HasSentProxy();
+        if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
+        if (!mayPublish && !willCompose) {
+            // Nothing to do this frame, but the game's render-complete semaphores were handed to this
+            // submit and something has to wait on them. Presenting without a wait leaves them
+            // signalled, and the next frame signals them again -- which is a real hazard, not a
+            // diagnostic: the present engine would be reading an image the game may still be drawing.
+            return runLeg();
+        }
+        if (mayPublish && (!sc.comp->RecordGrab(cb, swapchainImage, fs) ||
+                           !sc.comp->RecordEncode(cb, fs))) {
+            dc->vkEndCommandBuffer(cb);
+            return false;
+        }
+        // Composed before the encode's proxy is claimed as "sent", so the pair kept aside is still
+        // the one this answer was computed from.
+        if (willCompose && !sc.comp->RecordCompose(cb, swapchainImage, fs, haveAnswer)) {
+            dc->vkEndCommandBuffer(cb);
+            return false;
+        }
+        if (mayPublish && !sc.comp->RecordKeepSent(cb)) {
+            dc->vkEndCommandBuffer(cb);
+            return false;
+        }
+        if (!runLeg()) return false;
+        dropWaits();
+        sc.comp->ConsumeMeter();
+        sc.comp->WriteCapturedFrame();
+
+        // Published only after the fence: the helper reads these pages the moment it sees the
+        // sequence number, and the GPU has to have finished writing them first.
+        if (mayPublish)
+            ShmPublish(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ProxyPixels());
+
+        if (dc->shm.hdr) {
+            ShmStore64(dc->shm.hdr->layerFramesLo, dc->shm.hdr->layerFramesHi, ++dc->framesComposed);
+            dc->shm.hdr->layerWidth.store(sc.width);
+            dc->shm.hdr->layerHeight.store(sc.height);
+            dc->shm.hdr->layerFormat.store(uint32_t(sc.format));
+            dc->shm.hdr->layerCompositionUp.store(1);
+            dc->shm.hdr->layerMsBits.store(FloatToBits(float((time ? NowMs() : 0.0) - t0)));
+            dc->shm.hdr->layerMeasuredWhiteBits.store(FloatToBits(sc.comp->MeasuredWhitePoint()));
+            dc->shm.hdr->layerHeartbeat.fetch_add(1);
+        }
+        return true;
     }
 
     // ---- leg 1: the frame the model is shown ----
@@ -1213,18 +1321,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             }
             if (!sc.ready || dc->shm.dead) continue;
             const uint32_t waitCount = waitsConsumed ? 0u : pPresentInfo->waitSemaphoreCount;
-            waitsConsumed = true;
+            bool consumed = false;
             const bool composed = ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]],
-                                                 waitCount, pPresentInfo->pWaitSemaphores);
+                                                 waitCount, pPresentInfo->pWaitSemaphores, &consumed);
+            // Claimed only when a submit actually waited on them. Giving up before that point and
+            // still claiming them would leave the present with nothing to wait on, and the game's
+            // render-complete semaphore signalled with no one to clear it.
+            waitsConsumed = waitsConsumed || consumed;
             if (!composed) ++dc->framesPassedThrough;
             if (VerboseEnabled()) {
                 Log("[present] swapchain=%p image=%u seq=%u composed=%d",
                     (void*)pPresentInfo->pSwapchains[i], pPresentInfo->pImageIndices[i],
                     dc->shm.hdr ? dc->shm.hdr->seq_req.load() : 0u, int(composed));
             }
-            // On failure we simply present the original frame (fail-open). The semaphores are still
-            // consumed -- the capture submit waits on them before anything can fail -- so the flag
-            // stays set and the present below still drops them.
+            // On failure we simply present the original frame (fail-open).
         }
         if (TimeEnabled()) {
             static int frameNo = 0;
