@@ -1,0 +1,13 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_NV_dlssnr",
+    "type": "GLOBAL",
+    "library_path": "./libVkLayer_NV_dlssnr.so",
+    "api_version": "1.3.277",
+    "implementation_version": "1",
+    "description": "DLSS 5 Neural Rendering injection layer (Linux side)",
+    "enable_environment": { "VKLayer_DLSS5": "1" },
+    "disable_environment": { "DLSSNR_DISABLE": "1" }
+  }
+}

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DLSS5VKLayer Helper
+GenericName=DLSS5 helper
+Comment=Start, stop, and tune the DLSS5 neural rendering helper
+Exec=dlssnr-gui
+Terminal=false
+Categories=System;Settings;
+Icon=preferences-desktop
+StartupNotify=false

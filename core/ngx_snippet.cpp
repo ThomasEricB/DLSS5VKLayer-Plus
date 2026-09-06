@@ -1,0 +1,549 @@
+// Ported from standalone_runner/main.cpp (verified Feature-18 Vulkan sequence):
+//   IAT spoof  :283-365   guarded calls :741-774   param helpers :248-266
+//   core init  :892-936   params        :938-1006  snippet init  :1008-1033
+//   create     :1035-1061 eval params  :1063-1142  teardown      :1199-1213
+#include "ngx_snippet.h"
+#include "guard.h"
+#include "logging.h"
+#include "ngx_param.h"
+#include <cstring>
+
+namespace dlssnr {
+
+HMODULE g_layerModule = nullptr;
+
+// ---------------------------------------------------------------------------
+// Caller-identity spoof: IAT hook of KERNEL32!GetModuleFileNameW inside the
+// snippet/core modules so they see "nvngx.dll" as the caller.
+// ---------------------------------------------------------------------------
+static DWORD WINAPI SpoofedGetModuleFileNameW(HMODULE module, LPWSTR filename, DWORD size) noexcept {
+    if (module == g_layerModule) {
+        static constexpr wchar_t AUTHORIZED_CALLER[] = L"nvngx.dll";
+        constexpr DWORD LEN = ARRAYSIZE(AUTHORIZED_CALLER) - 1;
+        if (!filename || !size) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+        if (size <= LEN) {
+            if (size > 1) std::memcpy(filename, AUTHORIZED_CALLER, (size - 1) * sizeof(wchar_t));
+            filename[size - 1] = L'\0';
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return size;
+        }
+        std::memcpy(filename, AUTHORIZED_CALLER, sizeof(AUTHORIZED_CALLER));
+        return LEN;
+    }
+    extern decltype(&GetModuleFileNameW) g_realGetModuleFileNameW;
+    if (g_realGetModuleFileNameW) return g_realGetModuleFileNameW(module, filename, size);
+    SetLastError(ERROR_INVALID_FUNCTION);
+    return 0;
+}
+decltype(&GetModuleFileNameW) g_realGetModuleFileNameW = nullptr;
+
+struct SpoofState { void** slot = nullptr; decltype(&GetModuleFileNameW) orig = nullptr; };
+static SpoofState g_snippetSpoof, g_coreSpoof;
+
+static void** FindImportedFunctionSlot(HMODULE module, const char* functionName) noexcept {
+    if (!module || !functionName) return nullptr;
+    auto* base = reinterpret_cast<std::byte*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return nullptr;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return nullptr;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress || !dir.Size || dir.VirtualAddress >= nt->OptionalHeader.SizeOfImage)
+        return nullptr;
+    auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    const auto* descEnd = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress + dir.Size);
+    for (; desc < descEnd && desc->Name; ++desc) {
+        if (desc->Name >= nt->OptionalHeader.SizeOfImage) continue;
+        const char* lib = reinterpret_cast<const char*>(base + desc->Name);
+        if (_stricmp(lib, "KERNEL32.dll") != 0 &&
+            _stricmp(lib, "api-ms-win-core-libraryloader-l1-2-0.dll") != 0 &&
+            _stricmp(lib, "api-ms-win-core-libraryloader-l1-1-0.dll") != 0) continue;
+        if (!desc->OriginalFirstThunk || !desc->FirstThunk) continue;
+        auto* nameThunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + desc->OriginalFirstThunk);
+        auto* addrThunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + desc->FirstThunk);
+        for (; nameThunk->u1.AddressOfData; ++nameThunk, ++addrThunk) {
+            if (IMAGE_SNAP_BY_ORDINAL64(nameThunk->u1.Ordinal)) continue;
+            const uint32_t rva = static_cast<uint32_t>(nameThunk->u1.AddressOfData);
+            if (rva >= nt->OptionalHeader.SizeOfImage) return nullptr;
+            const auto* imp = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + rva);
+            if (std::strcmp(reinterpret_cast<const char*>(imp->Name), functionName) == 0)
+                return reinterpret_cast<void**>(&addrThunk->u1.Function);
+        }
+    }
+    return nullptr;
+}
+
+static bool InstallCallerSpoof(HMODULE module, SpoofState& state) {
+    state.slot = FindImportedFunctionSlot(module, "GetModuleFileNameW");
+    if (!state.slot) { Log("[spoof] module %p has no GetModuleFileNameW import", (void*)module); return false; }
+    DWORD old = 0;
+    if (!VirtualProtect(state.slot, sizeof(void*), PAGE_READWRITE, &old)) {
+        Log("[spoof] VirtualProtect failed (%lu)", GetLastError()); return false;
+    }
+    state.orig = reinterpret_cast<decltype(state.orig)>(
+        InterlockedExchangePointer(reinterpret_cast<void* volatile*>(state.slot),
+                                   reinterpret_cast<void*>(&SpoofedGetModuleFileNameW)));
+    VirtualProtect(state.slot, sizeof(void*), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), state.slot, sizeof(void*));
+    if (!state.orig) { Log("[spoof] original import was null"); return false; }
+    g_realGetModuleFileNameW = state.orig;
+    Log("[spoof] GetModuleFileNameW IAT hooked at %p (module %p)", (void*)state.slot, (void*)module);
+    return true;
+}
+
+static void RemoveCallerSpoof(SpoofState& state) {
+    if (!state.slot || !state.orig) return;
+    DWORD old = 0;
+    if (VirtualProtect(state.slot, sizeof(void*), PAGE_READWRITE, &old)) {
+        InterlockedExchangePointer(reinterpret_cast<void* volatile*>(state.slot),
+                                   reinterpret_cast<void*>(state.orig));
+        VirtualProtect(state.slot, sizeof(void*), old, &old);
+    }
+    state = {};
+}
+
+// ---------------------------------------------------------------------------
+// Param helpers + guarded NGX calls
+// ---------------------------------------------------------------------------
+static bool ParamSetUI(NVSDK_NGX_Parameter* p, const char* n, unsigned int v, DWORD* seh) {
+    Guarded([&] { p->Set(n, v); return true; }, false, seh);
+    return *seh == 0;
+}
+static bool ParamSetULL(NVSDK_NGX_Parameter* p, const char* n, unsigned long long v, DWORD* seh) {
+    Guarded([&] { p->Set(n, v); return true; }, false, seh);
+    return *seh == 0;
+}
+static bool ParamSetF(NVSDK_NGX_Parameter* p, const char* n, float v, DWORD* seh) {
+    Guarded([&] { p->Set(n, v); return true; }, false, seh);
+    return *seh == 0;
+}
+static bool ParamGetUI(NVSDK_NGX_Parameter* p, const char* n, unsigned int* v, DWORD* seh) {
+    return Guarded([&] { return NVSDK_NGX_SUCCEED(p->Get(n, v)); }, false, seh);
+}
+
+static NVSDK_NGX_Result CallInitExtSafely(FnVkInitExt fn, unsigned long long appId,
+    const wchar_t* path, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
+    NVSDK_NGX_Version version, DWORD* seh) noexcept {
+    return Guarded([&] { return fn(appId, path, instance, pd, device, version, nullptr); },
+                   NVSDK_NGX_Result_FAIL_SEH, seh);
+}
+static NVSDK_NGX_Result CallCreateSafely(FnVkCreateFeature fn, VkCommandBuffer cmd, int feature,
+    NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** handle, DWORD* seh) noexcept {
+    return Guarded([&] { return fn(cmd, feature, params, handle); },
+                   NVSDK_NGX_Result_FAIL_SEH, seh);
+}
+static NVSDK_NGX_Result CallEvaluateSafely(FnVkEvaluateFeature fn, VkCommandBuffer cmd,
+    const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, DWORD* seh) noexcept {
+    return Guarded([&] { return fn(cmd, handle, params, nullptr); },
+                   NVSDK_NGX_Result_FAIL_SEH, seh);
+}
+static NVSDK_NGX_Result CallReleaseSafely(FnVkReleaseFeature fn, NVSDK_NGX_Handle* handle, DWORD* seh) noexcept {
+    return Guarded([&] { return fn(handle); }, NVSDK_NGX_Result_FAIL_SEH, seh);
+}
+static NVSDK_NGX_Result CallShutdownSafely(FnVkShutdown1 fn, VkDevice device, DWORD* seh) noexcept {
+    return Guarded([&] { return fn(device); }, NVSDK_NGX_Result_FAIL_SEH, seh);
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+static std::wstring ModuleDir() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(g_layerModule, path, MAX_PATH);
+    std::wstring dir = path;
+    auto sep = dir.find_last_of(L"\\/");
+    return (sep == std::wstring::npos) ? L"." : dir.substr(0, sep);
+}
+
+static bool FileExists(const std::wstring& p) {
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::wstring ResolveBinDir() {
+    wchar_t env[MAX_PATH];
+    if (GetEnvironmentVariableW(L"DLSSNR_BIN_DIR", env, MAX_PATH) > 0 &&
+        FileExists(std::wstring(env) + L"\\nvngx_dlssnr.dll"))
+        return env;
+    std::wstring dir = ModuleDir();
+    if (FileExists(dir + L"\\nvngx_dlssnr.dll")) return dir;
+    if (FileExists(dir + L"\\binaries\\nvngx_dlssnr.dll")) return dir + L"\\binaries";
+    return L"";
+}
+
+static void RegisterPeRange(const char* name, HMODULE mod) {
+    if (!mod) return;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<uint8_t*>(mod) + dos->e_lfanew);
+    RegisterModuleRange(name, (uintptr_t)mod, nt->OptionalHeader.SizeOfImage);
+}
+
+// ---------------------------------------------------------------------------
+// Load + init (everything up to and including CreateFeature(18))
+// ---------------------------------------------------------------------------
+bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
+                    uint32_t width, uint32_t height, VkCommandBuffer recordingCmd) {
+    if (s.disabled) return false;
+    s.binDir = ResolveBinDir();
+    if (s.binDir.empty()) { Log("[ngx] nvngx_dlssnr.dll not found (set DLSSNR_BIN_DIR)"); s.disabled = true; return false; }
+    Log("[ngx] bin dir: %ls", s.binDir.c_str());
+
+    s.snippet = LoadLibraryExW((s.binDir + L"\\nvngx_dlssnr.dll").c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!s.snippet) { Log("[ngx] LoadLibrary nvngx_dlssnr.dll failed (%lu)", GetLastError()); s.disabled = true; return false; }
+    Log("[ngx] nvngx_dlssnr.dll loaded at %p", (void*)s.snippet);
+    RegisterPeRange("nvngx_dlssnr.dll", s.snippet);
+
+    s.initExt = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init_Ext"));
+    s.initExt2 = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init_Ext2"));
+    s.initPlain = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init"));
+    s.createFeature = reinterpret_cast<FnVkCreateFeature>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_CreateFeature"));
+    s.evaluateFeature = reinterpret_cast<FnVkEvaluateFeature>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_EvaluateFeature"));
+    s.releaseFeature = reinterpret_cast<FnVkReleaseFeature>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_ReleaseFeature"));
+    s.shutdown1 = reinterpret_cast<FnVkShutdown1>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Shutdown1"));
+    if (!s.createFeature || !s.evaluateFeature || !s.releaseFeature || !s.shutdown1) {
+        Log("[ngx] snippet Vulkan exports incomplete (create=%p eval=%p release=%p shutdown=%p)",
+            (void*)s.createFeature, (void*)s.evaluateFeature, (void*)s.releaseFeature, (void*)s.shutdown1);
+        s.disabled = true; return false;
+    }
+    Log("[ngx] snippet exports: init=%p create=%p", (void*)s.initExt, (void*)s.createFeature);
+
+    if (!InstallCallerSpoof(s.snippet, g_snippetSpoof)) { s.disabled = true; return false; }
+
+    s.nvapi = LoadLibraryExW((s.binDir + L"\\nvapi64.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (s.nvapi) RegisterPeRange("nvapi64.dll", s.nvapi);
+
+    // Core (nvngx.dll): libmgr prerequisite for snippet init; also param allocator.
+    std::wstring corePath = s.binDir + L"\\nvngx.dll";
+    if (FileExists(corePath)) {
+        s.core = LoadLibraryExW(corePath.c_str(), nullptr,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (s.core) InstallCallerSpoof(s.core, g_coreSpoof);
+    }
+    if (s.core) {
+        const char* projectId = "7c134ab9-9677-4af5-a2b2-bca943350861";
+        typedef NVSDK_NGX_Result (NVSDK_CONV* FnCoreInitWithProjectID)(
+            const char*, int, const char*, const wchar_t*,
+            VkInstance, VkPhysicalDevice, VkDevice);
+        typedef NVSDK_NGX_Result (NVSDK_CONV* FnCoreInitExt)(
+            unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice,
+            NVSDK_NGX_Version, const NVSDK_NGX_FeatureDiscoveryInfo*);
+        auto coreInitProjectID = reinterpret_cast<FnCoreInitWithProjectID>(
+            GetProcAddress(s.core, "NVSDK_NGX_VULKAN_Init_with_ProjectID"));
+        if (!coreInitProjectID)
+            coreInitProjectID = reinterpret_cast<FnCoreInitWithProjectID>(
+                GetProcAddress(s.core, "NVSDK_NGX_VULKAN_Init_ProjectID"));
+        auto coreInitExt = reinterpret_cast<FnCoreInitExt>(
+            GetProcAddress(s.core, "NVSDK_NGX_VULKAN_Init_Ext"));
+        bool coreInited = false;
+        if (coreInitProjectID) {
+            DWORD seh2 = 0;
+            NVSDK_NGX_Result r = Guarded([&] {
+                return coreInitProjectID(projectId, 3 /*CUSTOM*/, "Magpie-Experimental-0.5.7",
+                    s.binDir.c_str(), instance, pd, device);
+            }, NVSDK_NGX_Result_FAIL_SEH, &seh2);
+            Log("[core] VULKAN_Init_with_ProjectID -> %#x seh=%#x", (uint32_t)r, seh2);
+            coreInited = NVSDK_NGX_SUCCEED(r);
+        } else {
+            Log("[core] no Init_with_ProjectID export");
+        }
+        if (!coreInited && coreInitExt) {
+            DWORD seh2 = 0;
+            NVSDK_NGX_Result r = Guarded([&] {
+                return coreInitExt(DLSSNR_SIGNED_SNIPPET_APPLICATION_ID, s.binDir.c_str(),
+                    instance, pd, device, NVSDK_NGX_Version_API_14, nullptr);
+            }, NVSDK_NGX_Result_FAIL_SEH, &seh2);
+            Log("[core] VULKAN_Init_Ext -> %#x seh=%#x", (uint32_t)r, seh2);
+            coreInited = NVSDK_NGX_SUCCEED(r);
+        }
+        Log("[core] init %s", coreInited ? "OK" : "FAILED (continuing)");
+    } else {
+        Log("[core] nvngx.dll not loadable");
+    }
+
+    // Parameters: DLL allocator preferred (core -> snippet), own 16-slot vtable
+    // implementation only as fallback (notes section 4: blocks must come from the
+    // matching API family's allocator).
+    {
+        DWORD seh2 = 0;
+        NVSDK_NGX_Result r = NVSDK_NGX_Result_FAIL_Failure;
+        if (s.core) {
+            auto coreAlloc = reinterpret_cast<FnVkAllocateParameters>(
+                GetProcAddress(s.core, "NVSDK_NGX_VULKAN_AllocateParameters"));
+            auto coreDestroy = reinterpret_cast<FnVkDestroyParameters>(
+                GetProcAddress(s.core, "NVSDK_NGX_VULKAN_DestroyParameters"));
+            if (coreAlloc && coreDestroy) {
+                r = Guarded([&] { return coreAlloc(&s.params); }, NVSDK_NGX_Result_FAIL_SEH, &seh2);
+                Log("[params] core AllocateParameters -> %#x seh=%#x", (uint32_t)r, seh2);
+                if (NVSDK_NGX_SUCCEED(r) && s.params) s.paramsDestroy = coreDestroy;
+                else s.params = nullptr;
+            }
+        }
+        if (!s.params && s.snippet) {
+            auto snipAlloc = reinterpret_cast<FnVkAllocateParameters>(
+                GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_AllocateParameters"));
+            auto snipDestroy = reinterpret_cast<FnVkDestroyParameters>(
+                GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_DestroyParameters"));
+            if (snipAlloc) {
+                r = Guarded([&] { return snipAlloc(&s.params); }, NVSDK_NGX_Result_FAIL_SEH, &seh2);
+                Log("[params] snippet AllocateParameters -> %#x seh=%#x", (uint32_t)r, seh2);
+                if (NVSDK_NGX_SUCCEED(r) && s.params) s.paramsDestroy = snipDestroy;
+                else s.params = nullptr;
+            } else {
+                Log("[params] snippet does not export AllocateParameters");
+            }
+        }
+        if (!s.params) {
+            s.params = new OwnParam();
+            s.ownParams = true;
+            Log("[params] using own NVSDK_NGX_Parameter implementation");
+        }
+    }
+    {
+        DWORD seh2 = 0;
+        bool ok = ParamSetUI(s.params, "__selftest", 0xC0FFEE, &seh2);
+        unsigned int back = 0;
+        ok = ok && ParamGetUI(s.params, "__selftest", &back, &seh2) && back == 0xC0FFEE;
+        Log("[params] round-trip self-test: %s (seh=%#x)", ok ? "PASS" : "FAIL", seh2);
+        if (!ok) { s.disabled = true; return false; }
+    }
+
+    // Create parameters (extracted_pipeline_notes.md section 4).
+    DWORD seh = 0;
+    bool ps = true;
+    ps &= ParamSetUI(s.params, "DLSSNR.Width", width, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.Height", height, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.InputWidth", width, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.InputHeight", height, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.OutputWidth", width, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.OutputHeight", height, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.Output.Width", width, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.Output.Height", height, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.Upscaling", 0u, &seh);
+    ps &= ParamSetF(s.params, "DLSSNR.Scale", 1.0f, &seh);
+    ps &= ParamSetF(s.params, "DLSSNR.ScalingRatio", 1.0f, &seh);
+    ps &= ParamSetULL(s.params, "DLSSNRComputeScalingRatioCallback",
+                      (unsigned long long)(void*)&ScalingRatioCallback, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.Hint.Render.Preset", 0u, &seh);
+    ps &= ParamSetUI(s.params, "Width", width, &seh);
+    ps &= ParamSetUI(s.params, "Height", height, &seh);
+    ps &= ParamSetUI(s.params, "PerfQualityValue", 3u, &seh);  // Balanced
+    ps &= ParamSetUI(s.params, "CreationNodeMask", 1u, &seh);
+    ps &= ParamSetUI(s.params, "VisibilityNodeMask", 1u, &seh);
+    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_PerfQualityValue", 3u, &seh);
+    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_CreationNodeMask", 1u, &seh);
+    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_VisibilityNodeMask", 1u, &seh);
+    Log("[params] create contract set: %s (seh=%#x)", ps ? "ok" : "FAILED", seh);
+
+    // Snippet Init_Ext: (appId, path, instance, pd, device, version, featureInfo=nullptr)
+    NVSDK_NGX_Result initResult = NVSDK_NGX_Result_FAIL_NotInitialized;
+    for (NVSDK_NGX_Version ver : { NVSDK_NGX_Version_API_14, NVSDK_NGX_Version_API_13 }) {
+        if (s.initExt) {
+            initResult = CallInitExtSafely(s.initExt, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
+                s.binDir.c_str(), instance, pd, device, ver, &seh);
+            Log("[ngx] VULKAN_Init_Ext(ver=0x%x) -> %#x seh=%#x", ver, (uint32_t)initResult, seh);
+            if (NVSDK_NGX_SUCCEED(initResult)) break;
+        }
+        if (!NVSDK_NGX_SUCCEED(initResult) && s.initExt2) {
+            initResult = CallInitExtSafely(s.initExt2, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
+                s.binDir.c_str(), instance, pd, device, ver, &seh);
+            Log("[ngx] VULKAN_Init_Ext2(ver=0x%x) -> %#x seh=%#x", ver, (uint32_t)initResult, seh);
+            if (NVSDK_NGX_SUCCEED(initResult)) break;
+        }
+        if (!NVSDK_NGX_SUCCEED(initResult) && s.initPlain) {
+            initResult = CallInitExtSafely(s.initPlain, DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
+                s.binDir.c_str(), instance, pd, device, ver, &seh);
+            Log("[ngx] VULKAN_Init(ver=0x%x) -> %#x seh=%#x", ver, (uint32_t)initResult, seh);
+            if (NVSDK_NGX_SUCCEED(initResult)) break;
+        }
+    }
+    if (!NVSDK_NGX_SUCCEED(initResult)) {
+        Log("[ngx] snippet init failed, disabling layer");
+        s.disabled = true;
+        return false;
+    }
+
+    // Public Vulkan NGX contract: query Feature-18 requirements before create.
+    {
+        auto reqs2 = reinterpret_cast<FnVkGetFeatureReqs2>(
+            GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements"));
+        if (reqs2) {
+            DWORD seh2 = 0;
+            NVSDK_NGX_FeatureRequirements fr{};
+            NVSDK_NGX_Result r = Guarded([&] { return reqs2(instance, pd, &fr); },
+                                         NVSDK_NGX_Result_FAIL_SEH, &seh2);
+            Log("[reqs] GetFeatureRequirements -> %#x seh=%#x ver=%u.%u flags=%#x minGPU=%u inGPU=%u cs=%u.%u",
+                (uint32_t)r, seh2, fr.Version.Major, fr.Version.Minor, fr.FeatureFlags,
+                fr.MinGPUMode, fr.InGPUMode, fr.MinCSMajorVersion, fr.MinCSMinorVersion);
+        }
+    }
+
+    bool created = NgxCreateFeature(s, width, height, recordingCmd);
+    if (!created && s.snippet && s.params) {
+        auto reqs = reinterpret_cast<FnVkGetFeatureRequirements>(
+            GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements"));
+        if (reqs) {
+            DWORD seh3 = 0;
+            NVSDK_NGX_Result r = Guarded([&] { return reqs(instance, pd, s.params); },
+                                         NVSDK_NGX_Result_FAIL_SEH, &seh3);
+            Log("[diag] GetFeatureRequirements -> %#x seh=%#x", (uint32_t)r, seh3);
+            unsigned int avail = 0;
+            ParamGetUI(s.params, "DLSSNR.Available", &avail, &seh3);
+            Log("[diag] DLSSNR.Available=%u", avail);
+        }
+    }
+    return created;
+}
+
+bool NgxCreateFeature(NgxSnippet& s, uint32_t width, uint32_t height, VkCommandBuffer recordingCmd) {
+    if (s.disabled || !s.params) return false;
+    if (s.feature) {
+        DWORD seh = 0;
+        NVSDK_NGX_Result r = CallReleaseSafely(s.releaseFeature, s.feature, &seh);
+        Log("[ngx] ReleaseFeature (recreate) -> %#x seh=%#x", (uint32_t)r, seh);
+        s.feature = nullptr;
+    }
+    DWORD seh = 0;
+    NVSDK_NGX_Result createResult = CallCreateSafely(s.createFeature, recordingCmd,
+        FEATURE_DLSSNR, s.params, &s.feature, &seh);
+    Log("[ngx] VULKAN_CreateFeature(18) -> %#x seh=%#x handle=%p size=%ux%u",
+        (uint32_t)createResult, seh, (void*)s.feature, width, height);
+    if (!NVSDK_NGX_SUCCEED(createResult) || !s.feature) {
+        s.feature = nullptr;
+        s.disabled = true;
+        return false;
+    }
+    s.featureW = width;
+    s.featureH = height;
+    s.ready = true;
+    Log("[ngx] STATUS: Feature=18 created=true path=vulkan-snippet size=%ux%u", width, height);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Evaluate parameters (extracted_pipeline_notes.md section 5)
+// ---------------------------------------------------------------------------
+void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
+                     const NVSDK_NGX_Resource_VK& out, const NVSDK_NGX_Resource_VK& mv,
+                     const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height) {
+    if (!s.params) return;
+    s.resColor = color; s.resOut = out; s.resMV = mv; s.resDepth = depth;
+    DWORD seh = 0;
+    Guarded([&] {
+        s.params->Set("DLSSNR.Color", &s.resColor);
+        s.params->Set("DLSSNR.Output", &s.resOut);
+        s.params->Set("DLSSNR.MVec", &s.resMV);
+        s.params->Set("DLSSNR.Depth", &s.resDepth);
+        s.params->Set("DLSSNR.ControlMask", (const NVSDK_NGX_Resource_VK*)nullptr);
+        s.params->Set("DLSSNR.UI", (const NVSDK_NGX_Resource_VK*)nullptr);
+        s.params->Set("DLSSNR.UIAlpha", (const NVSDK_NGX_Resource_VK*)nullptr);
+        s.params->Set("DLSSNR.Backbuffer", (const NVSDK_NGX_Resource_VK*)nullptr);
+        s.params->Set("DLSSNR.BidirectionalDistortionField", (const NVSDK_NGX_Resource_VK*)nullptr);
+        s.params->Set("Color", &s.resColor);
+        s.params->Set("Output", &s.resOut);
+        s.params->Set("Depth", &s.resDepth);
+        s.params->Set("MotionVectors", &s.resMV);
+        s.params->Set("MVec", &s.resMV);
+        return true;
+    }, false, &seh);
+
+    const char* subrectNames[][4] = {
+        { "DLSSNR.ColorSubrectBaseX", "DLSSNR.ColorSubrectBaseY", "DLSSNR.ColorSubrectWidth", "DLSSNR.ColorSubrectHeight" },
+        { "DLSSNR.OutputSubrectBaseX", "DLSSNR.OutputSubrectBaseY", "DLSSNR.OutputSubrectWidth", "DLSSNR.OutputSubrectHeight" },
+        { "DLSSNR.MVecSubrectBaseX", "DLSSNR.MVecSubrectBaseY", "DLSSNR.MVecSubrectWidth", "DLSSNR.MVecSubrectHeight" },
+        { "DLSSNR.DepthSubrectBaseX", "DLSSNR.DepthSubrectBaseY", "DLSSNR.DepthSubrectWidth", "DLSSNR.DepthSubrectHeight" },
+    };
+    for (auto& n : subrectNames) {
+        ParamSetUI(s.params, n[0], 0, &seh);
+        ParamSetUI(s.params, n[1], 0, &seh);
+        ParamSetUI(s.params, n[2], width, &seh);
+        ParamSetUI(s.params, n[3], height, &seh);
+    }
+    bool ps = true;
+    ps &= ParamSetF(s.params, "DLSSNR.Jitter.Offset.X", 0.0f, &seh);
+    ps &= ParamSetF(s.params, "DLSSNR.Jitter.Offset.Y", 0.0f, &seh);
+    ps &= ParamSetF(s.params, "JitterOffsetX", 0.0f, &seh);
+    ps &= ParamSetF(s.params, "JitterOffsetY", 0.0f, &seh);
+    ps &= ParamSetUI(s.params, "Reset", 1u, &seh);
+    ps &= ParamSetF(s.params, "Sharpness", 0.0f, &seh);
+    ps &= ParamSetUI(s.params, "Width", width, &seh);
+    ps &= ParamSetUI(s.params, "Height", height, &seh);
+    ps &= ParamSetF(s.params, "DLSSNR.MVecScaleX", 1.0f, &seh);
+    ps &= ParamSetF(s.params, "DLSSNR.MVecScaleY", 1.0f, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.DepthInverted", 1u, &seh);
+    ps &= ParamSetUI(s.params, "DLSS.Indicator.Invert.X.Axis", 0u, &seh);
+    ps &= ParamSetUI(s.params, "DLSS.Indicator.Invert.Y.Axis", 0u, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.Enabled", 1u, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.Reset", 1u, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.Style", 0u, &seh);
+    ps &= ParamSetF(s.params, "DLSSNR.Intensity", 1.0f, &seh);
+    ps &= ParamSetF(s.params, "DLSSNR.LocalToneStrength", 1.0f, &seh);
+    ps &= ParamSetF(s.params, "DLSSNR.LocalStructureStrength", 1.0f, &seh);
+    ps &= ParamSetF(s.params, "DLSSNR.SkinStructureStrength", -1.0f, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.UseAutoMask", 0u, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.UICorrection", 0u, &seh);
+    Log("[params] evaluate contract set: %s (seh=%#x)", ps ? "ok" : "FAILED", seh);
+}
+
+void NgxSetReset(NgxSnippet& s, bool reset) {
+    if (!s.params) return;
+    DWORD seh = 0;
+    ParamSetUI(s.params, "DLSSNR.Reset", reset ? 1u : 0u, &seh);
+    ParamSetUI(s.params, "Reset", reset ? 1u : 0u, &seh);
+}
+
+void NgxSetStrengths(NgxSnippet& s, float intensity, float localTone,
+                     float localStructure, float skinStructure, float sharpness) {
+    if (!s.params) return;
+    DWORD seh = 0;
+    ParamSetF(s.params, "DLSSNR.Intensity", intensity, &seh);
+    ParamSetF(s.params, "DLSSNR.LocalToneStrength", localTone, &seh);
+    ParamSetF(s.params, "DLSSNR.LocalStructureStrength", localStructure, &seh);
+    ParamSetF(s.params, "DLSSNR.SkinStructureStrength", skinStructure, &seh);
+    ParamSetF(s.params, "Sharpness", sharpness, &seh);
+}
+
+bool NgxEvaluate(NgxSnippet& s, VkCommandBuffer recordingCmd) {
+    if (s.disabled || !s.ready || !s.feature) return false;
+    DWORD seh = 0;
+    NVSDK_NGX_Result r = CallEvaluateSafely(s.evaluateFeature, recordingCmd, s.feature, s.params, &seh);
+    if (!NVSDK_NGX_SUCCEED(r)) {
+        Log("[ngx] VULKAN_EvaluateFeature -> %#x seh=%#x (disabling)", (uint32_t)r, seh);
+        s.disabled = true;
+        return false;
+    }
+    return true;
+}
+
+// Teardown order per verified runner: Release -> Shutdown1 -> DestroyParameters
+// -> restore IAT -> FreeLibrary.
+void NgxTeardown(NgxSnippet& s, VkDevice device) {
+    DWORD seh = 0;
+    if (s.feature && s.releaseFeature) {
+        NVSDK_NGX_Result r = CallReleaseSafely(s.releaseFeature, s.feature, &seh);
+        Log("[ngx] ReleaseFeature -> %#x seh=%#x", (uint32_t)r, seh);
+        s.feature = nullptr;
+    }
+    if (s.shutdown1) {
+        NVSDK_NGX_Result r = CallShutdownSafely(s.shutdown1, device, &seh);
+        Log("[ngx] snippet Shutdown1 -> %#x seh=%#x", (uint32_t)r, seh);
+    }
+    if (s.params) {
+        if (s.ownParams) delete static_cast<OwnParam*>(s.params);
+        else if (s.paramsDestroy) {
+            NVSDK_NGX_Result r = Guarded([&] { return s.paramsDestroy(s.params); },
+                                         NVSDK_NGX_Result_FAIL_SEH, &seh);
+            Log("[ngx] DestroyParameters -> %#x seh=%#x", (uint32_t)r, seh);
+        }
+        s.params = nullptr;
+        s.paramsDestroy = nullptr;
+    }
+    RemoveCallerSpoof(g_snippetSpoof);
+    RemoveCallerSpoof(g_coreSpoof);
+    if (s.core) { FreeLibrary(s.core); s.core = nullptr; }
+    if (s.snippet) { FreeLibrary(s.snippet); s.snippet = nullptr; }
+    s.ready = false;
+}
+
+}  // namespace dlssnr

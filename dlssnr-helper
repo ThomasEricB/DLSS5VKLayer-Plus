@@ -1,0 +1,810 @@
+#!/usr/bin/env bash
+set -u
+
+PROG="${0##*/}"
+
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  RUNTIME_DIR="$XDG_RUNTIME_DIR/dlssnr"
+else
+  RUNTIME_DIR="/tmp/dlssnr-$UID"
+fi
+
+CONFIG_DIR="$XDG_CONFIG_HOME/dlssnr"
+CONFIG_FILE="$CONFIG_DIR/config.ini"
+DATA_DIR="$XDG_DATA_HOME/dlssnr"
+STATE_DIR="$XDG_STATE_HOME/dlssnr"
+PREFIX_DIR="$HOME/.local/share/dlssnr/prefix"
+WINE_PREFIX_DIR="$PREFIX_DIR"
+PID_FILE="$RUNTIME_DIR/helper.pid"
+SHM_FILE="$RUNTIME_DIR/shm.bin"
+LOG_FILE="$STATE_DIR/helper.log"
+DXVK_CONFIG_FILE="$STATE_DIR/dxvk.conf"
+
+runner_type=""
+runner_path=""
+binaries=""
+shm="$SHM_FILE"
+log="$LOG_FILE"
+dxvk_vendor=""
+dxvk_device=""
+
+usage() {
+  cat <<EOF
+usage: $PROG <command> [args]
+
+commands:
+  init                 create default config
+  setup                init config, dxvk config, and managed prefix if needed
+  start                start helper using configured runner
+  stop                 stop helper process tree
+  restart              stop then start
+  status               show helper status
+  doctor               check runner, prefix, dxvk, binaries, and paths
+  config               print effective config
+  runners              list discovered custom compatibility tool runners
+  detect-gpu           print detected NVIDIA PCI vendor/device
+  import-binaries DIR  copy NVIDIA NGX DLLs into user data dir
+EOF
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR" "$RUNTIME_DIR"
+  chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+}
+
+read_config_value() {
+  local key="$1" file="$2" line k v
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(trim "$line")"
+    case "$line" in
+      ''|'#'*) continue ;;
+      *=*) ;;
+      *) continue ;;
+    esac
+    k="$(trim "${line%%=*}")"
+    v="$(trim "${line#*=}")"
+    if [ "$k" = "$key" ]; then
+      printf '%s' "$v"
+      return 0
+    fi
+  done < "$file"
+}
+
+load_config() {
+  ensure_dirs
+  runner_type="$(read_config_value runner_type "$CONFIG_FILE")"
+  runner_path="$(read_config_value runner_path "$CONFIG_FILE")"
+  binaries="$(read_config_value binaries "$CONFIG_FILE")"
+  shm="$(read_config_value shm "$CONFIG_FILE")"
+  log="$(read_config_value log "$CONFIG_FILE")"
+  dxvk_vendor="$(read_config_value dxvk_vendor "$CONFIG_FILE")"
+  dxvk_device="$(read_config_value dxvk_device "$CONFIG_FILE")"
+  [ -n "$shm" ] || shm="$SHM_FILE"
+  [ -n "$log" ] || log="$LOG_FILE"
+}
+
+set_prefix_dirs() {
+  if [ "$runner_type" = "proton" ]; then
+    WINE_PREFIX_DIR="$PREFIX_DIR/pfx"
+  else
+    WINE_PREFIX_DIR="$PREFIX_DIR/wine"
+  fi
+}
+
+write_config() {
+  ensure_dirs
+  cat > "$CONFIG_FILE" <<EOF
+runner_type=$runner_type
+runner_path=$runner_path
+binaries=$binaries
+shm=$shm
+log=$log
+dxvk_vendor=$dxvk_vendor
+dxvk_device=$dxvk_device
+EOF
+}
+
+script_path() {
+  local p="$0"
+  while [ -L "$p" ]; do
+    p="$(readlink "$p")"
+  done
+  readlink -f "$p"
+}
+
+detect_install_dir() {
+  if [ -n "${DLSSNR_INSTALL_DIR:-}" ]; then
+    printf '%s' "$DLSSNR_INSTALL_DIR"
+    return 0
+  fi
+  local self bin_dir c
+  self="$(script_path)"
+  bin_dir="$(dirname "$self")"
+  for c in \
+    "$bin_dir/../lib64/dlssnr" \
+    "$bin_dir/../lib/dlssnr" \
+    "$bin_dir/../libexec/dlssnr" \
+    "$HOME/.local/lib/dlssnr" \
+    "/usr/lib64/dlssnr" \
+    "/usr/lib/dlssnr" \
+    "$bin_dir" \
+    "$bin_dir/.."; do
+    if [ -f "$c/helper/dlssnr_helper.exe" ] || [ -f "$c/build/dlssnr_helper.exe" ]; then
+      readlink -f "$c"
+      return 0
+    fi
+  done
+  readlink -f "$bin_dir"
+}
+
+detect_helper_exe() {
+  if [ -n "${DLSSNR_HELPER_EXE:-}" ]; then
+    printf '%s' "$DLSSNR_HELPER_EXE"
+    return 0
+  fi
+  local d c
+  d="$(detect_install_dir)"
+  for c in \
+    "$d/helper/dlssnr_helper.exe" \
+    "$d/build/dlssnr_helper.exe" \
+    "/usr/lib64/dlssnr/helper/dlssnr_helper.exe" \
+    "/usr/lib/dlssnr/helper/dlssnr_helper.exe" \
+    "$HOME/.local/lib/dlssnr/helper/dlssnr_helper.exe"; do
+    if [ -f "$c" ]; then
+      readlink -f "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_dxvk_dll() {
+  local d c
+  d="$(detect_install_dir)"
+  for c in \
+    "$d/third_party/dxvk/2.7.1/x64/vulkan-1.dll" \
+    "$d/dxvk/2.7.1/vulkan-1.dll" \
+    "/usr/lib64/dlssnr/dxvk/2.7.1/vulkan-1.dll" \
+    "/usr/share/dlssnr/dxvk/2.7.1/vulkan-1.dll" \
+    "$HOME/.local/lib/dlssnr/dxvk/2.7.1/vulkan-1.dll"; do
+    if [ -f "$c" ]; then
+      readlink -f "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_binaries() {
+  local d c
+  d="$(detect_install_dir)"
+  for c in \
+    "$DATA_DIR/binaries" \
+    "$d/helper/binaries" \
+    "$d/binaries" \
+    "$d/build/binaries"; do
+    if [ -f "$c/nvngx_dlssnr.dll" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  printf '%s' "$DATA_DIR/binaries"
+}
+
+detect_runner_probe() {
+  local d c
+  d="$(detect_install_dir)"
+  for c in \
+    "$d/build/runner_probe" \
+    "$d/runner_probe" \
+    "/usr/lib64/dlssnr/bin/runner_probe" \
+    "/usr/bin/dlssnr-runner-probe" \
+    "$HOME/.local/lib/dlssnr/bin/runner_probe"; do
+    if [ -x "$c" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+proton_score() {
+  local name="$1" v base=700000
+  case "$name" in
+    *Cachy*) base=1000000 ;;
+    *Wine-GE*) base=850000 ;;
+    *GE*) base=900000 ;;
+  esac
+  v="$(printf '%s\n' "$name" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
+  if [ -n "$v" ]; then
+    awk -v b="$base" -v v="$v" 'BEGIN { split(v, a, "."); printf "%d", b + a[1] * 1000 + (a[2] ? a[2] : 0) }'
+  else
+    printf '%s' "$base"
+  fi
+}
+
+detect_proton() {
+  local probe p base dir name score best="" best_score=-1
+  probe="$(detect_runner_probe || true)"
+  if [ -n "$probe" ]; then
+    p="$("$probe" --paths 2>/dev/null | head -1)"
+    if [ -n "$p" ]; then
+      printf '%s' "$p"
+      return 0
+    fi
+  fi
+
+  for base in \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/Steam/compatibilitytools.d" \
+    "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d" \
+    "$HOME/snap/steam/common/.local/share/Steam/compatibilitytools.d"; do
+    [ -d "$base" ] || continue
+    for dir in "$base"/*; do
+      [ -x "$dir/proton" ] || continue
+      name="$(basename "$dir")"
+      case "$name" in
+        *GE*|*Cachy*|*Sugar*|*Tkg*|*Wine-GE*) ;;
+        *) continue ;;
+      esac
+      score="$(proton_score "$name")"
+      if [ "$score" -gt "$best_score" ]; then
+        best="$dir/proton"
+        best_score="$score"
+      fi
+    done
+  done
+  printf '%s' "$best"
+}
+
+detect_wine() {
+  local w c
+  w="$(command -v wine 2>/dev/null || true)"
+  if [ -n "$w" ] && [ -x "$w" ]; then
+    printf '%s' "$w"
+    return 0
+  fi
+  for c in /usr/bin/wine /usr/local/bin/wine /opt/wine-devel/bin/wine; do
+    if [ -x "$c" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_steam_root() {
+  local d
+  for d in \
+    "$HOME/.local/share/Steam" \
+    "$HOME/.steam/steam" \
+    "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
+    if [ -d "$d" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_gpu() {
+  local id p v d cls
+  if command -v lspci >/dev/null 2>&1; then
+    id="$(lspci -d 10de: -n 2>/dev/null | awk '/0300/{for(i=1;i<=NF;i++) if($i ~ /^[0-9a-f]{4}:[0-9a-f]{4}$/){print $i; exit}}')"
+    if [ -z "$id" ]; then
+      id="$(lspci -d 10de: -n 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9a-f]{4}:[0-9a-f]{4}$/){print $i; exit}}')"
+    fi
+  fi
+  if [ -z "$id" ]; then
+    for p in /sys/bus/pci/devices/*; do
+      [ -r "$p/vendor" ] || continue
+      v="$(cat "$p/vendor" 2>/dev/null || true)"
+      d="$(cat "$p/device" 2>/dev/null || true)"
+      cls="$(cat "$p/class" 2>/dev/null || true)"
+      if [ "$v" = "0x10de" ] && [ "${cls#0x030}" != "$cls" ]; then
+        id="${v#0x}:${d#0x}"
+        break
+      fi
+    done
+  fi
+  printf '%s' "$id"
+}
+
+default_config() {
+  local p w id
+  p="$(detect_proton)"
+  if [ -n "$p" ]; then
+    runner_type="proton"
+    runner_path="$p"
+  else
+    w="$(detect_wine || true)"
+    if [ -n "$w" ]; then
+      runner_type="wine"
+      runner_path="$w"
+    else
+      runner_type="custom"
+      runner_path=""
+    fi
+  fi
+  binaries="$(detect_binaries)"
+  id="$(detect_gpu)"
+  if [ -n "$id" ]; then
+    dxvk_vendor="${id%%:*}"
+    dxvk_device="${id##*:}"
+  fi
+  shm="$SHM_FILE"
+  log="$LOG_FILE"
+  write_config
+}
+
+ensure_dxvk_config() {
+  ensure_dirs
+  local id ven="$dxvk_vendor" dev="$dxvk_device"
+  if [ -z "$ven" ] || [ -z "$dev" ]; then
+    id="$(detect_gpu)"
+    if [ -n "$id" ]; then
+      ven="${id%%:*}"
+      dev="${id##*:}"
+      dxvk_vendor="$ven"
+      dxvk_device="$dev"
+    fi
+  fi
+  if [ -n "$ven" ] && [ -n "$dev" ]; then
+    cat > "$DXVK_CONFIG_FILE" <<EOF
+dxgi.customVendorId = $ven
+dxgi.customDeviceId = $dev
+EOF
+  else
+    : > "$DXVK_CONFIG_FILE"
+    echo "warning: no NVIDIA GPU detected; DXVK custom IDs are not set" >&2
+  fi
+}
+
+setup_prefix() {
+  ensure_dirs
+  set_prefix_dirs
+  local wine dll
+  if [ "$runner_type" = "wine" ]; then
+    wine="$runner_path"
+  else
+    wine="$(detect_wine || true)"
+  fi
+  if [ -z "$wine" ] || [ ! -x "$wine" ]; then
+    echo "error: wine executable not found for managed prefix setup" >&2
+    return 1
+  fi
+  mkdir -p "$WINE_PREFIX_DIR"
+  if [ ! -d "$WINE_PREFIX_DIR/drive_c" ]; then
+    echo "creating managed Wine prefix: $WINE_PREFIX_DIR"
+    WINEPREFIX="$WINE_PREFIX_DIR" "$wine" wineboot --init >/dev/null 2>&1 ||
+      WINEPREFIX="$WINE_PREFIX_DIR" wineboot --init >/dev/null 2>&1 ||
+      return 1
+  fi
+  dll="$(detect_dxvk_dll || true)"
+  if [ -n "$dll" ]; then
+    mkdir -p "$WINE_PREFIX_DIR/drive_c/windows/system32"
+    if [ ! -f "$WINE_PREFIX_DIR/drive_c/windows/system32/vulkan-1.dll" ]; then
+      cp "$dll" "$WINE_PREFIX_DIR/drive_c/windows/system32/vulkan-1.dll"
+    fi
+  else
+    echo "warning: vendored DXVK vulkan-1.dll not found" >&2
+  fi
+}
+
+helper_pids() {
+  local helper base pid cmd
+  helper="$(detect_helper_exe || true)"
+  [ -n "$helper" ] || return 0
+  base="${helper##*/}"
+  for pid in /proc/[0-9]*; do
+    pid="${pid#/proc/}"
+    [ -r "/proc/$pid/cmdline" ] || continue
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    case "$cmd" in
+      *"$base"*) ;;
+      *) continue ;;
+    esac
+    if [ -r "/proc/$pid/environ" ] &&
+       tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -Fxq "DLSSNR_SHM=$shm"; then
+      printf '%s\n' "$pid"
+    fi
+  done
+}
+
+running_pid() {
+  local pid cmd
+  [ -f "$PID_FILE" ] || return 1
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  pid="$(trim "$pid")"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -r "/proc/$pid/cmdline" ]; then
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    case "$cmd" in
+      *dlssnr_helper.exe*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+cmd_start() {
+  ensure_dirs
+  if [ ! -f "$CONFIG_FILE" ]; then
+    default_config
+  fi
+  load_config
+  set_prefix_dirs
+  mkdir -p "$PREFIX_DIR"
+  if running_pid; then
+    echo "helper already running (pid $(cat "$PID_FILE"))"
+    return 0
+  fi
+  rm -f "$PID_FILE"
+
+  local helper helper_dir runner
+  helper="$(detect_helper_exe || true)"
+  if [ -z "$helper" ]; then
+    echo "error: dlssnr_helper.exe not found" >&2
+    return 1
+  fi
+  helper_dir="$(dirname "$helper")"
+
+  if [ "$runner_type" = "wine" ]; then
+    setup_prefix || return 1
+  fi
+
+  ensure_dxvk_config
+
+  if [ -z "$binaries" ]; then
+    binaries="$(detect_binaries)"
+  fi
+
+  runner="$runner_path"
+  case "$runner_type" in
+    proton)
+      if [ ! -x "$runner" ]; then
+        echo "error: proton runner not executable: $runner" >&2
+        return 1
+      fi
+      ;;
+    wine)
+      if [ ! -x "$runner" ]; then
+        echo "error: wine runner not executable: $runner" >&2
+        return 1
+      fi
+      ;;
+    custom)
+      if [ -z "$runner" ]; then
+        echo "error: custom runner path is empty" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "error: unknown runner_type: $runner_type" >&2
+      return 1
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$log")" "$(dirname "$shm")"
+  ( umask 077; touch "$shm" )
+  chmod 600 "$shm" 2>/dev/null || true
+  printf '\x00\x00\x00\x00' | dd of="$shm" bs=1 seek=20 count=4 conv=notrunc status=none 2>/dev/null || true
+
+  export WINEPREFIX="$WINE_PREFIX_DIR"
+  export DLSSNR_SHM="$shm"
+  export DLSSNR_LOG="$log"
+  export DXVK_CONFIG_FILE="$DXVK_CONFIG_FILE"
+  export WINEDEBUG="${WINEDEBUG:--all}"
+  if [ -n "$binaries" ]; then
+    export DLSSNR_BIN_DIR="Z:$binaries"
+  fi
+  if [ "$runner_type" = "proton" ]; then
+    export PROTON_ENABLE_NVAPI=1
+    export STEAM_COMPAT_DATA_PATH="$PREFIX_DIR"
+    local steam_root
+    steam_root="$(detect_steam_root || true)"
+    if [ -n "$steam_root" ]; then
+      export STEAM_COMPAT_CLIENT_INSTALL_PATH="$steam_root"
+    fi
+  fi
+  if [ "$runner_type" = "wine" ]; then
+    export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-vulkan-1=n,b}"
+  fi
+
+  local -a cmd
+  case "$runner_type" in
+    proton) cmd=("$runner" run "$helper") ;;
+    wine) cmd=("$runner" "$helper") ;;
+    custom) cmd=("$runner" "$helper") ;;
+  esac
+
+  if ! command -v setsid >/dev/null 2>&1; then
+    echo "error: setsid is required for isolated helper startup" >&2
+    return 1
+  fi
+
+  setsid bash -c '
+    printf "%s\n" "$$" > "$1"
+    shift
+    exec "$@"
+  ' _ "$PID_FILE" "${cmd[@]}" >>"$log" 2>&1 &
+
+  for _ in $(seq 1 40); do
+    [ -f "$PID_FILE" ] && break
+    sleep 0.1
+  done
+  for _ in $(seq 1 20); do
+    [ -n "$(helper_pids)" ] && break
+    sleep 0.25
+  done
+  if running_pid || [ -n "$(helper_pids)" ]; then
+    echo "helper started (pid $(cat "$PID_FILE"))"
+    echo "  runner: $runner_type $runner"
+    echo "  prefix: $PREFIX_DIR"
+    echo "  shm: $shm"
+    echo "  log: $log"
+  else
+    echo "helper failed to start; check $log" >&2
+    return 1
+  fi
+}
+
+cmd_stop() {
+  load_config
+  set_prefix_dirs
+  local pids pid
+
+  if [ -f "$shm" ]; then
+    printf '\x01\x00\x00\x00' | dd of="$shm" bs=1 seek=20 count=4 conv=notrunc status=none 2>/dev/null || true
+  fi
+
+  if running_pid; then
+    pid="$(cat "$PID_FILE")"
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+
+  for _ in $(seq 1 40); do
+    pids="$(helper_pids)"
+    [ -z "$pids" ] && break
+    sleep 0.25
+  done
+
+  pids="$(helper_pids)"
+  if [ -n "$pids" ]; then
+    for pid in $pids; do
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    for _ in $(seq 1 20); do
+      pids="$(helper_pids)"
+      [ -z "$pids" ] && break
+      sleep 0.25
+    done
+    pids="$(helper_pids)"
+    for pid in $pids; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+  fi
+
+  rm -f "$PID_FILE"
+  echo "helper stopped"
+}
+
+cmd_status() {
+  load_config
+  set_prefix_dirs
+  local pids
+  pids="$(helper_pids)"
+  if running_pid || [ -n "$pids" ]; then
+    echo "helper running"
+    if running_pid; then
+      echo "  runner pid: $(cat "$PID_FILE")"
+    fi
+    if [ -n "$pids" ]; then
+      echo "  helper pids: $(printf '%s' "$pids" | tr '\n' ' ')"
+    fi
+  else
+    echo "helper not running"
+  fi
+  echo "  config: $CONFIG_FILE"
+  echo "  runtime: $RUNTIME_DIR"
+  echo "  state: $STATE_DIR"
+  echo "  prefix: $WINE_PREFIX_DIR"
+  echo "  shm: $shm"
+  echo "  log: $log"
+}
+
+cmd_config() {
+  load_config
+  set_prefix_dirs
+  cat <<EOF
+config_file=$CONFIG_FILE
+runtime_dir=$RUNTIME_DIR
+state_dir=$STATE_DIR
+data_dir=$DATA_DIR
+prefix_dir=$PREFIX_DIR
+wine_prefix_dir=$WINE_PREFIX_DIR
+pid_file=$PID_FILE
+shm_file=$shm
+log_file=$log
+dxvk_config=$DXVK_CONFIG_FILE
+runner_type=$runner_type
+runner_path=$runner_path
+binaries=$binaries
+dxvk_vendor=$dxvk_vendor
+dxvk_device=$dxvk_device
+install_dir=$(detect_install_dir)
+helper_exe=$(detect_helper_exe || true)
+dxvk_dll=$(detect_dxvk_dll || true)
+EOF
+}
+
+cmd_detect_gpu() {
+  local id
+  id="$(detect_gpu)"
+  if [ -n "$id" ]; then
+    echo "$id"
+  else
+    echo "no NVIDIA GPU detected" >&2
+    return 1
+  fi
+}
+
+cmd_import_binaries() {
+  local src="${1:-}" dest f
+  if [ -z "$src" ] || [ ! -d "$src" ]; then
+    echo "usage: $PROG import-binaries DIR" >&2
+    return 1
+  fi
+  dest="$DATA_DIR/binaries"
+  mkdir -p "$dest"
+  for f in \
+    "$src"/nvngx_dlssnr.dll \
+    "$src"/nvngx.dll \
+    "$src"/nvapi64.dll \
+    "$src"/sl.*.dll \
+    "$src"/*.license.txt; do
+    if [ -f "$f" ]; then
+      cp -f "$f" "$dest/"
+    fi
+  done
+  load_config
+  binaries="$dest"
+  write_config
+  echo "imported binaries to $dest"
+}
+
+cmd_init() {
+  ensure_dirs
+  if [ -f "$CONFIG_FILE" ]; then
+    load_config
+    local p
+    p="$(detect_proton)"
+    if [ -n "$p" ]; then
+      case "$runner_path" in
+        */steamapps/common/Proton*)
+          runner_type="proton"
+          runner_path="$p"
+          write_config
+          echo "migrated official Proton runner to custom compatibility tool: $p"
+          ;;
+      esac
+    fi
+    echo "config already exists: $CONFIG_FILE"
+  else
+    default_config
+    echo "wrote $CONFIG_FILE"
+  fi
+  ensure_dxvk_config
+}
+
+cmd_setup() {
+  cmd_init
+  load_config
+  set_prefix_dirs
+  ensure_dxvk_config
+  if [ "$runner_type" = "wine" ]; then
+    setup_prefix
+  fi
+  echo "setup complete"
+}
+
+cmd_runners() {
+  local probe
+  probe="$(detect_runner_probe || true)"
+  if [ -n "$probe" ]; then
+    "$probe"
+    return $?
+  fi
+  local p
+  p="$(detect_proton)"
+  if [ -n "$p" ]; then
+    printf 'custom\t%s\n' "$p"
+  else
+    echo "no custom compatibility tools found" >&2
+    return 1
+  fi
+}
+
+cmd_doctor() {
+  ensure_dirs
+  load_config
+  set_prefix_dirs
+  local ok=0 helper dll
+  helper="$(detect_helper_exe || true)"
+  dll="$(detect_dxvk_dll || true)"
+
+  printf 'config: %s\n' "$CONFIG_FILE"
+  if [ -f "$CONFIG_FILE" ]; then echo "  ok"; else echo "  missing"; ok=1; fi
+
+  printf 'helper exe: %s\n' "${helper:-missing}"
+  if [ -n "$helper" ]; then echo "  ok"; else echo "  missing"; ok=1; fi
+
+  printf 'runner: %s %s\n' "$runner_type" "$runner_path"
+  if [ -x "$runner_path" ]; then echo "  ok"; else echo "  missing/not executable"; ok=1; fi
+
+  printf 'prefix: %s\n' "$WINE_PREFIX_DIR"
+  if [ -d "$WINE_PREFIX_DIR/drive_c" ]; then
+    echo "  ok"
+  elif [ "$runner_type" = "proton" ]; then
+    echo "  will be created by Proton on first run"
+  else
+    echo "  not initialized"
+    ok=1
+  fi
+
+  printf 'dxvk dll: %s\n' "${dll:-missing}"
+  if [ -n "$dll" ]; then echo "  ok"; else echo "  missing"; ok=1; fi
+
+  printf 'dxvk config: %s\n' "$DXVK_CONFIG_FILE"
+  if [ -s "$DXVK_CONFIG_FILE" ]; then echo "  ok"; else echo "  empty/missing"; ok=1; fi
+
+  printf 'binaries: %s\n' "$binaries"
+  if [ -f "$binaries/nvngx_dlssnr.dll" ] && [ -f "$binaries/nvngx.dll" ] && [ -f "$binaries/nvapi64.dll" ]; then
+    echo "  ok"
+  else
+    echo "  missing required NGX DLLs"
+    ok=1
+  fi
+
+  printf 'runtime dir: %s\n' "$RUNTIME_DIR"
+  if [ -w "$RUNTIME_DIR" ]; then echo "  ok"; else echo "  not writable"; ok=1; fi
+
+  printf 'state dir: %s\n' "$STATE_DIR"
+  if [ -w "$STATE_DIR" ]; then echo "  ok"; else echo "  not writable"; ok=1; fi
+
+  return "$ok"
+}
+
+case "${1:-}" in
+  init) cmd_init ;;
+  setup) cmd_setup ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_stop; cmd_start ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  config) cmd_config ;;
+  runners) cmd_runners ;;
+  detect-gpu) cmd_detect_gpu ;;
+  import-binaries) shift; cmd_import_binaries "$@" ;;
+  ""|help|--help|-h) usage ;;
+  *) usage >&2; exit 1 ;;
+esac
