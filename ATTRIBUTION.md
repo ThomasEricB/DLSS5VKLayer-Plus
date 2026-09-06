@@ -11,6 +11,7 @@ someone else's, and this file exists so that stays legible after the code has be
 | [Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR) | GPL-3.0 | the DLSS-NR module: the composition shader and its constant block, the reversible proxy modes, frame hold, the apply-model toggle, supersampling, the white-point work |
 | [y4my4my4m/OptiScaler_DLSSNR_Multipass_MFG](https://github.com/y4my4my4m/OptiScaler_DLSSNR_Multipass_MFG) | GPL-3.0 | multipass and per-pass model settings, the native-Vulkan feature path, MFG unlock |
 | [RenoDX](https://github.com/clshortfuse/renodx) | MIT | the colour composition itself — see below |
+| [xenmods/DLSSNR-Cost-Scaler](https://github.com/xenmods/DLSSNR-Cost-Scaler) | MIT | the native + edit enlargement — technique only, no code |
 | [vkBasalt](https://github.com/DadSchoorse/vkBasalt) | zlib | referenced for correct layer structure; **no code taken** |
 | [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) | — | the base project this forks |
 
@@ -33,6 +34,11 @@ The matched residual and its cube scaling are **hhkbble's**, from a multi-pass p
 the OptiScaler fork. It was reimplemented rather than merged, so there is no commit of theirs to
 carry the credit; it is recorded here and in the source instead.
 
+The third enlargement mode, **native + edit**, is the technique from **xen's** DLSSNR-Cost-Scaler
+(MIT): its `CS_Resolve` is where the additive rule and the shape of the luminance guard come from. No
+code was copied — the branch in `dlssnr.hlsl` is y4my4my4m's writing of it, carried here from
+`nr-split-vulkan`.
+
 ## The vendored shader
 
 `layer_linux/src/dlssnr/` holds the composition shader as a pair: `dlssnr.hlsl` as source, and
@@ -50,6 +56,14 @@ to the Direct3D bytecode, which this project never builds.
 
 `DlssNr_Layout.h` pins the constant block's offsets against the compiled module. If a re-vendor
 changes the layout, that file stops compiling on purpose.
+
+The `.spv` was originally copied from Dagherbou's tree. It is now built here, because the native +
+edit branch came from a different fork than the rest of the shader and no upstream artifact contains
+both. The command above reproduces the committed module byte for byte with
+`dxc 1.9(1-0d3ee6b5)`; a different `dxc` will lay out the same program differently, which is
+expected and harmless. Behaviour was checked against the artifact it replaces by capturing matched
+input frames through the pass, and the difference sat inside the run-to-run noise of the pass itself
+(see the commit that made the change).
 
 ## Licensing note
 

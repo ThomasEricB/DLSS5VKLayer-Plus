@@ -432,10 +432,14 @@ QWidget* MainWindow::buildSettings() {
         binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.0, 30.0, 0.5,
                          "The most the pass may brighten or darken a pixel. A detail pass has no "
                          "business restyling a light source, whatever the model returns.");
-        binder->AddChoice(f, "Enlargement", &ShmHeader::transfer, { "Classic", "Matched residual" },
+        binder->AddChoice(f, "Enlargement", &ShmHeader::transfer,
+                          { "Classic", "Matched residual", "Native + edit" },
                           "How a model that worked below the frame's size is brought back. Matched "
                           "residual carries only the model's difference up, so the two pictures being "
-                          "composed are at the same scale.");
+                          "composed are at the same scale. Native + edit composes nothing at all: the "
+                          "frame's own pixels are the result and only the model's difference is added "
+                          "to them, so geometry, text and edges the model left alone stay at native "
+                          "sharpness. Only does anything below a working scale of 1.");
     }
     {
         auto* f = group("Model  (read when the model is built, so a change takes a moment)");

@@ -47,7 +47,7 @@ const Setting kSettings[] = {
     { "detail", &ShmHeader::transferStrengthBits, true, "how much of the edit lands, 0-4" },
     { "colour", &ShmHeader::colourStrengthBits, true, "how much of its colour comes with it, 0-4" },
     { "guard", &ShmHeader::maxRatioBits, true, "highlight guard, the most a pixel may move" },
-    { "transfer", &ShmHeader::transfer, false, "0 classic, 1 matched residual" },
+    { "transfer", &ShmHeader::transfer, false, "0 classic, 1 matched residual, 2 native + edit" },
     { "debugview", &ShmHeader::debugView, false, "0 off, 1 proxy, 2 model, 3 amplified edit" },
     { "debugscale", &ShmHeader::debugScaleBits, true, "what the debug views are multiplied by" },
     { "whitepoint", &ShmHeader::whitePointBits, true, "paper white" },

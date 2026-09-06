@@ -226,7 +226,9 @@ struct ShmHeader {
     // The most the pass may multiply or divide a pixel by. The transfer is a ratio, and a ratio
     // against a near-black proxy pixel is unbounded without one.
     std::atomic<uint32_t> maxRatioBits;
-    // How a model that worked below the frame's size is brought back. 0 classic, 1 matched residual.
+    // How a model that worked below the frame's size is brought back. 0 classic, 1 matched residual,
+    // 2 native + edit -- the frame's own pixels with only the model's difference added, so what the
+    // model left alone never passes through the enlargement.
     std::atomic<uint32_t> transfer;
     // 0 off, 1 the picture the model was shown, 2 its raw answer, 3 what it changed, amplified.
     std::atomic<uint32_t> debugView;

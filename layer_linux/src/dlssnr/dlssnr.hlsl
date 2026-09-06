@@ -23,7 +23,7 @@ cbuffer Params : register(b0)
     float gCompareSplit; // where the wipe cuts, 0..1
     float gCompareZoom;  // side by side: 1 fits the frame, 2 fills the half
     uint  gCompareSwap;  // put the edited frame on the other side
-    uint  gTransfer;     // 0 classic, 1 matched residual -- how a below-size model comes back
+    uint  gTransfer;     // 0 classic, 1 matched residual, 2 native + edit -- how a below-size model comes back
     float gDebugScale;   // what the debug views are scaled by, held still while the meter moves
     uint  gReversibleMode; // 0 knee, 1 Neutwo+composed, 2 Neutwo+replace, 3 hybrid+composed, 4 hybrid+replace
     uint  gApplyModel;     // 0 output the clean frame (pass still runs), 1 apply the model's edit
@@ -871,14 +871,64 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // original's luminance says it should. Adding a difference is what let colour run away: nothing
     // bounded where the sum landed, so a warm subject could arrive green. Here both ends of every
     // blend are well-formed pictures, so everything between them is one too.
+    //
+    // Transfer 2 is the exception: it adds a difference, and carries the bound that path lacked.
     float modelLuma = dot(model, kLuma);
     float3 upgraded;
 
     if (modelLuma <= 1e-5)
     {
         // The model can return an empty frame for an input it cannot read. Rescaling that collapses
-        // the picture to black, so the frame is handed back untouched instead.
+        // the picture to black, so the frame is handed back untouched instead. Ahead of the additive
+        // branch as well: an empty model makes the edit the negated proxy, which subtracts the frame.
         upgraded = original;
+    }
+    else if (gTransfer == 2 && modelRanSmall)
+    {
+        // Native + edit. The frame's own pixels are the result and only the model's difference is
+        // laid on top of them.
+        //
+        // The other two modes build every output pixel out of the model's raster, so below frame size
+        // the whole picture arrives through the enlargement and geometry, text and edges the model
+        // never touched come back softened. Enlarging the difference alone leaves everything the
+        // model had no opinion about at native sharpness.
+        //
+        // Taken only where there is an enlargement, as the residual path is. At the same rate the
+        // model's picture is already the frame's size, nothing is resampled on the way back, and
+        // there is no softening for this to avoid.
+        //
+        // Technique from xenmods' DLSSNR-Cost-Scaler, Copyright (c) 2026 xen, MIT --
+        // https://github.com/xenmods/DLSSNR-Cost-Scaler. Its CS_Resolve is the source of the additive
+        // rule and of the guard's shape below; no code is copied.
+        //
+        // Saturated like the blend in the branch below. Detail strength above 1 is carried further
+        // down as a power on the luminance ratio, so scaling the edit by it here as well spends it
+        // twice.
+        upgraded = max(original + edit * saturate(gTransferStrength), float3(0.0, 0.0, 0.0));
+
+        // What bounds the sum. An addition says nothing about where the result lands, so the model's
+        // verdict is read as a ratio on the pair it came from and the sum is held near it.
+        //
+        // 1/512 in the normalised space, the same value and the same reason as the ratio floor
+        // further down: two dark pixels divide into an arbitrarily large number and the ratio is then
+        // built from rounding noise, which crawls frame to frame. The term is in both halves, so a
+        // bright pair is unaffected and the ratio falls to one as the pair goes black.
+        const float kEditFloor = 1.0 / 512.0;
+        const float editRatio = (modelLuma + kEditFloor) / (proxyLuma + kEditFloor);
+        const float sumLuma = dot(upgraded, kLuma);
+
+        if (sumLuma > 1e-5 && proxyLuma > 1e-5)
+        {
+            // The higher of two ceilings: 2.5x the pixel's own luminance, so a pixel the model
+            // genuinely brightened is not pulled back, and the model's ratio with half again plus an
+            // absolute 0.1, so a near-black pixel keeps an allowance rather than one that scales away
+            // with it. One scalar over the whole triple -- a per-channel bound moves hue.
+            const float targetLuma = originalLuma * editRatio;
+            const float maxLuma = max(originalLuma * 2.5, targetLuma * 1.5 + 0.1);
+
+            if (sumLuma > maxLuma)
+                upgraded *= maxLuma / sumLuma;
+        }
     }
     else
     {

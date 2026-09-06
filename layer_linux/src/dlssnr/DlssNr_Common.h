@@ -145,16 +145,20 @@ struct alignas(256) DlssNrConstants
     // left and right, so a difference can look like an improvement purely from where it sits.
     uint32_t CompareSwap;
 
-    // How a model that worked below the frame's size is brought back. 0 classic, 1 matched residual.
+    // How a model that worked below the frame's size is brought back. 0 classic, 1 matched residual,
+    // 2 native + edit.
     //
     // Classic composes the model's own low-resolution picture against the full-resolution frame, so
     // the two disagree by the blur the downsample introduced as well as by the edit -- and the
     // composition reads that disagreement as headroom the frame has and the model never saw. Matched
     // residual takes only the model's *difference* from low resolution and lays it on the frame's own
     // full-resolution proxy, so the two pictures being compared are at the same scale and the only
-    // thing carried up from small is the edit itself.
+    // thing carried up from small is the edit itself. Native + edit composes nothing: the frame's own
+    // pixels are the result and only the model's difference is added to them, so what the model left
+    // alone never passes through the enlargement. A luminance guard bounds the sum.
     //
     // The idea and the cube-scaled residual are hhkbble's, from the multi-pass PR against this fork.
+    // Native + edit is the technique from xenmods' DLSSNR-Cost-Scaler (MIT).
     uint32_t Transfer;
 
     // What the debug views are multiplied by on their way out.
