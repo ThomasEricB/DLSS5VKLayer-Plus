@@ -554,10 +554,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
     sc.passThrough = !SupportedFormat(sc.format) || sc.width > kMaxW || sc.height > kMaxH;
 
     std::lock_guard<std::mutex> lk(dc->lock);
-    dc->swapchains[*pSwapchain] = std::move(sc);
-    Log("[layer] swapchain %p %ux%u fmt=%d passThrough=%d", (void*)*pSwapchain,
+    Log("[layer] swapchain %p %ux%u fmt=%d passThrough=%d%s", (void*)*pSwapchain,
         pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
-        (int)pCreateInfo->imageFormat, 0);
+        (int)pCreateInfo->imageFormat, (int)sc.passThrough,
+        sc.passThrough ? (SupportedFormat(sc.format) ? " (too large)" : " (unsupported format)") : "");
+    dc->swapchains[*pSwapchain] = std::move(sc);
     return VK_SUCCESS;
 }
 
@@ -824,7 +825,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             SwapchainState& sc = sit->second;
             if (sc.passThrough || pPresentInfo->pImageIndices[i] >= sc.images.size()) continue;
             if (!sc.ready && !dc->shm.dead) {
-                if (!CreateResources(dc, sc, family)) { sc.passThrough = true; continue; }
+                if (!CreateResources(dc, sc, family)) {
+                    Log("[layer] staging resources failed for swapchain %p (%ux%u, family %u); "
+                        "passing this swapchain through",
+                        (void*)pPresentInfo->pSwapchains[i], sc.width, sc.height, family);
+                    sc.passThrough = true;
+                    continue;
+                }
                 sc.ready = true;
             }
             if (!sc.ready || dc->shm.dead) continue;
