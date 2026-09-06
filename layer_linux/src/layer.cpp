@@ -591,7 +591,13 @@ static void Barrier(DeviceChain* dc, VkCommandBuffer cb, VkImage img, VkImageLay
     dc->vkCmdPipelineBarrier(cb, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
-// Returns true if 'outMapped' now holds the neural-processed frame.
+// Returns true if the swapchain image now holds the neural-processed frame.
+//
+// The image arrives in VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, which is what the game transitioned it to
+// before handing it to vkQueuePresentKHR, and it must be back in that layout on every path out --
+// including the fail-open one. It is not COLOR_ATTACHMENT_OPTIMAL: that is where the game's render
+// pass left it, one transition earlier, and naming it here made every barrier a layout mismatch and
+// handed the present engine an image in a layout it does not accept.
 static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
                            VkImage swapchainImage, uint32_t* outW, uint32_t* outH) {
     VkDevice d = dc->self;
@@ -608,12 +614,12 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = { sc.width, sc.height, 1 };
 
-    auto restoreColorLayout = [&]() {
+    auto restorePresentLayout = [&]() {
         if (dc->vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
         Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
         if (dc->vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
         if (dc->vkQueueSubmit(queue, 1, &si, sc.fence) != VK_SUCCESS) return false;
         if (dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
@@ -623,9 +629,10 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
 
     // ---- capture: swapchain -> bufIn ----
     if (dc->vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
-    Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+    Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT);
     dc->vkCmdCopyImageToBuffer(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                sc.bufIn.buffer, 1, &region);
@@ -639,7 +646,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     if (!ShmProcessFrame(dc->shm, sc.width, sc.height,
                          sc.format == VK_FORMAT_R8G8B8A8_UNORM || sc.format == VK_FORMAT_R8G8B8A8_SRGB,
                          sc.bufIn.mapped)) {
-        restoreColorLayout();
+        restorePresentLayout();
         return false;
     }
     *outW = sc.width; *outH = sc.height;
@@ -655,9 +662,9 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     dc->vkCmdCopyBufferToImage(cb, sc.bufOut.buffer, swapchainImage,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     if (dc->vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
     if (dc->vkQueueSubmit(queue, 1, &si, sc.fence) != VK_SUCCESS) return false;
     if (dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
