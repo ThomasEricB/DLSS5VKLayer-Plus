@@ -147,6 +147,48 @@ VKLayer_DLSS5=1 %command%
 
 The layer is disabled unless `VKLayer_DLSS5=1` is present.
 
+The layer is intended to coexist with the Steam overlay. If a game crashes during Vulkan device creation, make sure you are using `0.1.0-4` or newer.
+
+## Steam / Proton Containers
+
+Steam games run inside the Steam Linux Runtime / `pressure-vessel` container. By default, the container may not expose `$XDG_RUNTIME_DIR/dlssnr` to the game process, so the Vulkan layer and the helper can end up looking at different shared-memory files.
+
+Symptoms:
+
+```text
+[dlssnr-layer] [shm] attached /run/user/1000/dlssnr/shm.bin seq_req=0 seq_resp=0
+[dlssnr-layer] [shm] helper unresponsive, disabling
+```
+
+while the helper log only says it is waiting for frames.
+
+### Per-Game Fix
+
+Add this to the Steam game launch options:
+
+```text
+PRESSURE_VESSEL_FILESYSTEMS_RW="$XDG_RUNTIME_DIR/dlssnr" VKLayer_DLSS5=1 %command%
+```
+
+If you already use other `PRESSURE_VESSEL_FILESYSTEMS_RW` paths, keep them and append the DLSS5VKLayer runtime directory with a colon separator.
+
+### System-Wide Fix
+
+To avoid editing every game launch option, expose the directory to Steam and Proton globally:
+
+```bash
+mkdir -p ~/.config/environment.d
+printf '%s\n' 'PRESSURE_VESSEL_FILESYSTEMS_RW="${XDG_RUNTIME_DIR}/dlssnr"' > ~/.config/environment.d/99-dlssnr.conf
+```
+
+Log out and log back in, or restart your user session, so Steam picks up the new environment.
+
+If you use a custom `DLSSNR_SHM` path, expose the directory containing that file instead. For example:
+
+```text
+PRESSURE_VESSEL_FILESYSTEMS_RW=/home/USERNAME/.local/share/dlssnr VKLayer_DLSS5=1 %command%
+```
+
 ## Runner Discovery
 
 Custom compatibility tools are discovered from:
@@ -194,7 +236,7 @@ rm -f /tmp/dlssnr_shm.bin
 rm -f "${XDG_RUNTIME_DIR:-/tmp/dlssnr-$UID}/dlssnr/shm.bin"
 ```
 
-Current builds use the XDG runtime path by default, so games and the helper should not need `DLSSNR_SHM` set manually.
+Current builds use the XDG runtime path by default, so games and the helper should not need `DLSSNR_SHM` set manually. Steam games may still need the `PRESSURE_VESSEL_FILESYSTEMS_RW` bind mount described above.
 
 Logs are written to the XDG state directory:
 
@@ -271,6 +313,22 @@ sudo ./uninstall.sh --system
 ```
 
 Add `--purge` to also remove user config, state, runtime data, and the managed prefix.
+
+## Troubleshooting
+
+If the helper starts and immediately logs `shutting down`, update to `0.1.0-4` or newer and remove stale runtime state:
+
+```bash
+rm -f "${XDG_RUNTIME_DIR:-/tmp/dlssnr-$UID}/dlssnr/shm.bin"
+```
+
+If a Steam game crashes in `steamoverlayvulkanlayer.so`, update to `0.1.0-4` or newer.
+
+If a Steam/Proton game logs `[shm] helper unresponsive, disabling` while the helper is waiting for frames, bind the shared-memory directory into `pressure-vessel`:
+
+```text
+PRESSURE_VESSEL_FILESYSTEMS_RW="$XDG_RUNTIME_DIR/dlssnr" VKLayer_DLSS5=1 %command%
+```
 
 ## Important Notes
 

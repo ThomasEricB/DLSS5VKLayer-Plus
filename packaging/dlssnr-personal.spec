@@ -1,13 +1,14 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
+%global pkg_release 4
 
 Name:           dlssnr-personal
 Version:        0.1.0
-Release:        2%{?dist}
+Release:        %{pkg_release}%{?dist}
 Summary:        DLSS5 Neural Rendering Vulkan layer and helper with bundled NGX DLLs
 License:        Proprietary
-Source0:        %{name}-%{version}-linux-x86_64.tar.gz
+Source0:        %{name}-%{version}-%{pkg_release}-linux-x86_64.tar.gz
 
 BuildArch:      x86_64
 
@@ -27,7 +28,7 @@ tool. This personal package includes bundled NVIDIA NGX DLLs and should only
 be redistributed if you have the rights to do so.
 
 %prep
-%setup -q -n %{name}-%{version}-linux-x86_64
+%setup -q -n %{name}-%{version}-%{pkg_release}-linux-x86_64
 
 %build
 # Prebuilt binary payload.
@@ -48,6 +49,15 @@ cp -a root/usr %{buildroot}/usr
 %doc %{_datadir}/doc/dlssnr/dxvk-license.txt
 
 %changelog
+* Sat Sep 05 2026 DLSS5VKLayer - 0.1.0-4
+- Detect bundled binaries and runner defaults in doctor/start when config is empty.
+- Log stale helper quit flags and explicit helper quit reasons.
+
+* Sat Sep 05 2026 DLSS5VKLayer - 0.1.0-3
+- Fix Steam overlay conflict by preserving the loader device create-info chain.
+- Clear stale helper quit state on helper startup.
+- Sync stale shared-memory sequence counters when the helper attaches.
+
 * Sat Sep 05 2026 DLSS5VKLayer - 0.1.0-2
 - Use XDG runtime shared-memory path by default.
 - Add helper heartbeat recovery.

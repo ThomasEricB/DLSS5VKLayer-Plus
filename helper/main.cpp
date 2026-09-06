@@ -92,6 +92,9 @@ static bool ShmOpen(ShmMap& s) {
     if (s.hdr->magic.load() != kShmMagic || s.hdr->passes.load() == 0) {
         ShmInitDefaults(s.hdr);
     }
+    if (s.hdr->quit.load()) Log("[helper] clearing stale quit flag");
+    s.hdr->quit.store(0);
+    s.hdr->seq_resp.store(s.hdr->seq_req.load());
     s.hdr->controlSeq.fetch_add(1);
     s.hdr->heartbeat.fetch_add(1);
     Log("[helper] shm attached: %ls", winPath.c_str());
@@ -692,6 +695,8 @@ int main() {
         if (ns.ngx.disabled) break;
     }
 
+    if (shm.hdr->quit.load()) Log("[helper] quit requested");
+    else if (ns.ngx.disabled) Log("[helper] neural disabled");
     Log("[helper] shutting down");
     if (ns.ngx.snippet) NgxTeardown(ns.ngx, ns.vk.device);
     vkDeviceWaitIdle(ns.vk.device);

@@ -4,6 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION="${DLSSNR_VERSION:-0.1.0}"
+RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
+RELEASE="${RELEASE:-1}"
 DIST="dist"
 BUILD="${DLSSNR_BUILD_DIR:-build}"
 export DLSSNR_SKIP_MANIFEST_INSTALL=1
@@ -17,7 +19,7 @@ mkdir -p "$DIST"
 stage_variant() {
   local variant="$1"
   local pkg_name="$2"
-  local pkg_dir="$DIST/$pkg_name-$VERSION-linux-x86_64"
+  local pkg_dir="$DIST/$pkg_name-$VERSION-$RELEASE-linux-x86_64"
   local root="$pkg_dir/root"
 
   rm -rf "$pkg_dir"
@@ -59,8 +61,8 @@ stage_variant() {
     chmod 644 "$root/usr/lib64/dlssnr/helper/binaries/"* 2>/dev/null || true
   fi
 
-  tar -C "$DIST" -czf "$DIST/$pkg_name-$VERSION-linux-x86_64.tar.gz" "$pkg_name-$VERSION-linux-x86_64"
-  echo "built $DIST/$pkg_name-$VERSION-linux-x86_64.tar.gz"
+  tar -C "$DIST" -czf "$DIST/$pkg_name-$VERSION-$RELEASE-linux-x86_64.tar.gz" "$pkg_name-$VERSION-$RELEASE-linux-x86_64"
+  echo "built $DIST/$pkg_name-$VERSION-$RELEASE-linux-x86_64.tar.gz"
 }
 
 build_rpm() {

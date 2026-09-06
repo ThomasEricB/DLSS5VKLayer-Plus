@@ -43,13 +43,16 @@ fi
 
 if [ "$PURGE" = true ]; then
   rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/dlssnr"
+  rm -rf "$HOME/.config/dlssnr"
   rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/dlssnr"
   rm -rf "$HOME/.local/share/dlssnr"
   rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/dlssnr"
+  rm -rf "$HOME/.local/state/dlssnr"
   if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     rm -rf "$XDG_RUNTIME_DIR/dlssnr"
   fi
   rm -rf "/tmp/dlssnr-$UID"
+  rm -f "/tmp/dlssnr_shm.bin"
 fi
 
 echo "DLSS5VKLayer removed"

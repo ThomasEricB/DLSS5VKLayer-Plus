@@ -363,10 +363,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_EnumeratePhysicalDevices(
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo,
     const VkAllocationCallbacks* pAllocator, VkDevice* pDevice) {
-    const VkLayerDeviceCreateInfo* link = (const VkLayerDeviceCreateInfo*)pCreateInfo->pNext;
+    auto* link = const_cast<VkLayerDeviceCreateInfo*>((const VkLayerDeviceCreateInfo*)pCreateInfo->pNext);
     while (link && !(link->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO &&
                      link->function == VK_LAYER_LINK_INFO))
-        link = (const VkLayerDeviceCreateInfo*)link->pNext;
+        link = (VkLayerDeviceCreateInfo*)link->pNext;
     if (!link || !link->u.pLayerInfo) return VK_ERROR_INITIALIZATION_FAILED;
 
     PFN_vkGetInstanceProcAddr next_gipa = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
@@ -381,19 +381,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         if (it != g_phys.end()) ic = it->second;
     }
 
-    std::vector<VkLayerDeviceCreateInfo> prefix;
-    for (const auto* n = (const VkLayerDeviceCreateInfo*)pCreateInfo->pNext; n && n != link;
-         n = (const VkLayerDeviceCreateInfo*)n->pNext)
-        prefix.push_back(*n);
-    VkDeviceCreateInfo m = *pCreateInfo;
-    if (prefix.empty()) {
-        m.pNext = link->pNext;
-    } else {
-        for (size_t i = 0; i + 1 < prefix.size(); ++i) prefix[i].pNext = &prefix[i + 1];
-        prefix.back().pNext = link->pNext;
-        m.pNext = &prefix[0];
-    }
-    VkResult res = create(physicalDevice, &m, pAllocator, pDevice);
+    link->u.pLayerInfo = link->u.pLayerInfo->pNext;
+    VkResult res = create(physicalDevice, pCreateInfo, pAllocator, pDevice);
     if (res != VK_SUCCESS) return res;
 
     DeviceChain* dc = new DeviceChain();
@@ -737,6 +726,15 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
     return nullptr;
 }
 
+static PFN_vkVoidFunction LookupDeviceHook(const char* n) {
+    if (!std::strcmp(n, "vkDestroyDevice")) return (PFN_vkVoidFunction)Hook_DestroyDevice;
+    if (!std::strcmp(n, "vkGetDeviceQueue")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue;
+    if (!std::strcmp(n, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction)Hook_CreateSwapchainKHR;
+    if (!std::strcmp(n, "vkDestroySwapchainKHR")) return (PFN_vkVoidFunction)Hook_DestroySwapchainKHR;
+    if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
+    return nullptr;
+}
+
 extern "C" {
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* pName);
@@ -798,7 +796,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instan
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* pName) {
     if (!pName) return nullptr;
     if (!std::strcmp(pName, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
-    if (auto fn = LookupHook(pName)) return fn;
+    if (auto fn = LookupDeviceHook(pName)) return fn;
     if (device) {
         std::lock_guard<std::mutex> lk(g_stateMutex);
         auto it = g_devices.find(device);

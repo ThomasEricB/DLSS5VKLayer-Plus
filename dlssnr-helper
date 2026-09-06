@@ -444,6 +444,10 @@ cmd_start() {
     default_config
   fi
   load_config
+  if [ -z "$runner_path" ]; then
+    default_config
+    load_config
+  fi
   set_prefix_dirs
   mkdir -p "$PREFIX_DIR"
   if running_pid; then
@@ -468,6 +472,11 @@ cmd_start() {
 
   if [ -z "$binaries" ]; then
     binaries="$(detect_binaries)"
+    write_config
+  fi
+  if [ ! -f "$binaries/nvngx_dlssnr.dll" ]; then
+    echo "warning: nvngx_dlssnr.dll not found in $binaries" >&2
+    echo "         the helper will start, but neural processing will be disabled" >&2
   fi
 
   runner="$runner_path"
@@ -747,10 +756,36 @@ cmd_runners() {
 cmd_doctor() {
   ensure_dirs
   load_config
-  set_prefix_dirs
-  local ok=0 helper dll
+  local ok=0 helper dll det_runner_type det_runner_path det_binaries det_prefix
   helper="$(detect_helper_exe || true)"
   dll="$(detect_dxvk_dll || true)"
+  det_runner_type="$runner_type"
+  det_runner_path="$runner_path"
+  det_binaries="$binaries"
+
+  if [ -z "$det_runner_path" ]; then
+    det_runner_path="$(detect_proton || true)"
+    if [ -n "$det_runner_path" ]; then
+      det_runner_type="proton"
+    else
+      det_runner_path="$(detect_wine || true)"
+      if [ -n "$det_runner_path" ]; then
+        det_runner_type="wine"
+      else
+        det_runner_type="custom"
+      fi
+    fi
+  fi
+
+  if [ -z "$det_binaries" ]; then
+    det_binaries="$(detect_binaries)"
+  fi
+
+  if [ "$det_runner_type" = "proton" ]; then
+    det_prefix="$PREFIX_DIR/pfx"
+  else
+    det_prefix="$PREFIX_DIR/wine"
+  fi
 
   printf 'config: %s\n' "$CONFIG_FILE"
   if [ -f "$CONFIG_FILE" ]; then echo "  ok"; else echo "  missing"; ok=1; fi
@@ -758,13 +793,13 @@ cmd_doctor() {
   printf 'helper exe: %s\n' "${helper:-missing}"
   if [ -n "$helper" ]; then echo "  ok"; else echo "  missing"; ok=1; fi
 
-  printf 'runner: %s %s\n' "$runner_type" "$runner_path"
-  if [ -x "$runner_path" ]; then echo "  ok"; else echo "  missing/not executable"; ok=1; fi
+  printf 'runner: %s %s\n' "$det_runner_type" "$det_runner_path"
+  if [ -x "$det_runner_path" ]; then echo "  ok"; else echo "  missing/not executable"; ok=1; fi
 
-  printf 'prefix: %s\n' "$WINE_PREFIX_DIR"
-  if [ -d "$WINE_PREFIX_DIR/drive_c" ]; then
+  printf 'prefix: %s\n' "$det_prefix"
+  if [ -d "$det_prefix/drive_c" ]; then
     echo "  ok"
-  elif [ "$runner_type" = "proton" ]; then
+  elif [ "$det_runner_type" = "proton" ]; then
     echo "  will be created by Proton on first run"
   else
     echo "  not initialized"
@@ -775,10 +810,10 @@ cmd_doctor() {
   if [ -n "$dll" ]; then echo "  ok"; else echo "  missing"; ok=1; fi
 
   printf 'dxvk config: %s\n' "$DXVK_CONFIG_FILE"
-  if [ -s "$DXVK_CONFIG_FILE" ]; then echo "  ok"; else echo "  empty/missing"; ok=1; fi
+  if [ -s "$DXVK_CONFIG_FILE" ]; then echo "  ok"; else echo "  will be created by start"; fi
 
-  printf 'binaries: %s\n' "$binaries"
-  if [ -f "$binaries/nvngx_dlssnr.dll" ] && [ -f "$binaries/nvngx.dll" ] && [ -f "$binaries/nvapi64.dll" ]; then
+  printf 'binaries: %s\n' "$det_binaries"
+  if [ -f "$det_binaries/nvngx_dlssnr.dll" ] && [ -f "$det_binaries/nvngx.dll" ] && [ -f "$det_binaries/nvapi64.dll" ]; then
     echo "  ok"
   else
     echo "  missing required NGX DLLs"
