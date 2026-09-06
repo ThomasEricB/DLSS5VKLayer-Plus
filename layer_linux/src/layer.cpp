@@ -760,6 +760,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     }
     if (!runLeg()) return false;
     dropWaits();
+    sc.comp->ConsumeMeter();
     const double tCapture = time ? NowMs() : 0.0;
 
     // ---- the round trip ----
@@ -789,6 +790,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         dc->shm.hdr->layerFormat.store(uint32_t(sc.format));
         dc->shm.hdr->layerCompositionUp.store(1);
         dc->shm.hdr->layerMsBits.store(FloatToBits(float(tReturn - t0)));
+        dc->shm.hdr->layerMeasuredWhiteBits.store(FloatToBits(sc.comp->MeasuredWhitePoint()));
         dc->shm.hdr->layerHeartbeat.fetch_add(1);
     }
 

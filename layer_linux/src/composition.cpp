@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace dlssnr {
 
@@ -59,12 +60,12 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
     s.reversibleMode = h->reversibleMode.load();
     s.applyModel = h->applyModel.load();
     s.holdFrame = h->holdFrame.load();
+    s.downscaler = h->scalingDownscaler.load();
 
-    // The slider, times the scale that says what the model should consider white. The trim belongs
-    // to the measured source, which this layer does not have yet.
-    const float base = BitsToFloat(h->whitePointBits.load());
-    const float scale = BitsToFloat(h->whitePointScaleBits.load());
-    s.whitePoint = base * (std::isfinite(scale) && scale > 0.0f ? scale : 1.0f);
+    s.whitePointManual = BitsToFloat(h->whitePointBits.load());
+    s.whitePointScale = BitsToFloat(h->whitePointScaleBits.load());
+    s.whitePointTrim = BitsToFloat(h->whitePointTrimBits.load());
+    s.whitePointSource = h->whitePointSource.load();
 
     // Clamped here rather than trusted, because these come from a file any process can write.
     const auto clamp = [](float v, float lo, float hi, float fallback) {
@@ -75,13 +76,16 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
     s.colourStrength = clamp(s.colourStrength, 0.0f, 4.0f, 1.0f);
     s.maxRatio = clamp(s.maxRatio, 1.0f, float(kMaxPasses), 2.0f);
     s.debugScale = clamp(s.debugScale, 0.01f, 100.0f, 1.0f);
-    s.whitePoint = clamp(s.whitePoint, 1e-4f, 2000.0f, 1.0f);
+    s.whitePointManual = clamp(s.whitePointManual, 1e-4f, 2000.0f, 1.0f);
+    s.whitePointScale = clamp(s.whitePointScale, 0.01f, 100.0f, 1.0f);
+    s.whitePointTrim = clamp(s.whitePointTrim, 0.01f, 100.0f, 1.0f);
+    if (s.whitePointSource > kWhitePointMeasured) s.whitePointSource = kWhitePointManual;
     s.compareSplit = clamp(s.compareSplit, 0.0f, 1.0f, 0.5f);
     s.compareZoom = clamp(s.compareZoom, 1.0f, 2.0f, 1.0f);
 
-    // Above 1.0 is supersampling, which needs a down-leg this layer has not ported yet; clamping
-    // rather than refusing means the control exists and simply stops at 100% for now.
-    s.workingScale = clamp(s.workingScale, 0.25f, 1.0f, 1.0f);
+    // Above 1.0 the model supersamples, up to upstream's 2x ceiling.
+    s.workingScale = clamp(s.workingScale, 0.25f, 2.0f, 1.0f);
+    if (s.downscaler >= kScalerCount || s.downscaler == kScalerFsr1) s.downscaler = kScalerLanczos3;
 
     if (s.transfer > 1) s.transfer = 1;
     if (s.debugView > 3) s.debugView = 0;
@@ -124,12 +128,21 @@ void Composition::DropAll() {
     DropImage(_work);
     DropImage(_model);
     DropImage(_composed);
+    DropImage(_modelNative);
+    DropImage(_meter);
+    DropHostBuffer(_meterBuf);
     DropHostBuffer(_download);
     DropHostBuffer(_upload);
+    _superUp.reset();
+    _superDown.reset();
+    _superSample = false;
     _width = _height = _modelW = _modelH = 0;
     _haveModel = false;
     _frameCaptured = false;
     _captureRecorded = false;
+    _meterRecorded = false;
+    _meterCount = 0;
+    _measuredWhitePoint = 0.0f;
 }
 
 bool Composition::FormatSupportsStorage(VkFormat format) const {
@@ -300,21 +313,38 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
     // and enable shaderStorageImageWriteWithoutFormat on the device, which is the arrangement this
     // pass actually needs and which vkBasalt reaches by a similar route.
     //
-    // The model works at a fraction of the frame. Rounded to a multiple of eight so the dispatch
-    // covers it exactly, and never below 64 so a tiny window cannot produce a degenerate raster.
+    // The model works at this fraction of the frame.
+    //
+    // No rounding to a workgroup multiple: every dispatch here covers a partial group and the shader
+    // bounds-checks against gWidth/gHeight, so alignment buys nothing -- and rounding *up* was worse
+    // than nothing, because at a scale of exactly 1.0 it pushed a 500-pixel frame to 504 and quietly
+    // engaged supersampling on a setting that means "leave it alone". A floor of 64 only stops a
+    // pathologically small window from producing a degenerate raster.
     const auto scaled = [&](uint32_t v) {
-        const uint32_t r = uint32_t(std::lround(double(v) * double(s.workingScale)));
-        return std::max<uint32_t>(64, (r + 7u) & ~7u);
+        if (s.workingScale == 1.0f) return v;
+        return std::max<uint32_t>(64, uint32_t(std::lround(double(v) * double(s.workingScale))));
     };
-    const uint32_t modelW = std::min(scaled(width), width);
-    const uint32_t modelH = std::min(scaled(height), height);
+    const uint32_t modelW = scaled(width);
+    const uint32_t modelH = scaled(height);
+    const bool superSample = modelW > width || modelH > height;
 
     if (_width == width && _height == height && _swapchainFormat == swapchainFormat &&
-        _modelW == modelW && _modelH == modelH && _linearHdr == linearHdr && _frame.image)
+        _modelW == modelW && _modelH == modelH && _linearHdr == linearHdr &&
+        _scalerFilter == s.downscaler && _frame.image)
         return true;
 
-    Log("[comp] building %ux%u, model %ux%u, %s", width, height, modelW, modelH,
-        linearHdr ? "linear HDR" : "display-referred");
+    Log("[comp] building %ux%u, model %ux%u, %s%s", width, height, modelW, modelH,
+        linearHdr ? "linear HDR" : "display-referred",
+        superSample ? " (supersampling)" : "");
+
+    if (superSample) {
+        // Said out loud because it is the transport, not the GPU, that decides whether this is
+        // usable: the proxy and the answer both cross shared memory at the model's raster, so the
+        // per-frame copy grows with the square of the scale.
+        const double mb = double(modelW) * modelH * 4.0 / (1024.0 * 1024.0);
+        Log("[comp] supersampling to %ux%u means %.0f MB across shared memory each way, every frame",
+            modelW, modelH, mb);
+    }
 
     DropAll();
 
@@ -340,11 +370,38 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
         MakeHostBuffer(_download, size_t(modelW) * modelH * 4, dst) &&
         MakeHostBuffer(_upload, size_t(modelW) * modelH * 4, src);
 
+    // The meter is a fixed 64x64 grid whatever the frame is, and is only built when there is
+    // something to measure: on a frame the game already tone mapped there is no white point to find,
+    // so the dispatch and its readback are skipped entirely rather than run and ignored.
+    const bool okMeter =
+        !linearHdr ||
+        (MakeImage(_meter, kDlssNrMeterGrid, kDlssNrMeterGrid, VK_FORMAT_R32_SFLOAT,
+                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
+         MakeHostBuffer(_meterBuf, size_t(kDlssNrMeterGrid) * kDlssNrMeterGrid * sizeof(float),
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT));
+
     const bool needWork = (modelW != width || modelH != height);
     const bool okWork = !needWork || MakeImage(_work, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
                                                sampled | storage | src);
 
-    if (!ok || !okWork) {
+    // The averaged answer, and the two filters that get there. Built only when supersampling.
+    bool okSuper = true;
+    if (superSample) {
+        okSuper = MakeImage(_modelNative, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | storage);
+        _superUp = std::make_unique<ScalerVk>(_vk, _instance, _device, _physicalDevice, true, s.downscaler);
+        _superDown = std::make_unique<ScalerVk>(_vk, _instance, _device, _physicalDevice, false, s.downscaler);
+        if (!_superUp->CanRender() || !_superDown->CanRender()) {
+            Log("[comp] the resampling filters could not be built; supersampling is unavailable");
+            _superUp.reset();
+            _superDown.reset();
+            okSuper = false;
+        }
+    } else {
+        _superUp.reset();
+        _superDown.reset();
+    }
+
+    if (!ok || !okWork || !okMeter || !okSuper) {
         _reason = "could not allocate the composition surfaces";
         DropAll();
         return false;
@@ -354,6 +411,8 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
     _height = height;
     _modelW = modelW;
     _modelH = modelH;
+    _superSample = superSample;
+    _scalerFilter = s.downscaler;
     _reason.clear();
     return true;
 }
@@ -395,13 +454,24 @@ void Composition::CopyWholeImage(VkCommandBuffer cb, VkImage src, VkImageLayout 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+// Where the white point comes from, in one place.
+//
+// The measured reading is only taken when there is one: the meter needs a lit scene and a linear
+// frame to say anything, and until it has spoken the slider is the answer rather than zero. The scale
+// applies to whichever was chosen, because it is the user saying what the model should treat as white
+// rather than a property of the measurement.
+float Composition::ResolvedWhitePoint(const FrameSettings& s) const {
+    float base = s.whitePointManual;
+    if (s.whitePointSource == kWhitePointMeasured && _measuredWhitePoint > 0.0f)
+        base = _measuredWhitePoint * s.whitePointTrim;
+    const float wp = base * s.whitePointScale;
+    return std::min(std::max(wp, 1e-4f), 2000.0f);
+}
+
 DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     DlssNrConstants c{};
 
-    // While held, the white point is the one snapshotted when hold came on. Upstream calls this the
-    // key constraint: anything that measures the white point keeps measuring, so leaving it live
-    // would drift the held picture for a reason other than the setting under test.
-    c.WhitePoint = (_holding && _frameCaptured) ? _heldWhitePoint : s.whitePoint;
+    c.WhitePoint = (_holding && _frameCaptured) ? _heldWhitePoint : ResolvedWhitePoint(s);
     c.TransferStrength = s.transferStrength;
     c.ColourStrength = s.colourStrength;
     c.MaxRatio = s.maxRatio;
@@ -440,7 +510,7 @@ bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, cons
     // moment it comes on rather than re-read every frame it stays on.
     if (s.holdFrame && !_holding) {
         _holding = true;
-        _heldWhitePoint = s.whitePoint;
+        _heldWhitePoint = ResolvedWhitePoint(s);
         Log("[comp] frame held (white point %.3f)", double(_heldWhitePoint));
     } else if (!s.holdFrame && _holding) {
         _holding = false;
@@ -479,19 +549,53 @@ bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, cons
                          _proxy.view, _keep.view))
         return false;
 
+    // The meter, measured off the untouched copy and never off anything this pass writes. That
+    // distinction is the whole reason it is safe: an earlier white point meter upstream read its own
+    // output and chased it, walking one session from 0.010 to 97.910. There is no path from what this
+    // pass writes back into what this reads.
+    _meterRecorded = false;
+    if (_meter.image) {
+        Transition(cb, _keep, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Transition(cb, _meter, VK_IMAGE_LAYOUT_GENERAL);
+
+        DlssNrConstants meter = BaseConstants(s);
+        meter.Mode = DlssNrMode_Calibrate;
+        meter.Width = kDlssNrMeterGrid;
+        meter.Height = kDlssNrMeterGrid;
+        if (_pass->Dispatch(cb, meter, kDlssNrMeterGrid, kDlssNrMeterGrid, _keep.view, VK_NULL_HANDLE,
+                            VK_NULL_HANDLE, VK_NULL_HANDLE, _meter.view, VK_NULL_HANDLE)) {
+            Transition(cb, _meter, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy mr{};
+            mr.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            mr.imageExtent = { kDlssNrMeterGrid, kDlssNrMeterGrid, 1 };
+            _vk->vkCmdCopyImageToBuffer(cb, _meter.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        _meterBuf.buffer, 1, &mr);
+            _meterRecorded = true;
+        }
+        Transition(cb, _keep, VK_IMAGE_LAYOUT_GENERAL);
+    }
+
     // What the model is actually handed: the full-resolution proxy, or a reduction of it.
     Image* source = &_proxy;
     if (_work.image) {
         Transition(cb, _proxy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         Transition(cb, _work, VK_IMAGE_LAYOUT_GENERAL);
 
-        DlssNrConstants down = BaseConstants(s);
-        down.Mode = DlssNrMode_Downsample;
-        down.Width = _modelW;
-        down.Height = _modelH;
-        if (!_pass->Dispatch(cb, down, _modelW, _modelH, _proxy.view, VK_NULL_HANDLE, VK_NULL_HANDLE,
-                             VK_NULL_HANDLE, _work.view, VK_NULL_HANDLE))
-            return false;
+        if (_superSample) {
+            // Enlarge, so the model has more pixels to synthesise into than the frame has.
+            if (!_superUp->Dispatch(cb, _proxy.view, _work.view, _width, _height, _modelW, _modelH))
+                return false;
+        } else {
+            // Reduce, with the module's own area filter -- the model then works on fewer pixels and
+            // less crosses the shared memory.
+            DlssNrConstants down = BaseConstants(s);
+            down.Mode = DlssNrMode_Downsample;
+            down.Width = _modelW;
+            down.Height = _modelH;
+            if (!_pass->Dispatch(cb, down, _modelW, _modelH, _proxy.view, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                 VK_NULL_HANDLE, _work.view, VK_NULL_HANDLE))
+                return false;
+        }
         source = &_work;
     }
 
@@ -518,7 +622,20 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     _vk->vkCmdCopyBufferToImage(cb, _upload.buffer, _model.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     Transition(cb, _model, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
+    // When the model worked above the frame its answer is averaged back to native first, and the
+    // composition then sees a native proxy against a native answer -- which is what it should see,
+    // because from its point of view the model effectively ran at the frame's own resolution.
+    Image* answer = &_model;
     Image* source = _work.image ? &_work : &_proxy;
+    if (_superSample) {
+        Transition(cb, _modelNative, VK_IMAGE_LAYOUT_GENERAL);
+        if (!_superDown->Dispatch(cb, _model.view, _modelNative.view, _modelW, _modelH, _width, _height))
+            return false;
+        Transition(cb, _modelNative, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        answer = &_modelNative;
+        source = &_proxy;
+    }
+
     Transition(cb, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     Transition(cb, _keep, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     Transition(cb, _composed, VK_IMAGE_LAYOUT_GENERAL);
@@ -527,7 +644,7 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     res.Mode = DlssNrMode_Resolve;
     res.Width = _width;
     res.Height = _height;
-    if (!_pass->Dispatch(cb, res, _width, _height, source->view, _model.view, _keep.view, VK_NULL_HANDLE,
+    if (!_pass->Dispatch(cb, res, _width, _height, source->view, answer->view, _keep.view, VK_NULL_HANDLE,
                          _composed.view, VK_NULL_HANDLE))
         return false;
 
@@ -568,6 +685,67 @@ void Composition::WriteCapturedFrame() {
     const size_t bytes = size_t(_width) * _height * (_workFormat == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4);
     const uint8_t* base = (const uint8_t*) _captureBuf.mapped;
     _capture.WriteFrame(base, base + bytes, _width, _height, uint32_t(_workFormat));
+}
+
+
+// A high percentile of tile peaks, not the maximum.
+//
+// The maximum is a sun or a specular hit and would normalise the whole picture into the dark; the
+// mean is scene brightness and says nothing about what scale the buffer is on. The 90th percentile of
+// per-tile peaks is high enough to sit at the top of the real range and common enough that no single
+// highlight decides it.
+//
+// The reading is only offered when enough of the frame carries light, measured against its own
+// brightest tile rather than an absolute threshold -- the units here are the game's and there is no
+// absolute scale. That is what separates "this buffer is scaled by 240" from "I am standing in a dark
+// cave": a percentile of tile peaks describes the buffer only when enough of the picture is lit for
+// the top of the range to appear in it.
+void Composition::ConsumeMeter() {
+    if (!_meterRecorded || !_meterBuf.mapped) return;
+    _meterRecorded = false;
+
+    const float* src = (const float*) _meterBuf.mapped;
+    std::vector<float> tiles;
+    tiles.reserve(kDlssNrMeterGrid * kDlssNrMeterGrid);
+    for (uint32_t i = 0; i < kDlssNrMeterGrid * kDlssNrMeterGrid; ++i) {
+        if (std::isfinite(src[i]) && src[i] > 1e-6f) tiles.push_back(src[i]);
+    }
+    if (tiles.size() < 16) return;
+
+    const size_t nth = size_t(float(tiles.size() - 1) * 0.90f);
+    std::nth_element(tiles.begin(), tiles.begin() + nth, tiles.end());
+    const float candidate = tiles[nth];
+
+    float brightest = 0.0f;
+    for (float v : tiles) brightest = std::max(brightest, v);
+    uint32_t lit = 0;
+    for (float v : tiles) {
+        if (v > brightest * 0.10f) ++lit;
+    }
+    const float litFraction = float(lit) / float(tiles.size());
+
+    // A torn readback survives isfinite and would clamp to exactly the ceiling, which is a value the
+    // slider can hold -- so a garbage frame could be offered as a real answer. Reject rather than clamp.
+    if (!(candidate > 0.0f) || candidate >= 1999.0f) return;
+    if (litFraction <= 0.20f) return;
+
+    _meterHistory[_meterCount % kMeterHistory] = candidate;
+    ++_meterCount;
+    _measuredWhitePoint = std::min(std::max(candidate, 0.25f), 1990.0f);
+
+    // Steadiness is the spread of recent answers, not their size. A number that has held still is one
+    // worth taking; one that is swinging means the scene is moving under the measurement and no single
+    // value would serve anyway.
+    const uint32_t have = std::min(_meterCount, kMeterHistory);
+    if (have >= 8) {
+        float lo = _meterHistory[0], hi = _meterHistory[0];
+        for (uint32_t i = 0; i < have; ++i) {
+            lo = std::min(lo, _meterHistory[i]);
+            hi = std::max(hi, _meterHistory[i]);
+        }
+        const float spread = lo > 0.0f ? hi / lo : 2.0f;
+        _meterSteadiness = std::min(std::max(1.0f - (spread - 1.0f), 0.0f), 1.0f);
+    }
 }
 
 }  // namespace dlssnr

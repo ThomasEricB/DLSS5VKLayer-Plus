@@ -20,6 +20,7 @@
 // goes in the constant block.
 #include "capture.h"
 #include "dlssnr_pass.h"
+#include "scaler_vk.h"
 #include "vk_table.h"
 
 #include "../../common/shm_protocol.h"
@@ -36,7 +37,14 @@ struct FrameSettings {
     float colourStrength = 1.0f;
     float maxRatio = 2.0f;
     float debugScale = 1.0f;
-    float whitePoint = 1.0f;
+    // The white point is three numbers, not one: where it comes from, the multiplier that says what
+    // the model should consider white, and the trim that belongs to a measured reading rather than to
+    // the slider. Keeping them apart is upstream's fix for a real bug -- sharing one stored value
+    // meant touching the slider in one mode silently destroyed the number found in the other.
+    float whitePointManual = 1.0f;
+    float whitePointScale = 1.0f;
+    float whitePointTrim = 1.0f;
+    uint32_t whitePointSource = kWhitePointManual;
     float compareSplit = 0.5f;
     float compareZoom = 1.0f;
     float workingScale = 1.0f;
@@ -47,6 +55,7 @@ struct FrameSettings {
     uint32_t reversibleMode = kReversibleKnee;
     uint32_t applyModel = 1;
     uint32_t holdFrame = 0;
+    uint32_t downscaler = kScalerLanczos3;
 
     static FrameSettings Read(const ShmHeader* h);
 };
@@ -108,6 +117,13 @@ class Composition {
     // Called after leg 2's fence, when the readback the compose recorded has landed.
     void WriteCapturedFrame();
 
+    // Called after leg 1's fence: turns the tile grid the meter wrote into a white point.
+    void ConsumeMeter();
+
+    // What the meter settled on, or 0 when it has not taken a usable reading. For the interface, so
+    // the number in use is visible rather than inferred.
+    float MeasuredWhitePoint() const { return _measuredWhitePoint; }
+
   private:
     struct Image {
         VkImage image = VK_NULL_HANDLE;
@@ -138,6 +154,7 @@ class Composition {
 
     bool FormatSupportsStorage(VkFormat format) const;
     DlssNrConstants BaseConstants(const FrameSettings& s) const;
+    float ResolvedWhitePoint(const FrameSettings& s) const;
 
     const DeviceTable* _vk = nullptr;
     const InstanceTable* _instance = nullptr;
@@ -157,6 +174,26 @@ class Composition {
     bool _haveModel = false;
 
     Image _frame{}, _keep{}, _proxy{}, _work{}, _model{}, _composed{};
+
+    // Supersampling: the model works above the frame, so the proxy is enlarged on the way in and the
+    // answer averaged back on the way out. _modelNative holds that average; without it the resolve
+    // would read the larger answer through a bilinear sampler and alias, which is the reason upstream
+    // gave this its own filter rather than reusing the resolve's.
+    Image _modelNative{};
+    std::unique_ptr<ScalerVk> _superUp, _superDown;
+    bool _superSample = false;
+    uint32_t _scalerFilter = kScalerLanczos3;
+
+    // The white point meter: a grid of tile peak luminances measured off the untouched copy, and the
+    // percentile the host takes across it. See ConsumeMeter.
+    Image _meter{};
+    HostBuffer _meterBuf{};
+    bool _meterRecorded = false;
+    float _measuredWhitePoint = 0.0f;
+    static constexpr uint32_t kMeterHistory = 16;
+    float _meterHistory[kMeterHistory] = {};
+    uint32_t _meterCount = 0;
+    float _meterSteadiness = 0.0f;
     HostBuffer _download{}, _upload{}, _captureBuf{};
 
     CaptureWriter _capture;

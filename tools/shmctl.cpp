@@ -52,6 +52,8 @@ const Setting kSettings[] = {
     { "debugscale", &ShmHeader::debugScaleBits, true, "what the debug views are multiplied by" },
     { "whitepoint", &ShmHeader::whitePointBits, true, "paper white" },
     { "whitepointscale", &ShmHeader::whitePointScaleBits, true, "multiplier on the white point" },
+    { "whitepointsource", &ShmHeader::whitePointSource, false, "0 the slider, 1 measured off the frame" },
+    { "whitepointtrim", &ShmHeader::whitePointTrimBits, true, "multiplier on a measured white point" },
     { "workingscale", &ShmHeader::workingScaleBits, true, "the fraction of the frame the model works at" },
     { "downscaler", &ShmHeader::scalingDownscaler, false, "0 bilinear, 1 bicubic, 2 lanczos3" },
     { "compare", &ShmHeader::compareMode, false, "0 off, 1 side by side, 2 wipe" },
@@ -155,6 +157,16 @@ void PrintStatus(const ShmHeader* h) {
     std::printf("width=%u\nheight=%u\n", h->width.load(), h->height.load());
     std::printf("quit=%u\nheartbeat=%u\ncontrol_seq=%u\n", h->quit.load(), h->heartbeat.load(),
                 h->controlSeq.load());
+    std::printf("helper_state=%u\nmodel_up=%u\nhelper_frames=%llu\n", h->helperState.load(),
+                h->modelUp.load(),
+                (unsigned long long) ShmLoad64(h->helperFramesLo, h->helperFramesHi));
+    std::printf("layer_composition_up=%u\nlayer_frames=%llu\nlayer_ms=%.2f\n",
+                h->layerCompositionUp.load(),
+                (unsigned long long) ShmLoad64(h->layerFramesLo, h->layerFramesHi),
+                double(BitsToFloat(h->layerMsBits.load())));
+    std::printf("measured_white_point=%g\n", double(BitsToFloat(h->layerMeasuredWhiteBits.load())));
+    const std::string reason = ShmLoadString(h->helperReasonSeq, h->helperReason, kReasonBytes);
+    if (!reason.empty()) std::printf("helper_reason=%s\n", reason.c_str());
 }
 
 }  // namespace

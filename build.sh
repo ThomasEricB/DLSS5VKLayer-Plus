@@ -16,6 +16,7 @@ g++ -O2 -std=c++17 -shared -fPIC -Wall $VK_INC -I layer_linux/src \
     layer_linux/src/dlssnr_pass.cpp \
     layer_linux/src/composition.cpp \
     layer_linux/src/capture.cpp \
+    layer_linux/src/scaler_vk.cpp \
     -o build/layer/libVkLayer_NV_dlssnr.so -lpthread
 cp layer_linux/manifest/VK_LAYER_NV_dlssnr.json build/layer/
 
