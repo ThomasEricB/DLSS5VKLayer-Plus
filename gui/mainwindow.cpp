@@ -2,7 +2,10 @@
 #include "passdialog.h"
 #include "../common/runner_discovery.h"
 
+#include <QAction>
+#include <QActionGroup>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
@@ -13,8 +16,12 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QIcon>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMessageBox>
+#include <QPainter>
+#include <QPixmap>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPushButton>
@@ -22,6 +29,7 @@
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QVariantMap>
 
@@ -30,9 +38,34 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static QIcon gearIcon(const QWidget* w) {
+    QIcon icon = QIcon::fromTheme("preferences-system-symbolic", QIcon::fromTheme("preferences-system"));
+    if (!icon.isNull()) return icon;
+
+    QPixmap pm(32, 32);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.translate(16, 16);
+
+    QColor c = w ? w->palette().color(QPalette::WindowText) : QColor(40, 40, 40);
+    p.setPen(Qt::NoPen);
+    p.setBrush(c);
+    for (int i = 0; i < 8; ++i) {
+        p.save();
+        p.rotate(i * 45);
+        p.drawRect(QRectF(-2.2, -15, 4.4, 7));
+        p.restore();
+    }
+    p.drawEllipse(QPointF(0, 0), 10, 10);
+    p.setCompositionMode(QPainter::CompositionMode_DestinationOut);
+    p.drawEllipse(QPointF(0, 0), 4.5, 4.5);
+    return QIcon(pm);
+}
+
 MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     setWindowTitle("DLSS5VKLayer Helper");
-    resize(420, 300);
+    resize(420, 340);
 
     projectDir = findProjectDir();
     helperCliPath = findHelperCli();
@@ -43,6 +76,36 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     ensureShm();
 
     auto* root = new QVBoxLayout(this);
+
+    settingsMenu = new QMenu(this);
+    mvecAction = settingsMenu->addAction("Enable synthetic motion vectors");
+    mvecAction->setCheckable(true);
+    scaleMenu = settingsMenu->addMenu("Motion vector scale");
+    scaleGroup = new QActionGroup(this);
+    scaleGroup->setExclusive(true);
+    scaleNormalizedAction = scaleMenu->addAction("Normalized [-1, 1]");
+    scalePixelsAction = scaleMenu->addAction("Pixels");
+    scaleUv01Action = scaleMenu->addAction("UV [0, 1]");
+    for (QAction* a : { scaleNormalizedAction, scalePixelsAction, scaleUv01Action }) {
+        a->setCheckable(true);
+        scaleGroup->addAction(a);
+    }
+    qualityMenu = settingsMenu->addMenu("Motion vector quality");
+    qualityGroup = new QActionGroup(this);
+    qualityGroup->setExclusive(true);
+    qualityFastAction = qualityMenu->addAction("Fast");
+    qualityBalancedAction = qualityMenu->addAction("Balanced");
+    qualityQualityAction = qualityMenu->addAction("Quality");
+    for (QAction* a : { qualityFastAction, qualityBalancedAction, qualityQualityAction }) {
+        a->setCheckable(true);
+        qualityGroup->addAction(a);
+    }
+    settingsBtn = new QToolButton(this);
+    settingsBtn->setAutoRaise(true);
+    settingsBtn->setIcon(gearIcon(this));
+    settingsBtn->setToolTip("Settings");
+    settingsBtn->setPopupMode(QToolButton::InstantPopup);
+    settingsBtn->setMenu(settingsMenu);
 
     statusLabel = new QLabel(this);
     root->addWidget(statusLabel);
@@ -72,6 +135,10 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     enabledBox = new QCheckBox("Neural enabled", this);
     passesSpin = new QSpinBox(this);
     passesSpin->setRange(1, int(kMaxPasses));
+    presetCombo = new QComboBox(this);
+    presetCombo->addItem("DLSS5 Native", uint32_t(DLSS5_PRESET_NATIVE));
+    presetCombo->addItem("DLSS5 Natural", uint32_t(DLSS5_PRESET_NATURAL));
+    presetCombo->addItem("DLSS5 Cinematic", uint32_t(DLSS5_PRESET_CINEMATIC));
     intensitySpin = new QDoubleSpinBox(this);
     intensitySpin->setRange(0.0, 4.0);
     intensitySpin->setSingleStep(0.05);
@@ -91,22 +158,31 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     if (hdr) {
         enabledBox->setChecked(ShmNeuralEnabled(hdr));
         passesSpin->setValue(int(ShmPasses(hdr)));
+        presetCombo->setCurrentIndex(int(ShmPreset(hdr)));
         intensitySpin->setValue(BitsToFloat(hdr->intensityBits.load()));
         localToneSpin->setValue(BitsToFloat(hdr->localToneBits.load()));
         localStructureSpin->setValue(BitsToFloat(hdr->localStructureBits.load()));
         skinStructureSpin->setValue(BitsToFloat(hdr->skinStructureBits.load()));
         sharpnessSpin->setValue(BitsToFloat(hdr->sharpnessBits.load()));
+        mvecAction->setChecked(ShmMVecEnabled(hdr));
+        setScaleAction(ShmMVecScaleMode(hdr));
+        setQualityAction(ShmMVecQuality(hdr));
     } else {
         enabledBox->setChecked(true);
         passesSpin->setValue(1);
+        presetCombo->setCurrentIndex(int(DLSS5_PRESET_NATIVE));
         intensitySpin->setValue(1.0);
         localToneSpin->setValue(1.0);
         localStructureSpin->setValue(1.0);
         skinStructureSpin->setValue(-1.0);
         sharpnessSpin->setValue(0.0);
+        mvecAction->setChecked(true);
+        setScaleAction(MVEC_SCALE_PIXELS);
+        setQualityAction(MVEC_QUALITY_BALANCED);
     }
 
     form->addRow(enabledBox);
+    form->addRow("DLSS5 preset", presetCombo);
     form->addRow("Passes", passesSpin);
     form->addRow("Intensity", intensitySpin);
     form->addRow("Local tone", localToneSpin);
@@ -114,6 +190,12 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     form->addRow("Skin structure", skinStructureSpin);
     form->addRow("Sharpness", sharpnessSpin);
     root->addLayout(form);
+    root->addStretch();
+
+    auto* bottomRow = new QHBoxLayout;
+    bottomRow->addStretch();
+    bottomRow->addWidget(settingsBtn);
+    root->addLayout(bottomRow);
 
     connect(startBtn, &QPushButton::clicked, this, &MainWindow::startHelper);
     connect(stopBtn, &QPushButton::clicked, this, &MainWindow::stopHelper);
@@ -140,6 +222,10 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     });
     connect(enabledBox, &QCheckBox::toggled, this, &MainWindow::writeControls);
     connect(passesSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, &MainWindow::writeControls);
+    connect(presetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::writeControls);
+    connect(mvecAction, &QAction::toggled, this, &MainWindow::writeControls);
+    connect(scaleGroup, &QActionGroup::triggered, this, &MainWindow::writeControls);
+    connect(qualityGroup, &QActionGroup::triggered, this, &MainWindow::writeControls);
     connect(intensitySpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::writeControls);
     connect(localToneSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::writeControls);
     connect(localStructureSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::writeControls);
@@ -155,11 +241,39 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
 }
 
 MainWindow::~MainWindow() {
-    if (helper) {
-        // Let the helper keep running if the GUI is closed.
-        helper->setParent(nullptr);
+    if (statusTimer) statusTimer->stop();
+
+    if (statusProcess) {
+        statusProcess->disconnect();
+        statusProcess->setParent(nullptr);
+        if (statusProcess->state() != QProcess::NotRunning) {
+            statusProcess->kill();
+            statusProcess->waitForFinished(1000);
+        }
+        delete statusProcess;
+        statusProcess = nullptr;
     }
+
+    if (helper) {
+        helper->disconnect();
+        helper->setParent(nullptr);
+        if (helper->state() != QProcess::NotRunning) {
+            helper->kill();
+            helper->waitForFinished(1000);
+        }
+        delete helper;
+        helper = nullptr;
+    }
+
     if (shmBase) munmap(shmBase, 4096 + kMaxFrame * 2);
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    if (statusTimer) statusTimer->stop();
+    if (hdr) hdr->quit.store(1);
+    if (helperCliPath.isEmpty()) helperCliPath = findHelperCli();
+    if (!helperCliPath.isEmpty()) QProcess::startDetached(helperCliPath, {"stop"});
+    QWidget::closeEvent(event);
 }
 
 QString MainWindow::findProjectDir() const {
@@ -351,15 +465,35 @@ void MainWindow::stopHelper() {
     updateStatus();
 }
 
+void MainWindow::setScaleAction(uint32_t mode) {
+    if (mode == MVEC_SCALE_PIXELS) scalePixelsAction->setChecked(true);
+    else if (mode == MVEC_SCALE_UV01) scaleUv01Action->setChecked(true);
+    else scaleNormalizedAction->setChecked(true);
+}
+
+void MainWindow::setQualityAction(uint32_t quality) {
+    if (quality == MVEC_QUALITY_FAST) qualityFastAction->setChecked(true);
+    else if (quality == MVEC_QUALITY_QUALITY) qualityQualityAction->setChecked(true);
+    else qualityBalancedAction->setChecked(true);
+}
+
 void MainWindow::writeControls() {
     if (!hdr) return;
     hdr->enabled.store(enabledBox->isChecked() ? 1u : 0u);
     hdr->passes.store(uint32_t(passesSpin->value()));
+    hdr->preset.store(presetCombo->currentData().toUInt());
     hdr->intensityBits.store(FloatToBits(float(intensitySpin->value())));
     hdr->localToneBits.store(FloatToBits(float(localToneSpin->value())));
     hdr->localStructureBits.store(FloatToBits(float(localStructureSpin->value())));
     hdr->skinStructureBits.store(FloatToBits(float(skinStructureSpin->value())));
     hdr->sharpnessBits.store(FloatToBits(float(sharpnessSpin->value())));
+    hdr->mvecEnabled.store(mvecAction->isChecked() ? 1u : 0u);
+    hdr->mvecScaleMode.store(scalePixelsAction->isChecked() ? uint32_t(MVEC_SCALE_PIXELS)
+        : scaleUv01Action->isChecked() ? uint32_t(MVEC_SCALE_UV01)
+                                       : uint32_t(MVEC_SCALE_NORMALIZED));
+    hdr->mvecQuality.store(qualityFastAction->isChecked() ? uint32_t(MVEC_QUALITY_FAST)
+        : qualityQualityAction->isChecked() ? uint32_t(MVEC_QUALITY_QUALITY)
+                                            : uint32_t(MVEC_QUALITY_BALANCED));
     hdr->controlSeq.fetch_add(1);
 }
 

@@ -67,6 +67,14 @@ static int TimeInterval() {
     return v > 0 ? v : 30;
 }
 
+static bool VerboseEnabled() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_VERBOSE");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
 static inline double NowMs() {
     return std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -191,6 +199,8 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, bool fmtRgba, con
     for (;;) {
         if (s.hdr->seq_resp.load() >= req) {
             s.timeouts = 0;
+            const bool ok = s.hdr->seq_ok.load() >= req;
+            if (!ok) Log("[shm] helper frame failed seq=%u ok=%u", req, s.hdr->seq_ok.load());
             if (time) {
                 static int frameNo = 0;
                 if (++frameNo % TimeInterval() == 0) {
@@ -199,7 +209,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, bool fmtRgba, con
                         tCopy - t0, tSignal - tCopy, tDone - tSignal, tDone - t0);
                 }
             }
-            return true;
+            return ok;
         }
         if (s.hdr->quit.load()) { s.dead = true; return false; }
         const double elapsed = NowMs() - tSignal;
@@ -207,7 +217,11 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, bool fmtRgba, con
         if (elapsed < 2.0) CpuYield();
         else std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
-    if (++s.timeouts >= 8) { s.dead = true; Log("[shm] helper unresponsive, disabling"); }
+    if (++s.timeouts >= 8) {
+        s.dead = true;
+        Log("[shm] helper unresponsive, disabling (seq_req=%u seq_resp=%u heartbeat=%u)",
+            s.hdr->seq_req.load(), s.hdr->seq_resp.load(), s.hdr->heartbeat.load());
+    }
     return false;
 }
 
@@ -274,6 +288,8 @@ struct DeviceChain {
     std::unordered_map<VkSwapchainKHR, SwapchainState> swapchains;
     std::unordered_map<VkQueue, uint32_t> queueFamilies;
     ShmMap shm;
+    uint64_t processedFrames = 0;
+    uint64_t rawFrames = 0;
 };
 
 static std::unordered_map<VkInstance, InstanceChain> g_instances;
@@ -605,12 +621,11 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = { sc.width, sc.height, 1 };
 
-    auto restoreColorLayout = [&]() {
+    auto restorePresentLayout = [&]() {
         if (dc->vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
         Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT,
+                0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
         if (dc->vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
         if (dc->vkQueueSubmit(queue, 1, &si, sc.fence) != VK_SUCCESS) return false;
         if (dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
@@ -620,7 +635,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
 
     // ---- capture: swapchain -> bufIn ----
     if (dc->vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
-    Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -636,7 +651,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     if (!ShmProcessFrame(dc->shm, sc.width, sc.height,
                          sc.format == VK_FORMAT_R8G8B8A8_UNORM || sc.format == VK_FORMAT_R8G8B8A8_SRGB,
                          sc.bufIn.mapped)) {
-        restoreColorLayout();
+        restorePresentLayout();
         return false;
     }
     *outW = sc.width; *outH = sc.height;
@@ -652,9 +667,8 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     dc->vkCmdCopyBufferToImage(cb, sc.bufOut.buffer, swapchainImage,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT,
+            0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     if (dc->vkEndCommandBuffer(cb) != VK_SUCCESS) return false;
     if (dc->vkQueueSubmit(queue, 1, &si, sc.fence) != VK_SUCCESS) return false;
     if (dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
@@ -703,8 +717,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             }
             if (!sc.ready || dc->shm.dead) continue;
             uint32_t ow = 0, oh = 0;
-            ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]], &ow, &oh);
+            const uint32_t imageIndex = pPresentInfo->pImageIndices[i];
+            const bool ok = ProcessPresent(dc, sc, queue, sc.images[imageIndex], &ow, &oh);
+            if (ok) ++dc->processedFrames;
+            else ++dc->rawFrames;
+            if (VerboseEnabled()) {
+                Log("[present] swapchain=%p image=%u seq=%u processed=%d",
+                    (void*)pPresentInfo->pSwapchains[i], imageIndex, dc->shm.hdr->seq_req.load(), int(ok));
+            }
             // On failure we simply present the original frame (fail-open).
+        }
+        if (TimeEnabled()) {
+            static int frameNo = 0;
+            if (++frameNo % TimeInterval() == 0) {
+                Log("[layer] processed=%llu raw=%llu",
+                    (unsigned long long)dc->processedFrames, (unsigned long long)dc->rawFrames);
+            }
         }
     }
     return dc->vkQueuePresentKHR(queue, pPresentInfo);

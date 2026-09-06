@@ -121,6 +121,9 @@ static bool ParamSetF(NVSDK_NGX_Parameter* p, const char* n, float v, DWORD* seh
 static bool ParamGetUI(NVSDK_NGX_Parameter* p, const char* n, unsigned int* v, DWORD* seh) {
     return Guarded([&] { return NVSDK_NGX_SUCCEED(p->Get(n, v)); }, false, seh);
 }
+static bool ParamGetF(NVSDK_NGX_Parameter* p, const char* n, float* v, DWORD* seh) {
+    return Guarded([&] { return NVSDK_NGX_SUCCEED(p->Get(n, v)); }, false, seh);
+}
 
 static NVSDK_NGX_Result CallInitExtSafely(FnVkInitExt fn, unsigned long long appId,
     const wchar_t* path, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
@@ -334,7 +337,28 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_PerfQualityValue", 3u, &seh);
     ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_CreationNodeMask", 1u, &seh);
     ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_VisibilityNodeMask", 1u, &seh);
-    Log("[params] create contract set: %s (seh=%#x)", ps ? "ok" : "FAILED", seh);
+
+    // Create flags: sharpening is applied by the net when the runtime float is
+    // nonzero (see NgxSetStrengths); auto-exposure keeps adaptation state in the
+    // DLL so it survives normal dynamic lighting without host-side resets.
+    unsigned int createFlags = NVSDK_NGX_DLSS_Feature_Flags_DoSharpening |
+                               NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    const char* hdrEnv = getenv("DLSSNR_HDR");
+    const bool wantHdr = hdrEnv && hdrEnv[0] == '1';
+    if (wantHdr) createFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+    ps &= ParamSetUI(s.params, "Feature_Flags", createFlags, &seh);
+    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_Feature_Flags", createFlags, &seh);
+
+    // Non-destructive exposure: identity pre-exposure/exposure-scale (never
+    // re-pinned per frame) + SDR tonemapped hint unless the HDR path is asked
+    // for and the snippet's feature flags advertise HDR.
+    ps &= ParamSetF(s.params, "InPreExposure", 1.0f, &seh);
+    ps &= ParamSetF(s.params, "InExposureScale", 1.0f, &seh);
+    ps &= ParamSetF(s.params, "NVSDK_NGX_Parameter_PreExposure", 1.0f, &seh);
+    ps &= ParamSetF(s.params, "NVSDK_NGX_Parameter_ExposureScale", 1.0f, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.AutoExposure", 1u, &seh);
+    Log("[params] create contract set: %s (seh=%#x) flags=%#x hdr=%d",
+        ps ? "ok" : "FAILED", seh, createFlags, int(wantHdr));
 
     // Snippet Init_Ext: (appId, path, instance, pd, device, version, featureInfo=nullptr)
     NVSDK_NGX_Result initResult = NVSDK_NGX_Result_FAIL_NotInitialized;
@@ -364,7 +388,7 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         return false;
     }
 
-    // Public Vulkan NGX contract: query Feature-18 requirements before create.
+// Public Vulkan NGX contract: query Feature-18 requirements before create.
     {
         auto reqs2 = reinterpret_cast<FnVkGetFeatureReqs2>(
             GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements"));
@@ -376,7 +400,21 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
             Log("[reqs] GetFeatureRequirements -> %#x seh=%#x ver=%u.%u flags=%#x minGPU=%u inGPU=%u cs=%u.%u",
                 (uint32_t)r, seh2, fr.Version.Major, fr.Version.Minor, fr.FeatureFlags,
                 fr.MinGPUMode, fr.InGPUMode, fr.MinCSMajorVersion, fr.MinCSMinorVersion);
+            if (NVSDK_NGX_SUCCEED(r)) {
+                s.featureFlags = fr.FeatureFlags;
+                s.hdrCapable = (fr.FeatureFlags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0u;
+            }
         }
+    }
+
+    // Tonemapping hint now that the snippet's feature flags are known: SDR by
+    // default (input is LDR RGBA8); HDR only when both requested and capable.
+    {
+        DWORD seh2 = 0;
+        const bool hdrPath = wantHdr && s.hdrCapable;
+        ParamSetUI(s.params, "DLSSNR.Hdr", hdrPath ? 1u : 0u, &seh2);
+        ParamSetUI(s.params, "DLSSNR.SDR", hdrPath ? 0u : 1u, &seh2);
+        Log("[params] tonemap hint: %s (featureFlags=%#x)", hdrPath ? "HDR" : "SDR", s.featureFlags);
     }
 
     bool created = NgxCreateFeature(s, width, height, recordingCmd);
@@ -431,10 +469,11 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
     s.resColor = color; s.resOut = out; s.resMV = mv; s.resDepth = depth;
     DWORD seh = 0;
     Guarded([&] {
+        const bool hasDepth = s.resDepth.Resource.ImageViewInfo.ImageView != VK_NULL_HANDLE;
         s.params->Set("DLSSNR.Color", &s.resColor);
         s.params->Set("DLSSNR.Output", &s.resOut);
         s.params->Set("DLSSNR.MVec", &s.resMV);
-        s.params->Set("DLSSNR.Depth", &s.resDepth);
+        s.params->Set("DLSSNR.Depth", hasDepth ? &s.resDepth : (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("DLSSNR.ControlMask", (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("DLSSNR.UI", (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("DLSSNR.UIAlpha", (const NVSDK_NGX_Resource_VK*)nullptr);
@@ -442,7 +481,7 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
         s.params->Set("DLSSNR.BidirectionalDistortionField", (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("Color", &s.resColor);
         s.params->Set("Output", &s.resOut);
-        s.params->Set("Depth", &s.resDepth);
+        s.params->Set("Depth", hasDepth ? &s.resDepth : (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("MotionVectors", &s.resMV);
         s.params->Set("MVec", &s.resMV);
         return true;
@@ -481,16 +520,52 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
     ps &= ParamSetF(s.params, "DLSSNR.LocalToneStrength", 1.0f, &seh);
     ps &= ParamSetF(s.params, "DLSSNR.LocalStructureStrength", 1.0f, &seh);
     ps &= ParamSetF(s.params, "DLSSNR.SkinStructureStrength", -1.0f, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.UseAutoMask", 0u, &seh);
+    ps &= ParamSetUI(s.params, "DLSSNR.UseAutoMask", 1u, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.UICorrection", 0u, &seh);
-    Log("[params] evaluate contract set: %s (seh=%#x)", ps ? "ok" : "FAILED", seh);
+    unsigned int autoMask = 0;
+    float mvecScaleX = 0.0f, mvecScaleY = 0.0f;
+    ParamGetUI(s.params, "DLSSNR.UseAutoMask", &autoMask, &seh);
+    ParamGetF(s.params, "DLSSNR.MVecScaleX", &mvecScaleX, &seh);
+    ParamGetF(s.params, "DLSSNR.MVecScaleY", &mvecScaleY, &seh);
+    Log("[params] evaluate contract set: %s (seh=%#x) UseAutoMask=%u MVecScaleX=%.6f MVecScaleY=%.6f depth=%s",
+        ps ? "ok" : "FAILED", seh, autoMask, mvecScaleX, mvecScaleY,
+        s.resDepth.Resource.ImageViewInfo.ImageView ? "bound" : "null");
 }
 
-void NgxSetReset(NgxSnippet& s, bool reset) {
+void NgxSetReset(NgxSnippet& s, bool reset, bool logValue) {
     if (!s.params) return;
     DWORD seh = 0;
-    ParamSetUI(s.params, "DLSSNR.Reset", reset ? 1u : 0u, &seh);
-    ParamSetUI(s.params, "Reset", reset ? 1u : 0u, &seh);
+    const bool ok1 = ParamSetUI(s.params, "DLSSNR.Reset", reset ? 1u : 0u, &seh);
+    const bool ok2 = ParamSetUI(s.params, "Reset", reset ? 1u : 0u, &seh);
+    if (!logValue) return;
+    unsigned int back = 0, back2 = 0;
+    ParamGetUI(s.params, "DLSSNR.Reset", &back, &seh);
+    ParamGetUI(s.params, "Reset", &back2, &seh);
+    Log("[params] DLSSNR.Reset(slot11) requested=%u readback=%u alias=%u ok=%d/%d seh=%#x",
+        reset ? 1u : 0u, back, back2, int(ok1), int(ok2), seh);
+}
+
+void NgxSetPreset(NgxSnippet& s, uint32_t preset) {
+    if (!s.params) return;
+    if (preset > 2u) preset = 0u;
+    DWORD seh = 0;
+    ParamSetUI(s.params, "DLSSNR.Style", preset, &seh);
+    if (s.loggedPreset == (int)preset) return;
+    s.loggedPreset = (int)preset;
+    unsigned int back = 0;
+    ParamGetUI(s.params, "DLSSNR.Style", &back, &seh);
+    Log("[params] DLSS5 preset=%u DLSSNR.Style=%u (seh=%#x)", preset, back, seh);
+}
+
+void NgxSetMotionScale(NgxSnippet& s, float scaleX, float scaleY) {
+    if (!s.params) return;
+    DWORD seh = 0;
+    ParamSetF(s.params, "DLSSNR.MVecScaleX", scaleX, &seh);
+    ParamSetF(s.params, "DLSSNR.MVecScaleY", scaleY, &seh);
+    float x = 0.0f, y = 0.0f;
+    ParamGetF(s.params, "DLSSNR.MVecScaleX", &x, &seh);
+    ParamGetF(s.params, "DLSSNR.MVecScaleY", &y, &seh);
+    Log("[params] MVecScaleX=%.6f MVecScaleY=%.6f (seh=%#x)", x, y, seh);
 }
 
 void NgxSetStrengths(NgxSnippet& s, float intensity, float localTone,
@@ -501,7 +576,14 @@ void NgxSetStrengths(NgxSnippet& s, float intensity, float localTone,
     ParamSetF(s.params, "DLSSNR.LocalToneStrength", localTone, &seh);
     ParamSetF(s.params, "DLSSNR.LocalStructureStrength", localStructure, &seh);
     ParamSetF(s.params, "DLSSNR.SkinStructureStrength", skinStructure, &seh);
+    // Runtime sharpness float must reach the DLL on every evaluate dispatch
+    // (DoSharpening was enabled at create; this is the per-frame amount).
     ParamSetF(s.params, "Sharpness", sharpness, &seh);
+    if (Verbose()) {
+        float back = 0.0f;
+        ParamGetF(s.params, "Sharpness", &back, &seh);
+        Log("[params] Sharpness=%.4f readback=%.4f (seh=%#x)", sharpness, back, seh);
+    }
 }
 
 bool NgxEvaluate(NgxSnippet& s, VkCommandBuffer recordingCmd) {

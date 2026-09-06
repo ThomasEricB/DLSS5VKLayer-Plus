@@ -31,6 +31,11 @@ struct NgxSnippet {
     bool ready = false;     // snippet init + CreateFeature(18) succeeded
     bool disabled = false;  // latched failure -> pass-through forever
 
+    // Captured from NVSDK_NGX_VULKAN_GetFeatureRequirements (bit 0 = HDR path).
+    unsigned int featureFlags = 0;
+    bool hdrCapable = false;
+    int loggedPreset = -1;  // NgxSetPreset logs only on change
+
     // Caller-identity spoof state
     void** iatSlot = nullptr;
     decltype(&GetModuleFileNameW) originalGetModuleFileNameW = nullptr;
@@ -50,7 +55,9 @@ bool NgxCreateFeature(NgxSnippet& s, uint32_t width, uint32_t height, VkCommandB
 void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
                      const NVSDK_NGX_Resource_VK& out, const NVSDK_NGX_Resource_VK& mv,
                      const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height);
-void NgxSetReset(NgxSnippet& s, bool reset);
+void NgxSetReset(NgxSnippet& s, bool reset, bool logValue = false);
+void NgxSetPreset(NgxSnippet& s, uint32_t preset);
+void NgxSetMotionScale(NgxSnippet& s, float scaleX, float scaleY);
 void NgxSetStrengths(NgxSnippet& s, float intensity, float localTone,
                      float localStructure, float skinStructure, float sharpness);
 bool NgxEvaluate(NgxSnippet& s, VkCommandBuffer recordingCmd);

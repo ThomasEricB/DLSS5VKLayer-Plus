@@ -4,6 +4,7 @@
 #include "../common/shm_protocol.h"
 
 class QCheckBox;
+class QComboBox;
 class QDoubleSpinBox;
 class QTabWidget;
 
@@ -18,6 +19,7 @@ private slots:
 private:
     struct Row {
         QCheckBox* enabled = nullptr;
+        QComboBox* preset = nullptr;
         QDoubleSpinBox* intensity = nullptr;
         QDoubleSpinBox* localTone = nullptr;
         QDoubleSpinBox* localStructure = nullptr;

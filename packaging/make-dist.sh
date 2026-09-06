@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="${DLSSNR_VERSION:-0.1.0}"
+VERSION="${DLSSNR_VERSION:-0.2.1}"
 RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
 RELEASE="${RELEASE:-1}"
 DIST="dist"

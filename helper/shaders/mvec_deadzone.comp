@@ -1,0 +1,72 @@
+#version 450
+// GPU-side NVOF post-processing: decode raw flow texels, deadzone-clamp
+// sub-pixel micro-jitter to (0,0), and upscale the low-res flow grid to the
+// full-resolution DLSSNR MVec resource. Never touches host memory.
+//
+// srcFlow : raw NVOF output bits reinterpreted as R16G16_UINT
+//           (VK_FORMAT_R16G16_SFIXED5_NV -> int16/32 px, or
+//            VK_FORMAT_R16G16_SFLOAT     -> half-float px)
+// dstMVec : DLSSNR MVec image (VK_FORMAT_R16G16_SFLOAT, full res)
+//
+// Vectors are in full-resolution pixel units (current -> previous). The
+// deadzone threshold is in the same units so it removes static-geometry
+// noise (< 1 px) without clipping slow intentional camera pans.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint  cGrid     = 4u;    // NVOF output grid factor
+layout(constant_id = 1) const uint  cSrcW     = 480u;  // flow grid width
+layout(constant_id = 2) const uint  cSrcH     = 270u;  // flow grid height
+layout(constant_id = 3) const uint  cDstW     = 1920u; // MVec width
+layout(constant_id = 4) const uint  cDstH     = 1080u; // MVec height
+layout(constant_id = 5) const uint  cFixed5   = 1u;    // 1 = SFIXED5 bits, 0 = half-float bits
+layout(constant_id = 6) const float cDeadzone = 0.5;   // px, full-res units
+layout(constant_id = 7) const uint  cBilinear = 1u;    // 1 = bilinear upscale, 0 = nearest
+
+layout(rg16ui,   binding = 0) uniform readonly  highp uimage2D srcFlow;
+layout(rgba16f,  binding = 1) uniform writeonly highp image2D  dstMVec;
+
+vec2 DecodeFlow(uvec2 raw) {
+    // NOTE: do NOT branch on the cFixed5 spec constant here. On this driver a
+    // spec-constant branch in this shader evaluated false at runtime despite
+    // specialization, sending SFIXED5 bits through unpackHalf2x16 and writing
+    // NaN into MVec (which faults NGX). The helper only builds this pipeline
+    // for SFIXED5 flow; SFLOAT flow uses the legacy CPU/hybrid paths.
+    int ix = int(raw.x);
+    int iy = int(raw.y);
+    if (ix > 32767) ix -= 65536;
+    if (iy > 32767) iy -= 65536;
+    return vec2(float(ix), float(iy)) * (1.0 / 32.0);
+}
+
+// Deadzone applied per NVOF grid vector: low-magnitude noise clamps to exact
+// zero so DLSSNR static accumulation stays perfectly locked.
+vec2 SampleFlow(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(int(cSrcW), int(cSrcH)) - 1);
+    vec2 v = DecodeFlow(imageLoad(srcFlow, p).xy);
+    if (dot(v, v) < cDeadzone * cDeadzone) {
+        return vec2(0.0);
+    }
+    return v;
+}
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    if (dst.x >= int(cDstW) || dst.y >= int(cDstH)) {
+        return;
+    }
+    vec2 v;
+    if (cBilinear != 0u && cGrid > 1u) {
+        vec2 f = (vec2(dst) + vec2(0.5)) / float(cGrid) - vec2(0.5);
+        ivec2 p0 = ivec2(floor(f));
+        vec2 w = f - vec2(p0);
+        vec2 v00 = SampleFlow(p0);
+        vec2 v10 = SampleFlow(p0 + ivec2(1, 0));
+        vec2 v01 = SampleFlow(p0 + ivec2(0, 1));
+        vec2 v11 = SampleFlow(p0 + ivec2(1, 1));
+        v = mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
+    } else {
+        v = SampleFlow(dst / int(cGrid));
+    }
+    imageStore(dstMVec, dst, vec4(v, 0.0, 1.0));
+}

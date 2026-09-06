@@ -12,12 +12,20 @@ class QLabel;
 class QTimer;
 class QComboBox;
 class QLineEdit;
+class QCloseEvent;
+class QMenu;
+class QAction;
+class QActionGroup;
+class QToolButton;
 
 class MainWindow : public QWidget {
     Q_OBJECT
 public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
 
 private slots:
     void startHelper();
@@ -36,6 +44,8 @@ private:
     void populateRunners();
     void applyRunnerSelection(int index);
     bool ensureShm();
+    void setScaleAction(uint32_t mode);
+    void setQualityAction(uint32_t quality);
 
     QString projectDir;
     QString helperCliPath;
@@ -65,9 +75,24 @@ private:
 
     QCheckBox* enabledBox = nullptr;
     QSpinBox* passesSpin = nullptr;
+    QComboBox* presetCombo = nullptr;
     QDoubleSpinBox* intensitySpin = nullptr;
     QDoubleSpinBox* localToneSpin = nullptr;
     QDoubleSpinBox* localStructureSpin = nullptr;
     QDoubleSpinBox* skinStructureSpin = nullptr;
     QDoubleSpinBox* sharpnessSpin = nullptr;
+
+    QToolButton* settingsBtn = nullptr;
+    QMenu* settingsMenu = nullptr;
+    QAction* mvecAction = nullptr;
+    QMenu* scaleMenu = nullptr;
+    QMenu* qualityMenu = nullptr;
+    QActionGroup* scaleGroup = nullptr;
+    QActionGroup* qualityGroup = nullptr;
+    QAction* scaleNormalizedAction = nullptr;
+    QAction* scalePixelsAction = nullptr;
+    QAction* scaleUv01Action = nullptr;
+    QAction* qualityFastAction = nullptr;
+    QAction* qualityBalancedAction = nullptr;
+    QAction* qualityQualityAction = nullptr;
 };

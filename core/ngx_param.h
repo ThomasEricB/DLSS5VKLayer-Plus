@@ -29,27 +29,33 @@ struct OwnParam final : NVSDK_NGX_Parameter {
 
     // Slot 0 (0x00)
     void NVSDK_CONV Set(const char* n, void* v) override {
-        if (!n) return; auto& x = m[n]; x = {}; x.kind = 4; x.p = v; x.u = (unsigned long long)v;
+        if (!n) return;
+        auto& x = m[n]; x = {}; x.kind = 4; x.p = v; x.u = (unsigned long long)v;
     }
     // Slot 1 (0x08)
     void NVSDK_CONV Set(const char* n, unsigned long long v) override {
-        if (!n) return; auto& x = m[n]; x = {}; x.kind = 1; x.u = v; x.f = (float)v; x.d = (double)v;
+        if (!n) return;
+        auto& x = m[n]; x = {}; x.kind = 1; x.u = v; x.f = (float)v; x.d = (double)v;
     }
     // Slot 2 (0x10)
     void NVSDK_CONV Set(const char* n, float v) override {
-        if (!n) return; auto& x = m[n]; x = {}; x.kind = 2; x.f = v; x.d = (double)v; x.u = (unsigned long long)v;
+        if (!n) return;
+        auto& x = m[n]; x = {}; x.kind = 2; x.f = v; x.d = (double)v; x.u = (unsigned long long)v;
     }
     // Slot 3 (0x18)
     void NVSDK_CONV Set(const char* n, double v) override {
-        if (!n) return; auto& x = m[n]; x = {}; x.kind = 3; x.d = v; x.f = (float)v; x.u = (unsigned long long)v;
+        if (!n) return;
+        auto& x = m[n]; x = {}; x.kind = 3; x.d = v; x.f = (float)v; x.u = (unsigned long long)v;
     }
     // Slot 4 (0x20)
     void NVSDK_CONV Set(const char* n, unsigned int v) override {
-        if (!n) return; auto& x = m[n]; x = {}; x.kind = 1; x.u = (unsigned long long)v; x.f = (float)v; x.d = (double)v;
+        if (!n) return;
+        auto& x = m[n]; x = {}; x.kind = 1; x.u = (unsigned long long)v; x.f = (float)v; x.d = (double)v;
     }
     // Slot 5 (0x28)
     void NVSDK_CONV Set(const char* n, int v) override {
-        if (!n) return; auto& x = m[n]; x = {}; x.kind = 1; x.u = (unsigned long long)(unsigned int)v; x.f = (float)v; x.d = (double)v;
+        if (!n) return;
+        auto& x = m[n]; x = {}; x.kind = 1; x.u = (unsigned long long)(unsigned int)v; x.f = (float)v; x.d = (double)v;
     }
 
     // Slot 6 (0x30)

@@ -11,11 +11,14 @@ This project is experimental. It is intended for local testing and research.
 - Windows NGX helper runs under:
   - custom Steam compatibility tools such as Proton-CachyOS, Proton-GE, Wine-GE, and similar tools
   - system Wine with a managed prefix and vendored DXVK 2.7.1
+- Synthetic motion vectors generated with `VK_NV_optical_flow` when available.
 - Qt GUI for live controls:
   - enable/disable neural processing
   - multi-pass rendering
+  - DLSS5 Native/Natural/Cinematic presets
   - intensity, tone, structure, skin structure, and sharpness
   - per-pass overrides
+  - synthetic motion-vector enable, scale mode, and quality
 - CLI helper manager:
   - runner discovery
   - start/stop/status
@@ -64,13 +67,13 @@ The personal package variant includes these DLLs. Only redistribute the personal
 Public package:
 
 ```bash
-sudo rpm -Uvh dist/dlssnr-0.1.0-1.fc44.x86_64.rpm
+sudo rpm -Uvh dist/dlssnr-0.2.1-3.fc44.x86_64.rpm
 ```
 
 Personal package:
 
 ```bash
-sudo rpm -Uvh dist/dlssnr-personal-0.1.0-1.fc44.x86_64.rpm
+sudo rpm -Uvh dist/dlssnr-personal-0.2.1-3.fc44.x86_64.rpm
 ```
 
 `wine` is a recommended package, not a hard dependency, so Proton-only users are not forced to install host Wine.
@@ -80,8 +83,8 @@ sudo rpm -Uvh dist/dlssnr-personal-0.1.0-1.fc44.x86_64.rpm
 Extract the tarball:
 
 ```bash
-tar -xzf dist/dlssnr-0.1.0-linux-x86_64.tar.gz
-cd dlssnr-0.1.0-linux-x86_64
+tar -xzf dist/dlssnr-0.2.1-3-linux-x86_64.tar.gz
+cd dlssnr-0.2.1-3-linux-x86_64
 ```
 
 User install, no root required:
@@ -147,7 +150,7 @@ VKLayer_DLSS5=1 %command%
 
 The layer is disabled unless `VKLayer_DLSS5=1` is present.
 
-The layer is intended to coexist with the Steam overlay. If a game crashes during Vulkan device creation, make sure you are using `0.1.0-4` or newer.
+The layer is intended to coexist with the Steam overlay. If a game crashes during Vulkan device creation, make sure you are using `0.2.1-3` or newer.
 
 ## Steam / Proton Containers
 
@@ -274,6 +277,91 @@ build/runner_probe
 build/gui/dlssnr_gui
 ```
 
+## GUI Settings
+
+Start the GUI with:
+
+```bash
+dlssnr-gui
+```
+
+The main window has a global `DLSS5 preset` selector:
+
+```text
+DLSS5 Native      maps to DLSSNR.Style 0
+DLSS5 Natural     maps to DLSSNR.Style 1
+DLSS5 Cinematic   maps to DLSSNR.Style 2
+```
+
+The Passes dialog has the same preset selector per pass. A pass preset applies when that pass overrides the global settings.
+
+The cogwheel button in the bottom-right corner opens the settings menu. It controls synthetic motion vectors:
+
+```text
+Enable synthetic motion vectors
+Motion vector scale: Pixels (default), Normalized [-1, 1], UV [0, 1]
+Motion vector quality: Fast, Balanced (default), Quality
+```
+
+Settings are written to shared memory and take effect on the next processed frame. Closing the GUI requests a helper stop, so the helper does not need to be stopped manually.
+
+## Synthetic Motion Vectors
+
+The helper can generate screen-space motion vectors between `Frame[N-1]` and `Frame[N]` and bind them to `DLSSNR.MVec` before calling Feature 18.
+
+Current behavior:
+
+- `DLSSNR.Depth` is left as `nullptr`.
+- `DLSSNR.UseAutoMask` is set to `1`.
+- `DLSSNR.Reset` is set on the first frame and on simple CPU-detected scene cuts.
+- NVIDIA Optical Flow (`VK_NV_optical_flow`) is used when available.
+- The helper keeps optical-flow input images in VRAM and runs the flow pass before `VULKAN_EvaluateFeature(18)`.
+- `DLSSNR.MVec` is filled as `R16G16_SFLOAT` half-float vectors in source-pixel units, current-frame-to-previous-frame by default.
+- If the optical-flow output format is not directly accepted by NGX, the helper tries a direct GPU blit, then a hybrid low-res CPU conversion plus GPU float upscale, then full CPU conversion.
+- Motion-vector quality controls the NVOF performance level and output grid: Fast prefers a smaller grid, Balanced uses a medium grid, and Quality prefers full-resolution flow.
+
+Environment controls:
+
+```text
+DLSSNR_MVEC=0                 disable synthetic motion vectors
+DLSSNR_MVEC_GPU=0             force CPU flow conversion (diagnostics)
+DLSSNR_MVEC_DIRECTION=0       use previous-to-current flow direction instead of current-to-previous
+DLSSNR_MVEC_FILTER=1          force linear GPU upscale filter when supported
+DLSSNR_MVEC_DEBUG=1           log first few flow/MVec statistics
+DLSSNR_SCENE_CUT=0            disable scene-cut reset detection
+DLSSNR_SCENE_CUT_THRESHOLD=55 mean luma difference threshold
+```
+
+Build:
+
+```bash
+DLSSNR_SKIP_MANIFEST_INSTALL=1 ./build.sh
+```
+
+Test parameter ingestion:
+
+```bash
+DLSSNR_HELPER_EXE="$PWD/build/dlssnr_helper.exe" DLSSNR_VERBOSE=1 DLSSNR_TIME=1 ./dlssnr-helper start
+WINEPREFIX="$HOME/.local/share/dlssnr/prefix/pfx" \
+PROTON_ENABLE_NVAPI=1 \
+STEAM_COMPAT_DATA_PATH="$HOME/.local/share/dlssnr/prefix" \
+VKLayer_DLSS5=1 \
+DLSSNR_SMOKE_FRAMES=5 \
+"/home/hunter/.local/share/Steam/compatibilitytools.d/Proton-CachyOS Latest/proton" run "$PWD/build/smoke.exe"
+```
+
+Expected helper log lines:
+
+```text
+[mvec] NV optical flow enabled ... gpu_convert=1 dir=1 xfer=1
+[params] evaluate contract set: ok ... UseAutoMask=1 ... depth=null
+[params] MVecScaleX=1.000000 MVecScaleY=1.000000
+[mvec] first optical-flow pass completed
+[time] passes=1 ... flow=... eval=... total=... ms
+```
+
+If optical flow is unavailable, the helper falls back to zero motion vectors and continues without disabling neural processing.
+
 ## Packaging
 
 Build public and personal tarballs plus RPMs:
@@ -316,13 +404,13 @@ Add `--purge` to also remove user config, state, runtime data, and the managed p
 
 ## Troubleshooting
 
-If the helper starts and immediately logs `shutting down`, update to `0.1.0-4` or newer and remove stale runtime state:
+If the helper starts and immediately logs `shutting down`, update to `0.2.1-3` or newer and remove stale runtime state:
 
 ```bash
 rm -f "${XDG_RUNTIME_DIR:-/tmp/dlssnr-$UID}/dlssnr/shm.bin"
 ```
 
-If a Steam game crashes in `steamoverlayvulkanlayer.so`, update to `0.1.0-4` or newer.
+If a Steam game crashes in `steamoverlayvulkanlayer.so`, update to `0.2.1-3` or newer.
 
 If a Steam/Proton game logs `[shm] helper unresponsive, disabling` while the helper is waiting for frames, bind the shared-memory directory into `pressure-vessel`:
 

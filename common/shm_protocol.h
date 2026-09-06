@@ -5,10 +5,28 @@
 #include <cstring>
 #include <string>
 
-static constexpr uint32_t kShmMagic = 0x524E5347;  // 'GNSR'
+static constexpr uint32_t kShmMagic = 0x524E534A;  // 'JNSR'
 static constexpr uint32_t kMaxW = 4096, kMaxH = 2160;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
 static constexpr uint32_t kMaxPasses = 8;
+
+enum Dlss5Preset : uint32_t {
+    DLSS5_PRESET_NATIVE = 0,
+    DLSS5_PRESET_NATURAL = 1,
+    DLSS5_PRESET_CINEMATIC = 2,
+};
+
+enum MVecScaleMode : uint32_t {
+    MVEC_SCALE_NORMALIZED = 0,
+    MVEC_SCALE_PIXELS = 1,
+    MVEC_SCALE_UV01 = 2,
+};
+
+enum MVecQuality : uint32_t {
+    MVEC_QUALITY_FAST = 0,
+    MVEC_QUALITY_BALANCED = 1,
+    MVEC_QUALITY_QUALITY = 2,
+};
 
 inline std::string ShmDefaultPath() {
     const char* rt = std::getenv("XDG_RUNTIME_DIR");
@@ -25,6 +43,7 @@ struct PassControl {
     std::atomic<uint32_t> localStructureBits;
     std::atomic<uint32_t> skinStructureBits;
     std::atomic<uint32_t> sharpnessBits;
+    std::atomic<uint32_t> preset;
 };
 
 struct PassStrength {
@@ -33,6 +52,7 @@ struct PassStrength {
     float localStructure = 1.0f;
     float skinStructure = -1.0f;
     float sharpness = 0.0f;
+    uint32_t preset = DLSS5_PRESET_NATIVE;
 };
 
 struct ShmHeader {
@@ -53,6 +73,11 @@ struct ShmHeader {
     std::atomic<uint32_t> controlSeq;
     PassControl pass[kMaxPasses];
     std::atomic<uint32_t> heartbeat;
+    std::atomic<uint32_t> preset;
+    std::atomic<uint32_t> mvecEnabled;
+    std::atomic<uint32_t> mvecScaleMode;
+    std::atomic<uint32_t> mvecQuality;
+    std::atomic<uint32_t> seq_ok;
 };
 
 inline uint32_t FloatToBits(float f) {
@@ -84,6 +109,11 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->sharpnessBits.store(FloatToBits(0.0f));
     h->controlSeq.store(0);
     h->heartbeat.store(0);
+    h->preset.store(DLSS5_PRESET_NATIVE);
+    h->mvecEnabled.store(1);
+    h->mvecScaleMode.store(MVEC_SCALE_PIXELS);
+    h->mvecQuality.store(MVEC_QUALITY_BALANCED);
+    h->seq_ok.store(0);
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].enabled.store(0);
         h->pass[i].intensityBits.store(FloatToBits(1.0f));
@@ -91,6 +121,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
         h->pass[i].localStructureBits.store(FloatToBits(1.0f));
         h->pass[i].skinStructureBits.store(FloatToBits(-1.0f));
         h->pass[i].sharpnessBits.store(FloatToBits(0.0f));
+        h->pass[i].preset.store(DLSS5_PRESET_NATIVE);
     }
 }
 
@@ -104,6 +135,25 @@ inline bool ShmNeuralEnabled(const ShmHeader* h) {
     return h->enabled.load() != 0;
 }
 
+inline uint32_t ShmPreset(const ShmHeader* h) {
+    uint32_t p = h->preset.load();
+    return p <= DLSS5_PRESET_CINEMATIC ? p : DLSS5_PRESET_NATIVE;
+}
+
+inline bool ShmMVecEnabled(const ShmHeader* h) {
+    return h->mvecEnabled.load() != 0;
+}
+
+inline uint32_t ShmMVecScaleMode(const ShmHeader* h) {
+    uint32_t m = h->mvecScaleMode.load();
+    return m <= MVEC_SCALE_UV01 ? m : MVEC_SCALE_NORMALIZED;
+}
+
+inline uint32_t ShmMVecQuality(const ShmHeader* h) {
+    uint32_t q = h->mvecQuality.load();
+    return q <= MVEC_QUALITY_QUALITY ? q : MVEC_QUALITY_BALANCED;
+}
+
 inline PassStrength ShmGetPassStrength(const ShmHeader* h, uint32_t pass) {
     PassStrength s;
     if (pass < kMaxPasses && h->pass[pass].enabled.load()) {
@@ -112,12 +162,15 @@ inline PassStrength ShmGetPassStrength(const ShmHeader* h, uint32_t pass) {
         s.localStructure = BitsToFloat(h->pass[pass].localStructureBits.load());
         s.skinStructure = BitsToFloat(h->pass[pass].skinStructureBits.load());
         s.sharpness = BitsToFloat(h->pass[pass].sharpnessBits.load());
+        uint32_t p = h->pass[pass].preset.load();
+        s.preset = p <= DLSS5_PRESET_CINEMATIC ? p : DLSS5_PRESET_NATIVE;
     } else {
         s.intensity = BitsToFloat(h->intensityBits.load());
         s.localTone = BitsToFloat(h->localToneBits.load());
         s.localStructure = BitsToFloat(h->localStructureBits.load());
         s.skinStructure = BitsToFloat(h->skinStructureBits.load());
         s.sharpness = BitsToFloat(h->sharpnessBits.load());
+        s.preset = ShmPreset(h);
     }
     return s;
 }
