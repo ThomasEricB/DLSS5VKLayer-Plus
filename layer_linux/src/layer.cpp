@@ -398,9 +398,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 #undef X
     if (!dc->vkQueuePresentKHR || !dc->vkCreateSwapchainKHR || !ic) dc->inert = true;
 
+    // Neural Rendering is an NGX feature and the helper only ever creates its own device on an
+    // NVIDIA GPU, so on anything else there is nothing for this layer to do but cost a round trip.
+    // Hybrid machines are the case that matters: an implicit layer is loaded for every device the
+    // loader builds, including the integrated one a game may well be running on.
+    char deviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = "?";
+    if (ic && ic->vkGetPhysicalDeviceProperties) {
+        VkPhysicalDeviceProperties props{};
+        ic->vkGetPhysicalDeviceProperties(physicalDevice, &props);
+        std::snprintf(deviceName, sizeof(deviceName), "%s", props.deviceName);
+        if (props.vendorID != 0x10DE) {
+            dc->inert = true;
+            Log("[layer] inert on non-NVIDIA device (vendor %#x): %s", props.vendorID, deviceName);
+        }
+    }
+
     std::lock_guard<std::mutex> lk(g_stateMutex);
     g_devices[*pDevice] = dc;
-    Log("[layer] vkCreateDevice -> %p (inert=%d enabled=%d)", (void*)*pDevice, dc->inert, LayerEnabled());
+    Log("[layer] vkCreateDevice -> %p on %s (inert=%d enabled=%d)", (void*)*pDevice, deviceName,
+        dc->inert, LayerEnabled());
     return VK_SUCCESS;
 }
 
