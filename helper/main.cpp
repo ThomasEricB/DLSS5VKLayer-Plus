@@ -819,9 +819,6 @@ static bool ImportOneRegion(VkCtx& c, void* host, size_t bytes, VkDeviceMemory* 
 // the same way, so the two agree on the pages even though the addresses differ.
 static void EnsureFrameImports(VkCtx& c, void* in, void* out, size_t bytes) {
     if (!c.hostImport || !in || !out) return;
-    // Opt-in; see the note beside ZeroCopyAllowed in the layer.
-    const char* on = getenv("DLSSNR_ZEROCOPY");
-    if (!(on && on[0] == '1')) return;
 
     const size_t want = ((bytes + kHostImportAlignment - 1) / kHostImportAlignment) * kHostImportAlignment;
     if (c.frameInBuf && c.importedIn == in && c.importedOut == out && c.importedBytes >= want) return;
