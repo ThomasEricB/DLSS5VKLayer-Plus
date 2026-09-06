@@ -38,6 +38,15 @@ struct NgxSnippet {
     bool ready = false;     // snippet init + CreateFeature(18) succeeded
     bool disabled = false;  // latched failure -> pass-through forever
 
+    // Captured from NVSDK_NGX_VULKAN_GetFeatureRequirements (bit 0 = HDR path).
+    unsigned int featureFlags = 0;
+    bool hdrCapable = false;
+
+    // Last values the evaluate contract reported, so it says something only when it changes.
+    unsigned int loggedAutoMask = 0xFFFFFFFFu;
+    float loggedMVecScaleX = -1.0f, loggedMVecScaleY = -1.0f;
+    bool loggedDepthBound = false;
+
     // Caller-identity spoof state
     void** iatSlot = nullptr;
     decltype(&GetModuleFileNameW) originalGetModuleFileNameW = nullptr;
@@ -90,12 +99,14 @@ void NgxReleaseAllPasses(NgxSnippet& s, VkDevice device);
 void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
                      const NVSDK_NGX_Resource_VK& out, const NVSDK_NGX_Resource_VK& mv,
                      const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height);
-void NgxSetReset(NgxSnippet& s, bool reset);
+void NgxSetReset(NgxSnippet& s, bool reset, bool logValue = false);
 // The one strength the model reads at evaluate rather than at create, so it follows the setting
 // without a rebuild. The others were removed from this interface deliberately: writing them here did
 // nothing at all, which is what made every one of them look like a control that was simply ignored.
 // They live in NgxTuning and are read when the feature is built.
 void NgxSetSharpness(NgxSnippet& s, float sharpness);
+// How the motion field's units are read. Written every evaluate, because it goes with the field.
+void NgxSetMotionScale(NgxSnippet& s, float scaleX, float scaleY);
 bool NgxEvaluatePass(NgxSnippet& s, uint32_t pass, VkCommandBuffer recordingCmd);
 void NgxTeardown(NgxSnippet& s, VkDevice device);
 

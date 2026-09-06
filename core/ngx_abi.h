@@ -128,6 +128,17 @@ typedef NVSDK_NGX_Result (NVSDK_CONV* PFN_NVSDK_NGX_ProgressCallback)(float prog
 #define FEATURE_DLSSNR 18
 #define DLSSNR_SIGNED_SNIPPET_APPLICATION_ID 0x0876232Cull
 
+// NVSDK_NGX_DLSS_Feature_Flags (public SDK values; "Feature_Flags" create param).
+enum NVSDK_NGX_DLSS_Feature_Flags {
+    NVSDK_NGX_DLSS_Feature_Flags_IsHDR              = 0x1,
+    NVSDK_NGX_DLSS_Feature_Flags_DepthInverted      = 0x2,
+    NVSDK_NGX_DLSS_Feature_Flags_DoSharpening       = 0x4,
+    NVSDK_NGX_DLSS_Feature_Flags_AutoExposure       = 0x8,
+    NVSDK_NGX_DLSS_Feature_Flags_MVLowRes           = 0x10,
+    NVSDK_NGX_DLSS_Feature_Flags_MVJittered         = 0x20,
+    NVSDK_NGX_DLSS_Feature_Flags_ResetRenderProfile = 0x100,
+};
+
 // ---- snippet (nvngx_dlssnr.dll) Vulkan export signatures ----
 typedef NVSDK_NGX_Result (NVSDK_CONV* FnVkInitExt)(
     unsigned long long InApplicationId, const wchar_t* InApplicationDataPath,

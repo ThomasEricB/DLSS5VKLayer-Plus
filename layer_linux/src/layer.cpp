@@ -86,6 +86,14 @@ static int TimeInterval() {
     return v > 0 ? v : 30;
 }
 
+static bool VerboseEnabled() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_VERBOSE");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
 static inline double NowMs() {
     return std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -291,7 +299,11 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
         if (s.hdr->seq_resp.load() >= req) {
             s.timeouts = 0;
             s.everAnswered = true;
-            std::memcpy(modelOut, s.outPixels, bytes);
+            // The helper answers even when it could not use the frame. seq_ok says whether the
+            // answer is worth composing; when it is not, the game's own frame is what to present.
+            const bool ok = s.hdr->seq_ok.load() >= req;
+            if (!ok) Log("[shm] helper could not use frame %u (ok=%u)", req, s.hdr->seq_ok.load());
+            if (ok) std::memcpy(modelOut, s.outPixels, bytes);
             if (time) {
                 static int frameNo = 0;
                 if (++frameNo % TimeInterval() == 0) {
@@ -300,7 +312,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
                         tCopy - t0, tSignal - tCopy, tDone - tSignal, tDone - t0);
                 }
             }
-            return true;
+            return ok;
         }
         if (s.hdr->quit.load()) { s.dead = true; return false; }
         const double elapsed = NowMs() - tSignal;
@@ -313,8 +325,10 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy
     if (++s.timeouts >= 4) {
         s.dead = true;
         s.retryAfterMs = NowMs() + 5000.0;
-        Log("[shm] no answer in %.0f ms x4 (helper %s); passing frames through, retrying in 5s",
-            budgetMs, helperPresent ? "is present but silent" : "not running");
+        Log("[shm] no answer in %.0f ms x4 (helper %s); passing frames through, retrying in 5s "
+            "(seq_req=%u seq_resp=%u heartbeat=%u)",
+            budgetMs, helperPresent ? "is present but silent" : "not running",
+            s.hdr->seq_req.load(), s.hdr->seq_resp.load(), s.hdr->heartbeat.load());
     }
     return false;
 }
@@ -383,6 +397,7 @@ struct DeviceChain {
     std::unordered_map<VkQueue, uint32_t> queueFamilies;
     ShmMap shm;
     uint64_t framesComposed = 0;
+    uint64_t framesPassedThrough = 0;
 };
 
 static std::unordered_map<VkInstance, InstanceChain> g_instances;
@@ -970,11 +985,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             if (!sc.ready || dc->shm.dead) continue;
             const uint32_t waitCount = waitsConsumed ? 0u : pPresentInfo->waitSemaphoreCount;
             waitsConsumed = true;
-            ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]], waitCount,
-                           pPresentInfo->pWaitSemaphores);
+            const bool composed = ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]],
+                                                 waitCount, pPresentInfo->pWaitSemaphores);
+            if (!composed) ++dc->framesPassedThrough;
+            if (VerboseEnabled()) {
+                Log("[present] swapchain=%p image=%u seq=%u composed=%d",
+                    (void*)pPresentInfo->pSwapchains[i], pPresentInfo->pImageIndices[i],
+                    dc->shm.hdr ? dc->shm.hdr->seq_req.load() : 0u, int(composed));
+            }
             // On failure we simply present the original frame (fail-open). The semaphores are still
             // consumed -- the capture submit waits on them before anything can fail -- so the flag
             // stays set and the present below still drops them.
+        }
+        if (TimeEnabled()) {
+            static int frameNo = 0;
+            if (++frameNo % TimeInterval() == 0) {
+                Log("[layer] composed=%llu passed through=%llu",
+                    (unsigned long long)dc->framesComposed,
+                    (unsigned long long)dc->framesPassedThrough);
+            }
         }
     }
 

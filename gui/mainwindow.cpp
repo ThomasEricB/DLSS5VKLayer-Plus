@@ -4,7 +4,10 @@
 #include "shm_binder.h"
 #include "../layer_linux/src/hotkey.h"
 
+#include <QAction>
+#include <QActionGroup>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
@@ -15,8 +18,12 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QIcon>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMessageBox>
+#include <QPainter>
+#include <QPixmap>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPushButton>
@@ -24,6 +31,7 @@
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QGroupBox>
 #include <QScrollArea>
@@ -34,9 +42,34 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static QIcon gearIcon(const QWidget* w) {
+    QIcon icon = QIcon::fromTheme("preferences-system-symbolic", QIcon::fromTheme("preferences-system"));
+    if (!icon.isNull()) return icon;
+
+    QPixmap pm(32, 32);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.translate(16, 16);
+
+    QColor c = w ? w->palette().color(QPalette::WindowText) : QColor(40, 40, 40);
+    p.setPen(Qt::NoPen);
+    p.setBrush(c);
+    for (int i = 0; i < 8; ++i) {
+        p.save();
+        p.rotate(i * 45);
+        p.drawRect(QRectF(-2.2, -15, 4.4, 7));
+        p.restore();
+    }
+    p.drawEllipse(QPointF(0, 0), 10, 10);
+    p.setCompositionMode(QPainter::CompositionMode_DestinationOut);
+    p.drawEllipse(QPointF(0, 0), 4.5, 4.5);
+    return QIcon(pm);
+}
+
 MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     setWindowTitle("DLSS5VKLayer Helper");
-    resize(420, 300);
+    resize(420, 340);
 
     projectDir = findProjectDir();
     helperCliPath = findHelperCli();
@@ -128,11 +161,27 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
 }
 
 MainWindow::~MainWindow() {
-    if (helper) {
-        // Let the helper keep running if the GUI is closed.
-        helper->setParent(nullptr);
+    if (statusTimer) statusTimer->stop();
+
+    if (statusProcess) {
+        statusProcess->disconnect();
+        statusProcess->setParent(nullptr);
+        if (statusProcess->state() != QProcess::NotRunning) {
+            statusProcess->kill();
+            statusProcess->waitForFinished(1000);
+        }
+        delete statusProcess;
+        statusProcess = nullptr;
     }
     if (shmBase) munmap(shmBase, ShmTotalBytes());
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    if (statusTimer) statusTimer->stop();
+    if (hdr) hdr->quit.store(1);
+    if (helperCliPath.isEmpty()) helperCliPath = findHelperCli();
+    if (!helperCliPath.isEmpty()) QProcess::startDetached(helperCliPath, {"stop"});
+    QWidget::closeEvent(event);
 }
 
 QString MainWindow::findProjectDir() const {
@@ -461,6 +510,21 @@ QWidget* MainWindow::buildSettings() {
                         ShmBinder::AtCreate);
         binder->AddFloat(f, "Sharpness", &ShmHeader::sharpnessBits, 0.0, 1.0, 0.05,
                          "The one strength the model reads every frame, so it takes effect at once.");
+    }
+    {
+        auto* f = group("Motion");
+        binder->AddBool(f, "Estimate motion vectors", &ShmHeader::mvecEnabled,
+                        "The model reasons about what moved between frames. A layer at present time "
+                        "has no motion vectors from the engine, so they are estimated on the GPU's "
+                        "optical-flow engine from the two frames the helper already has. Off hands "
+                        "the model a zero field, which is what it used to get.");
+        binder->AddChoice(f, "Motion quality", &ShmHeader::mvecQuality,
+                          { "Fast", "Balanced", "Quality" },
+                          "How much of the frame's budget the flow estimate may take.");
+        binder->AddChoice(f, "Motion units", &ShmHeader::mvecScaleMode,
+                          { "Normalised", "Pixels", "UV 0..1" },
+                          "What the numbers in the field mean to the model. Pixels is what the "
+                          "estimate produces; the others are for matching a model that expects them.");
     }
     {
         auto* f = group("Colour");

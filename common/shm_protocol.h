@@ -30,7 +30,7 @@
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
-static constexpr uint32_t kShmVersion = 3;
+static constexpr uint32_t kShmVersion = 4;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
@@ -123,6 +123,20 @@ enum HelperState : uint32_t {
     kHelperModelFailed = 3,
     kHelperRunning = 4,
     kHelperStopped = 5,
+};
+
+// How the motion field the helper hands the model is scaled. From bmitch87's motion-vector work.
+enum MVecScaleMode : uint32_t {
+    kMVecNormalized = 0,
+    kMVecPixels = 1,
+    kMVecUv01 = 2,
+};
+
+// What the optical-flow engine is asked for. Higher costs more of the frame's budget.
+enum MVecQuality : uint32_t {
+    kMVecFast = 0,
+    kMVecBalanced = 1,
+    kMVecQuality = 2,
 };
 
 // Where the mapping lives.
@@ -318,6 +332,15 @@ struct ShmHeader {
     char gameName[kNameBytes];
 
     PassControl pass[kMaxPasses];
+
+    // Appended after the pass array on purpose: everything before it has a pinned offset, and a new
+    // field inserted higher up would move all of them. Motion vectors, from bmitch87's work.
+    std::atomic<uint32_t> mvecEnabled;
+    std::atomic<uint32_t> mvecScaleMode;
+    std::atomic<uint32_t> mvecQuality;
+    // How far the helper has answered *successfully*. seq_resp says a frame came back; this says it
+    // was worth using, so the layer can present the game's own frame when it was not.
+    std::atomic<uint32_t> seq_ok;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -333,11 +356,12 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1860, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1876, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, pass) == 780, "layout changed -- bump kShmVersion");
+static_assert(offsetof(ShmHeader, mvecEnabled) == 1860, "layout changed -- bump kShmVersion");
 
 inline uint32_t FloatToBits(float f) {
     uint32_t u = 0;
@@ -402,6 +426,11 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->holdFrame.store(0);
     h->scalingDownscaler.store(kDownscaleLanczos3);
 
+    h->mvecEnabled.store(1);
+    h->mvecScaleMode.store(kMVecPixels);
+    h->mvecQuality.store(kMVecBalanced);
+    h->seq_ok.store(0);
+
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);
         h->pass[i].intensityBits.store(FloatToBits(1.0f));
@@ -409,6 +438,11 @@ inline void ShmInitDefaults(ShmHeader* h) {
         h->pass[i].localStructureBits.store(FloatToBits(1.0f));
         h->pass[i].skinStructureBits.store(FloatToBits(-1.0f));
         h->pass[i].sharpnessBits.store(FloatToBits(0.0f));
+        // Inert until overrideMask names them, but initialised to the global defaults so a pass that
+        // is switched on later starts from what the rest of the frame is already doing.
+        h->pass[i].style.store(0);
+        h->pass[i].preset.store(0);
+        h->pass[i].autoMask.store(1);
     }
 }
 
@@ -459,4 +493,16 @@ inline uint64_t ShmLoad64(const std::atomic<uint32_t>& lo, const std::atomic<uin
 inline void ShmStore64(std::atomic<uint32_t>& lo, std::atomic<uint32_t>& hi, uint64_t v) {
     hi.store(uint32_t(v >> 32));
     lo.store(uint32_t(v & 0xFFFFFFFFu));
+}
+
+inline bool ShmMVecEnabled(const ShmHeader* h) { return h->mvecEnabled.load() != 0; }
+
+inline uint32_t ShmMVecScaleMode(const ShmHeader* h) {
+    const uint32_t m = h->mvecScaleMode.load();
+    return m <= kMVecUv01 ? m : kMVecNormalized;
+}
+
+inline uint32_t ShmMVecQuality(const ShmHeader* h) {
+    const uint32_t q = h->mvecQuality.load();
+    return q <= kMVecQuality ? q : kMVecBalanced;
 }

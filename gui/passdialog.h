@@ -6,6 +6,7 @@
 #include "../common/shm_protocol.h"
 
 class QCheckBox;
+class QComboBox;
 class QDoubleSpinBox;
 class QSpinBox;
 class QComboBox;
