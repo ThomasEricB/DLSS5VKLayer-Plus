@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 3
+%global pkg_release 4
 
 Name:           dlssnr
 Version:        0.2.2
@@ -45,6 +45,11 @@ cp -a root/usr %{buildroot}/usr
 %doc %{_datadir}/doc/dlssnr/dxvk-license.txt
 
 %changelog
+* Sun Sep 06 2026 DLSS5VKLayer - 0.2.2-4
+- Layer: side-by-side and wipe compare now work with composition off. The raw-answer path returned ahead of the compare overlay, so compare did nothing while composition was off; the raw answer is now presented through the replace-mode exact inverse, which carries the overlay.
+- GUI: the presenting indicator no longer opens claiming Active. The first poll seeds the frame counter rather than judging it against zero.
+- GUI: "Rebuild spacing (ms)" moves from the Cost group to the gear menu as an inline spinbox; the menu opens attached under the gear.
+
 * Sun Sep 06 2026 DLSS5VKLayer - 0.2.2-3
 - Multipass: changing one pass's model settings rebuilds only that pass. It used to tear down the whole chain and rebuild every pass, one per settle window, which is what made a single slider feel like it crawled through each pass.
 - Multipass: a retuned pass keeps answering with its old tuning until its replacement is ready, so changing settings no longer drops the chain mid-rebuild.

@@ -531,9 +531,23 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     // The model's answer IS the frame. The raw-answer debug path returns the model's picture ahead of
     // every step of the composition -- no ratio, no guard, no blend, no compare -- and it returns
     // before the normalisation step, so the scale that step would have applied has to come from here.
+    //
+    // That early return is also why compare did nothing under a bypass: the overlay lives at the tail
+    // of the resolve, past every return, so the raw path showed one picture with a divider across it
+    // and nothing to compare. The replace modes are the only route that presents the model's answer
+    // without returning early -- pure inverse of the encode, none of the composition -- so comparing
+    // under a bypass borrows them: soft knee and Neutwo pair with NeutwoDecode, Hybrid with
+    // HybridDecode. The encode reads these same constants, so the pair stays an exact inverse. The
+    // price is that the proxy shown to the model while comparing is the replace mode's own rather
+    // than the user's, which is acceptable for a diagnostic view and why this is not done when the
+    // composition is on, where the overlay already runs on the composed picture.
     if (s.compositionBypass) {
-        c.DebugView = 2;
-        c.DebugScale = _linearHdr ? ResolvedWhitePoint(s) : 1.0f;
+        if (s.compareMode != 0) {
+            c.ReversibleMode = s.reversibleMode >= 3 ? 4u : 2u;
+        } else {
+            c.DebugView = 2;
+            c.DebugScale = _linearHdr ? ResolvedWhitePoint(s) : 1.0f;
+        }
     }
 
     // A frame the game already tone mapped goes through the encode untouched, and the composition
