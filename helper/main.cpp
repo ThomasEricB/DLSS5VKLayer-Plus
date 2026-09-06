@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 using namespace dlssnr;
@@ -455,14 +456,54 @@ static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes) {
 // ---------------------------------------------------------------------------
 // Per-size neural pipeline state
 // ---------------------------------------------------------------------------
+static float ClampF(float v, float lo, float hi) {
+    if (!(v >= lo)) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
 struct NeuralState {
     VkCtx vk{};
     NgxSnippet ngx{};
-    GpuImage colorIn{}, colorOut{}, mv{}, depth{};
+
+    // The proxy the layer sent, and two surfaces the chain alternates between. Two, not one, because
+    // a pass must read the previous pass's answer while writing its own: with a single surface the
+    // model would be reading and writing the same image.
+    GpuImage colorIn{}, workA{}, workB{}, mv{}, depth{};
+
     uint32_t w = 0, h = 0;
     bool ready = false;
-    bool firstFrame = true;
+
+    // Per-pass state. A pass owns a feature, the tuning that feature was built with, and whether it
+    // still owes the model a history reset.
+    NgxTuning tuning[kMaxPasses] = {};
+    bool passNeedsReset[kMaxPasses] = {};
+    uint32_t livePasses = 0;
+
+    // Rebuilds are spaced rather than done at once: back-to-back NGX creation exhausts the driver's
+    // latches and the model stops answering until the process restarts.
+    uint32_t lastTuningSeq = 0;
+    uint64_t frames = 0;
+    uint64_t buildAfter = 0;
+
+    uint64_t evaluates = 0;
 };
+
+// How long to wait after a change before rebuilding, and between one rebuild and the next.
+static constexpr uint64_t kSettleFrames = 30;
+
+static NgxTuning TuningFor(const ShmHeader* h, uint32_t pass) {
+    const PassTuning p = ShmResolvePass(h, pass);
+    NgxTuning t;
+    t.intensity = ClampF(p.intensity, 0.0f, 4.0f);
+    t.localTone = ClampF(p.localTone, 0.0f, 4.0f);
+    t.localStructure = ClampF(p.localStructure, 0.0f, 4.0f);
+    t.skinStructure = ClampF(p.skinStructure, -1.0f, 4.0f);
+    t.style = p.style;
+    t.preset = p.preset;
+    t.autoMask = p.autoMask ? 1u : 0u;
+    return t;
+}
 
 static void Swizzle(uint8_t* dst, const uint8_t* src, size_t px) {
     uint32_t* d = (uint32_t*)dst;
@@ -481,28 +522,45 @@ static void Swizzle(uint8_t* dst, const uint8_t* src, size_t px) {
     }
 }
 
-static float ClampF(float v, float lo, float hi) {
-    if (!(v >= lo)) return lo;
-    if (v > hi) return hi;
-    return v;
+static void PublishStatus(ShmMap& shm, NeuralState& ns, uint32_t state) {
+    if (!shm.hdr) return;
+    shm.hdr->helperState.store(state);
+    shm.hdr->modelUp.store(ns.ngx.ready && !ns.ngx.disabled ? 1u : 0u);
+    shm.hdr->helperFeatures.store(ns.livePasses);
+    ShmStore64(shm.hdr->helperFramesLo, shm.hdr->helperFramesHi, ns.evaluates);
 }
 
-static bool EnsureNeural(NeuralState& ns, uint32_t w, uint32_t h) {
+static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     if (ns.ready && ns.w == w && ns.h == h) return true;
     if (ns.ngx.disabled) return false;
-    if (ns.ngx.feature) { NgxTeardown(ns.ngx, ns.vk.device); }
-    DestroyImage2D(ns.vk, ns.colorIn); DestroyImage2D(ns.vk, ns.colorOut);
-    DestroyImage2D(ns.vk, ns.mv); DestroyImage2D(ns.vk, ns.depth);
+
+    if (ns.ngx.snippet) NgxReleaseAllPasses(ns.ngx, ns.vk.device);
+    DestroyImage2D(ns.vk, ns.colorIn);
+    DestroyImage2D(ns.vk, ns.workA);
+    DestroyImage2D(ns.vk, ns.workB);
+    DestroyImage2D(ns.vk, ns.mv);
+    DestroyImage2D(ns.vk, ns.depth);
+    ns.livePasses = 0;
 
     if (!CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.colorIn) ||
-        !CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.colorOut) ||
+        !CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.workA) ||
+        !CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.workB) ||
         !CreateImage2D(ns.vk, VK_FORMAT_R16G16_SFLOAT, w, h, ns.mv) ||
         !CreateImage2D(ns.vk, VK_FORMAT_R32_SFLOAT, w, h, ns.depth)) {
-        Log("[helper] image creation failed"); return false;
+        Log("[helper] image creation failed at %ux%u", w, h);
+        ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                       "could not allocate the model's surfaces");
+        return false;
     }
+
+    // The model is given motion vectors and depth because its parameter block requires them. A
+    // present-time layer has neither, so they are zero: the model then has no reprojection to do and
+    // judges each frame on its own. This is the honest limit of injecting here rather than inside the
+    // renderer, and it is why the pass is weaker in motion than OptiScaler's.
     std::vector<uint8_t> zeros(size_t(w) * h * 4, 0);
     if (!UploadPixels(ns.vk, ns.mv, zeros.data(), zeros.size()) ||
         !UploadPixels(ns.vk, ns.depth, zeros.data(), zeros.size())) return false;
+
     if (!BeginCmd(ns.vk.cmdScratch)) return false;
     TransitionImage(ns.vk, ns.vk.cmdScratch, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
@@ -510,137 +568,222 @@ static bool EnsureNeural(NeuralState& ns, uint32_t w, uint32_t h) {
     TransitionImage(ns.vk, ns.vk.cmdScratch, ns.depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-    TransitionImage(ns.vk, ns.vk.cmdScratch, ns.colorOut, VK_IMAGE_LAYOUT_GENERAL, 0,
+    TransitionImage(ns.vk, ns.vk.cmdScratch, ns.workA, VK_IMAGE_LAYOUT_GENERAL, 0,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    TransitionImage(ns.vk, ns.vk.cmdScratch, ns.workB, VK_IMAGE_LAYOUT_GENERAL, 0,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     if (!SubmitAndWait(ns.vk, ns.vk.cmdScratch)) return false;
 
+    // Pass 0's feature is built with pass 0's tuning, here, because the model reads it at create.
+    // Pass 0 is created inside NgxLoadAndInit, so its tuning has to be in the parameter block before
+    // that call rather than recorded after it. Setting it afterwards is what made pass 0 always come
+    // up with defaults while this side believed it had the user's values.
+    NgxTuning first = TuningFor(shm.hdr, 0);
+
     if (!BeginCmd(ns.vk.cmdCreate)) return false;
-    bool ok = NgxLoadAndInit(ns.ngx, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h, ns.vk.cmdCreate);
+    bool ok = NgxLoadAndInit(ns.ngx, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h, ns.vk.cmdCreate, first);
     if (!SubmitAndWait(ns.vk, ns.vk.cmdCreate) || !ok) {
         Log("[helper] snippet init/create failed at %ux%u", w, h);
+        ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                       "the model would not initialise; see the helper log");
         ns.ngx.disabled = true;
+        PublishStatus(shm, ns, kHelperModelFailed);
         return false;
     }
 
-    auto fill = [](NVSDK_NGX_Resource_VK& r, GpuImage& img, bool rw) {
-        r = {};
-        r.Type = NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGE_VIEW;
-        r.ReadWrite = rw;
-        r.Resource.ImageViewInfo.ImageView = img.view;
-        r.Resource.ImageViewInfo.Image = img.image;
-        r.Resource.ImageViewInfo.SubresourceRange = { img.aspect(), 0, 1, 0, 1 };
-        r.Resource.ImageViewInfo.Format = img.format;
-        r.Resource.ImageViewInfo.Width = img.width;
-        r.Resource.ImageViewInfo.Height = img.height;
-    };
-    NVSDK_NGX_Resource_VK rc{}, ro{}, rm{}, rd{};
-    fill(rc, ns.colorIn, false); fill(ro, ns.colorOut, true); fill(rm, ns.mv, false); fill(rd, ns.depth, false);
-    NgxSetResources(ns.ngx, rc, ro, rm, rd, w, h);
-
-    ns.w = w; ns.h = h; ns.ready = true; ns.firstFrame = true;
+    ns.tuning[0] = first;
+    ns.passNeedsReset[0] = true;
+    ns.livePasses = 1;
+    ns.w = w;
+    ns.h = h;
+    ns.ready = true;
+    ns.buildAfter = ns.frames + kSettleFrames;
     Log("[helper] neural ready %ux%u", w, h);
+    ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes, "");
+    PublishStatus(shm, ns, kHelperRunning);
     return true;
+}
+
+// Bind one pass's input and output. The proxy the layer sent is read by pass 0 and never written by
+// the chain, so what the composition later differences against is the whole chain's edit rather than
+// the last pass's edit against the one before it.
+static void BindPass(NeuralState& ns, uint32_t pass, GpuImage*& in, GpuImage*& out) {
+    if (pass == 0) {
+        in = &ns.colorIn;
+        out = &ns.workA;
+    } else if (pass % 2 == 1) {
+        in = &ns.workA;
+        out = &ns.workB;
+    } else {
+        in = &ns.workB;
+        out = &ns.workA;
+    }
+}
+
+static void FillResource(NVSDK_NGX_Resource_VK& r, GpuImage& img, bool rw) {
+    r = {};
+    r.Type = NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGE_VIEW;
+    r.ReadWrite = rw;
+    r.Resource.ImageViewInfo.ImageView = img.view;
+    r.Resource.ImageViewInfo.Image = img.image;
+    r.Resource.ImageViewInfo.SubresourceRange = { img.aspect(), 0, 1, 0, 1 };
+    r.Resource.ImageViewInfo.Format = img.format;
+    r.Resource.ImageViewInfo.Width = img.width;
+    r.Resource.ImageViewInfo.Height = img.height;
+}
+
+// Bring the built features into line with what the header asks for.
+//
+// One build per call and never before the settle window has passed. Both halves matter: NGX creation
+// is expensive and back-to-back creation exhausts the driver's latches, after which the model stops
+// answering until the process restarts.
+static void MaintainPasses(NeuralState& ns, ShmMap& shm, uint32_t wanted) {
+    if (!ns.ready || ns.ngx.disabled) return;
+
+    // Has anything the model latches at creation changed?
+    //
+    // Compared by value rather than by watching tuningSeq. The sequence is a hint, not the truth: a
+    // header reset returns it to zero while this process still remembers a larger number, and the
+    // change that follows then looks like no change at all. Seven atomic loads per live pass per
+    // frame is nothing next to a control that silently stops working.
+    {
+        ns.lastTuningSeq = shm.hdr->tuningSeq.load();
+        bool any = false;
+        for (uint32_t i = 0; i < ns.livePasses; ++i) {
+            if (TuningFor(shm.hdr, i) != ns.tuning[i]) { any = true; break; }
+        }
+        if (any) {
+            Log("[helper] model tuning changed; rebuilding %u pass(es) after a settle", ns.livePasses);
+            vkDeviceWaitIdle(ns.vk.device);
+            NgxReleaseAllPasses(ns.ngx, ns.vk.device);
+            ns.livePasses = 0;
+
+            // ns.ready stays true on purpose. It means "the snippet is loaded and the surfaces
+            // exist", not "a feature is built" -- clearing it would send EnsureNeural back through
+            // NgxLoadAndInit, which reloads a 165 MB DLL and re-runs the caller spoof to rebuild
+            // something that only needed its features made again. The features come back through the
+            // build path below, one at a time.
+            ns.ngx.ready = true;
+            ns.buildAfter = ns.frames + kSettleFrames;
+            return;
+        }
+    }
+
+    if (wanted < ns.livePasses) {
+        vkDeviceWaitIdle(ns.vk.device);
+        for (uint32_t i = wanted; i < ns.livePasses; ++i) NgxReleasePass(ns.ngx, i, ns.vk.device);
+        ns.livePasses = wanted;
+        return;
+    }
+
+    // Frames where nothing is built fail open: the layer presents the game's own frame, which is the
+    // right answer while the model has no feature to answer with.
+    if (wanted > ns.livePasses && ns.frames >= ns.buildAfter) {
+        const uint32_t pass = ns.livePasses;
+        NgxTuning t = TuningFor(shm.hdr, pass);
+        NgxSetCreateTuning(ns.ngx, t);
+        if (!BeginCmd(ns.vk.cmdCreate)) return;
+        const bool built = NgxCreatePass(ns.ngx, pass, ns.w, ns.h, ns.vk.cmdCreate);
+        SubmitAndWait(ns.vk, ns.vk.cmdCreate);
+        if (built) {
+            ns.tuning[pass] = t;
+            ns.passNeedsReset[pass] = true;
+            ns.livePasses = pass + 1;
+        } else {
+            // A later pass failing is a ceiling, not a fault: the chain simply runs at what fits.
+            Log("[helper] pass %u would not build; holding the chain at %u", pass, ns.livePasses);
+            shm.hdr->helperPassCeiling.store(ns.livePasses);
+        }
+        ns.buildAfter = ns.frames + kSettleFrames;
+    }
 }
 
 static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     uint32_t w = shm.hdr->width.load(), h = shm.hdr->height.load();
-    uint32_t fmt = shm.hdr->format.load();
     if (!w || !h || w > kMaxW || h > kMaxH) return false;
 
-    size_t px = size_t(w) * h;
-    size_t bytes = px * 4;
+    const size_t px = size_t(w) * h;
+    const size_t bytes = px * 4;
+    ++ns.frames;
+
     if (!ShmNeuralEnabled(shm.hdr)) {
         std::memcpy(shm.outPixels, shm.inPixels, bytes);
         return true;
     }
 
-    const uint32_t passes = ShmPasses(shm.hdr);
+    const uint32_t wanted = ShmPasses(shm.hdr);
     const bool time = TimeEnabled();
     const double t0 = NowMs();
-    if (!EnsureNeural(ns, w, h)) return false;
 
-    const uint8_t* in = shm.inPixels;
+    if (!EnsureNeural(ns, shm, w, h)) return false;
+    MaintainPasses(ns, shm, wanted);
+    if (!ns.ready || ns.livePasses == 0) return false;
+
+    // The proxy the layer encoded. It is already R8G8B8A8_UNORM and display-referred, so there is
+    // nothing to swizzle and nothing to convert.
     if (bytes > ns.vk.stagingSize && !CreateStaging(ns.vk, bytes)) return false;
-    if (fmt == 0) Swizzle((uint8_t*)ns.vk.uploadMap, in, px);   // BGRA -> RGBA
-    else std::memcpy(ns.vk.uploadMap, in, bytes);
-    const double tSwizzleIn = time ? NowMs() : 0.0;
-    if (!UploadMappedPixels(ns.vk, ns.colorIn, bytes)) return false;
+    std::memcpy(ns.vk.uploadMap, shm.inPixels, bytes);
     const double tUpload = time ? NowMs() : 0.0;
+    if (!UploadMappedPixels(ns.vk, ns.colorIn, bytes)) return false;
+
+    const uint32_t passes = std::min(wanted, ns.livePasses);
+    GpuImage* last = nullptr;
 
     for (uint32_t pass = 0; pass < passes; ++pass) {
+        GpuImage *in = nullptr, *out = nullptr;
+        BindPass(ns, pass, in, out);
+
+        NVSDK_NGX_Resource_VK rc{}, ro{}, rm{}, rd{};
+        FillResource(rc, *in, false);
+        FillResource(ro, *out, true);
+        FillResource(rm, ns.mv, false);
+        FillResource(rd, ns.depth, false);
+        NgxSetResources(ns.ngx, rc, ro, rm, rd, w, h);
+
+        // Sharpness is the one strength the model reads at evaluate, so it follows the setting
+        // without a rebuild; everything else was latched when this pass's feature was built.
         const PassTuning ps = ShmResolvePass(shm.hdr, pass);
-        NgxSetStrengths(ns.ngx,
-            ClampF(ps.intensity, 0.0f, 4.0f),
-            ClampF(ps.localTone, 0.0f, 4.0f),
-            ClampF(ps.localStructure, 0.0f, 4.0f),
-            ClampF(ps.skinStructure, -1.0f, 4.0f),
-            ClampF(ps.sharpness, 0.0f, 1.0f));
+        NgxSetSharpness(ns.ngx, ClampF(ps.sharpness, 0.0f, 1.0f));
+
         if (!BeginCmd(ns.vk.cmdEval)) return false;
+        TransitionImage(ns.vk, ns.vk.cmdEval, *in, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        TransitionImage(ns.vk, ns.vk.cmdEval, *out, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-        VkAccessFlags inSrc = 0;
-        VkPipelineStageFlags inStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-        if (ns.colorIn.layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-            inSrc = VK_ACCESS_TRANSFER_WRITE_BIT; inStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        } else if (ns.colorIn.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-            inSrc = VK_ACCESS_SHADER_READ_BIT; inStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        } else if (ns.colorIn.layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-            inSrc = VK_ACCESS_TRANSFER_READ_BIT; inStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        NgxSetReset(ns.ngx, ns.passNeedsReset[pass]);
+        ns.passNeedsReset[pass] = false;
+
+        if (!NgxEvaluatePass(ns.ngx, pass, ns.vk.cmdEval)) {
+            vkEndCommandBuffer(ns.vk.cmdEval);
+            return false;
         }
-        TransitionImage(ns.vk, ns.vk.cmdEval, ns.colorIn, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            inSrc, VK_ACCESS_SHADER_READ_BIT, inStage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-        VkAccessFlags outSrc = 0;
-        VkPipelineStageFlags outStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-        if (ns.colorOut.layout == VK_IMAGE_LAYOUT_GENERAL) {
-            outSrc = VK_ACCESS_SHADER_WRITE_BIT; outStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        } else if (ns.colorOut.layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-            outSrc = VK_ACCESS_TRANSFER_READ_BIT; outStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        } else if (ns.colorOut.layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-            outSrc = VK_ACCESS_TRANSFER_WRITE_BIT; outStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        }
-        TransitionImage(ns.vk, ns.vk.cmdEval, ns.colorOut, VK_IMAGE_LAYOUT_GENERAL,
-            outSrc, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            outStage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-        NgxSetReset(ns.ngx, ns.firstFrame && pass == 0);
-        if (pass == 0) ns.firstFrame = false;
-        if (!NgxEvaluate(ns.ngx, ns.vk.cmdEval)) { vkEndCommandBuffer(ns.vk.cmdEval); return false; }
         if (!SubmitAndWait(ns.vk, ns.vk.cmdEval)) return false;
-
-        if (pass + 1 < passes) {
-            if (!BeginCmd(ns.vk.cmdScratch)) return false;
-            TransitionImage(ns.vk, ns.vk.cmdScratch, ns.colorOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            TransitionImage(ns.vk, ns.vk.cmdScratch, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkImageCopy copy{};
-            copy.srcSubresource = { ns.colorOut.aspect(), 0, 0, 1 };
-            copy.srcOffset = { 0, 0, 0 };
-            copy.dstSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
-            copy.dstOffset = { 0, 0, 0 };
-            copy.extent = { w, h, 1 };
-            vkCmdCopyImage(ns.vk.cmdScratch, ns.colorOut.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            if (!SubmitAndWait(ns.vk, ns.vk.cmdScratch)) return false;
-        }
+        last = out;
     }
     const double tEval = time ? NowMs() : 0.0;
 
-    if (!ReadbackPixels(ns.vk, ns.colorOut, bytes)) return false;
-    const double tReadback = time ? NowMs() : 0.0;
-    if (fmt == 0) Swizzle(shm.outPixels, (const uint8_t*)ns.vk.readMap, px);  // RGBA -> BGRA
-    else std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
-    const double tSwizzleOut = time ? NowMs() : 0.0;
+    if (!last || !ReadbackPixels(ns.vk, *last, bytes)) return false;
+    std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
+    const double tDone = time ? NowMs() : 0.0;
+
+    ++ns.evaluates;
+    if (shm.hdr) {
+        ShmStore64(shm.hdr->helperFramesLo, shm.hdr->helperFramesHi, ns.evaluates);
+        shm.hdr->helperEvalMsBits.store(FloatToBits(float(tEval - tUpload)));
+        shm.hdr->helperFeatures.store(ns.livePasses);
+        shm.hdr->modelUp.store(1);
+    }
 
     if (time) {
         static int frameNo = 0;
         if (++frameNo % TimeInterval() == 0) {
-            Log("[time] passes=%u swizzleIn=%.2f upload=%.2f eval=%.2f readback=%.2f swizzleOut=%.2f total=%.2f ms",
-                passes, tSwizzleIn - t0, tUpload - tSwizzleIn, tEval - tUpload,
-                tReadback - tEval, tSwizzleOut - tReadback, tSwizzleOut - t0);
+            Log("[time] passes=%u/%u upload=%.2f eval=%.2f readback=%.2f total=%.2f ms",
+                passes, wanted, tUpload - t0, tEval - tUpload, tDone - tEval, tDone - t0);
         }
     }
     return true;
