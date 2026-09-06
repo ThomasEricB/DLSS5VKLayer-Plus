@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -24,6 +25,8 @@
 #include <vector>
 
 #include "../../common/shm_protocol.h"
+#include "composition.h"
+#include "vk_table.h"
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -175,8 +178,13 @@ static bool ShmNeuralEnabled(ShmMap& s) {
     return ::ShmNeuralEnabled(s.hdr);
 }
 
-// Returns true if a processed frame was written to outPixels.
-static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, bool fmtRgba, const void* pixels) {
+// One round trip: publish the proxy, wait for the model's answer, copy it back.
+//
+// What crosses is the proxy at the model's own resolution, always R8G8B8A8_UNORM and always
+// display-referred, because the encode has already done that work on the GPU. The helper therefore
+// never has to know what format the game presents in, and the working scale reduces this copy
+// quadratically -- which on this transport is the difference the setting actually buys.
+static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, const void* proxy, void* modelOut) {
     if (s.dead) return false;
     if (!ShmOpen(s)) { s.dead = true; return false; }
     if (w > kMaxW || h > kMaxH) return false;
@@ -184,11 +192,12 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, bool fmtRgba, con
 
     const bool time = TimeEnabled();
     const double t0 = NowMs();
-    std::memcpy(s.inPixels, pixels, size_t(w) * h * 4);
+    const size_t bytes = size_t(w) * h * 4;
+    std::memcpy(s.inPixels, proxy, bytes);
     const double tCopy = NowMs();
     s.hdr->width.store(w);
     s.hdr->height.store(h);
-    s.hdr->format.store(fmtRgba ? 1u : 0u);
+    s.hdr->format.store(1u);  // the encode always writes RGBA order
     uint32_t req = s.hdr->seq_req.load() + 1;
     s.hdr->seq_req.store(req);
 
@@ -197,6 +206,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, bool fmtRgba, con
     for (;;) {
         if (s.hdr->seq_resp.load() >= req) {
             s.timeouts = 0;
+            std::memcpy(modelOut, s.outPixels, bytes);
             if (time) {
                 static int frameNo = 0;
                 if (++frameNo % TimeInterval() == 0) {
@@ -222,6 +232,11 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, bool fmtRgba, con
 // ---------------------------------------------------------------------------
 struct InstanceChain {
     PFN_vkGetInstanceProcAddr next_gipa = nullptr;
+
+    // The instance-level entry points the composition needs, resolved once. Kept here rather than on
+    // the device chain because this is where the VkInstance handle is in scope.
+    dlssnr::InstanceTable table;
+
     PFN_vkDestroyInstance vkDestroyInstance = nullptr;
     PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices = nullptr;
     PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties = nullptr;
@@ -240,31 +255,19 @@ struct InstanceChain {
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkCmdCopyBufferToImage) \
     X(vkCmdCopyImageToBuffer) X(vkCmdPipelineBarrier) X(vkDeviceWaitIdle)
 
-struct GpuImage {
-    VkImage image = nullptr;
-    VkDeviceMemory memory = nullptr;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    uint32_t width = 0, height = 0;
-    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-};
-
-struct HostBuffer {
-    VkBuffer buffer = nullptr;
-    VkDeviceMemory memory = nullptr;
-    void* mapped = nullptr;
-    size_t size = 0;
-};
-
 struct SwapchainState {
     std::vector<VkImage> images;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
-    HostBuffer bufIn{}, bufOut{};
     VkFence fence = nullptr;
     VkCommandPool pool = nullptr;
     VkCommandBuffer cb = nullptr;
     bool ready = false;
     bool passThrough = false;
+
+    // The pass. Owns every surface it needs, including the two host-visible buffers the round trip
+    // reads and writes, which is why there are no staging buffers left here.
+    std::unique_ptr<dlssnr::Composition> comp;
 };
 
 struct DeviceChain {
@@ -272,6 +275,9 @@ struct DeviceChain {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice self = VK_NULL_HANDLE;
     PFN_vkGetDeviceProcAddr next_dpa = nullptr;
+
+    // The same entry points again, in the form the composition takes them.
+    dlssnr::DeviceTable table;
 
     // The loader's hook for installing a dispatch table on a dispatchable object a layer creates.
     // Handed to every layer in its own VkLayerDeviceCreateInfo node; see Hook_CreateDevice.
@@ -284,6 +290,7 @@ struct DeviceChain {
     std::unordered_map<VkSwapchainKHR, SwapchainState> swapchains;
     std::unordered_map<VkQueue, uint32_t> queueFamilies;
     ShmMap shm;
+    uint64_t framesComposed = 0;
 };
 
 static std::unordered_map<VkInstance, InstanceChain> g_instances;
@@ -365,6 +372,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(
     chain.vkGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)next_gipa(*pInstance, "vkGetPhysicalDeviceProperties");
     chain.vkEnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties)next_gipa(*pInstance, "vkEnumerateDeviceExtensionProperties");
     chain.vkGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)next_gipa(*pInstance, "vkGetPhysicalDeviceMemoryProperties");
+
+    chain.table.next_gipa = next_gipa;
+    chain.table.Load(*pInstance);
 
     std::lock_guard<std::mutex> lk(g_stateMutex);
     g_instances[*pInstance] = chain;
@@ -451,6 +461,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 #define X(name) dc->name = (PFN_##name)next_dpa(*pDevice, #name);
     DEVICE_FN_LIST(X)
 #undef X
+    dc->table.next_dpa = next_dpa;
+    dc->table.Load(*pDevice);
     if (!dc->vkQueuePresentKHR || !dc->vkCreateSwapchainKHR || !ic) dc->inert = true;
 
     // Neural Rendering is an NGX feature and the helper only ever creates its own device on an
@@ -489,10 +501,7 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
         std::lock_guard<std::mutex> lk(dc->lock);
         for (auto& kv : dc->swapchains) {
             SwapchainState& sc = kv.second;
-            if (sc.bufIn.buffer) dc->vkDestroyBuffer(device, sc.bufIn.buffer, nullptr);
-            if (sc.bufIn.memory) dc->vkFreeMemory(device, sc.bufIn.memory, nullptr);
-            if (sc.bufOut.buffer) dc->vkDestroyBuffer(device, sc.bufOut.buffer, nullptr);
-            if (sc.bufOut.memory) dc->vkFreeMemory(device, sc.bufOut.memory, nullptr);
+            sc.comp.reset();
             if (sc.fence) dc->vkDestroyFence(device, sc.fence, nullptr);
             if (sc.pool) dc->vkDestroyCommandPool(device, sc.pool, nullptr);
         }
@@ -538,9 +547,12 @@ static VKAPI_ATTR void VKAPI_CALL Hook_GetDeviceQueue2(VkDevice device,
 // ---------------------------------------------------------------------------
 // Swapchain
 // ---------------------------------------------------------------------------
+// Which swapchain formats the pass can work in. Every one of them has a UNORM twin the composition
+// uses internally; the ten-bit and float entries are new here, and are what lets an HDR game reach
+// the model at all -- the encode is exactly the step that turns open-ended light into the kind of
+// picture the model was trained on.
 static bool SupportedFormat(VkFormat f) {
-    return f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB ||
-           f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB;
+    return dlssnr::CompositionFormat(f) != VK_FORMAT_UNDEFINED;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
@@ -598,10 +610,7 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(VkDevice device,
         if (dc->vkDeviceWaitIdle) dc->vkDeviceWaitIdle(device);
         lk.lock();
         SwapchainState& sc = it->second;
-        if (sc.bufIn.buffer) dc->vkDestroyBuffer(device, sc.bufIn.buffer, nullptr);
-        if (sc.bufIn.memory) dc->vkFreeMemory(device, sc.bufIn.memory, nullptr);
-        if (sc.bufOut.buffer) dc->vkDestroyBuffer(device, sc.bufOut.buffer, nullptr);
-        if (sc.bufOut.memory) dc->vkFreeMemory(device, sc.bufOut.memory, nullptr);
+        sc.comp.reset();
         if (sc.fence) dc->vkDestroyFence(device, sc.fence, nullptr);
         if (sc.pool) dc->vkDestroyCommandPool(device, sc.pool, nullptr);
         dc->swapchains.erase(it);
@@ -613,23 +622,6 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(VkDevice device,
 // ---------------------------------------------------------------------------
 // Present-time neural round-trip
 // ---------------------------------------------------------------------------
-static uint32_t ChooseHostMemoryType(const VkPhysicalDeviceMemoryProperties& mp, uint32_t bits) {
-    const VkMemoryPropertyFlags required =
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    int best = -1, bestScore = -1;
-    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-        if (!(bits & (1u << i))) continue;
-        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
-        if ((f & required) != required) continue;
-        int score = 0;
-        if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) score += 100;
-        if (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) score += 10;
-        if (f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) score -= 50;
-        if (score > bestScore) { bestScore = score; best = (int)i; }
-    }
-    return best >= 0 ? (uint32_t)best : UINT32_MAX;
-}
-
 // Give a dispatchable object this layer allocated the dispatch table the loader expects on it.
 //
 // VkCommandBuffer and VkQueue are dispatchable: their first word points at a dispatch table, and
@@ -650,26 +642,6 @@ static bool SetLoaderData(DeviceChain* dc, void* object) {
 
 static bool CreateResources(DeviceChain* dc, SwapchainState& sc, uint32_t family) {
     VkDevice d = dc->self;
-    size_t bytes = size_t(sc.width) * sc.height * 4;
-
-    auto makeHostBuf = [&](HostBuffer& hb) {
-        VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bci.size = bytes;
-        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        if (dc->vkCreateBuffer(d, &bci, nullptr, &hb.buffer) != VK_SUCCESS) return false;
-        hb.size = bytes;
-        VkMemoryRequirements req{};
-        dc->vkGetBufferMemoryRequirements(d, hb.buffer, &req);
-        VkPhysicalDeviceMemoryProperties mp{};
-        dc->instance->vkGetPhysicalDeviceMemoryProperties(dc->physical, &mp);
-        uint32_t mt = ChooseHostMemoryType(mp, req.memoryTypeBits);
-        if (mt == UINT32_MAX) return false;
-        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
-        if (dc->vkAllocateMemory(d, &mai, nullptr, &hb.memory) != VK_SUCCESS) return false;
-        if (dc->vkBindBufferMemory(d, hb.buffer, hb.memory, 0) != VK_SUCCESS) return false;
-        return dc->vkMapMemory(d, hb.memory, 0, VK_WHOLE_SIZE, 0, &hb.mapped) == VK_SUCCESS;
-    };
 
     VkCommandPoolCreateInfo cpci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -685,21 +657,14 @@ static bool CreateResources(DeviceChain* dc, SwapchainState& sc, uint32_t family
     VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     if (dc->vkCreateFence(d, &fci, nullptr, &sc.fence) != VK_SUCCESS) return false;
 
-    return makeHostBuf(sc.bufIn) && makeHostBuf(sc.bufOut);
-}
-
-static void Barrier(DeviceChain* dc, VkCommandBuffer cb, VkImage img, VkImageLayout oldL,
-                    VkImageLayout newL, VkAccessFlags src, VkAccessFlags dst,
-                    VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
-    VkImageMemoryBarrier b{};
-    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    b.oldLayout = oldL; b.newLayout = newL;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img;
-    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    b.srcAccessMask = src; b.dstAccessMask = dst;
-    dc->vkCmdPipelineBarrier(cb, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
+    if (!dc->instance) return false;
+    sc.comp = std::make_unique<dlssnr::Composition>(&dc->table, &dc->instance->table, d, dc->physical);
+    if (!sc.comp->Usable()) {
+        Log("[layer] composition unavailable: %s", sc.comp->Reason());
+        sc.comp.reset();
+        return false;
+    }
+    return true;
 }
 
 // Every Vulkan result on the present path, looked at rather than collapsed into a bool.
@@ -722,35 +687,44 @@ static bool NoteVk(DeviceChain* dc, VkResult r, const char* what) {
     return false;
 }
 
-// Returns true if the swapchain image now holds the neural-processed frame.
+// Returns true if the swapchain image now holds the composed frame.
 //
-// The caller's present semaphores are consumed here, by the capture submit, because that submit is
-// the first thing to touch the image and must not start before the game's render has finished. They
-// are therefore unsignalled by the time this returns and must not be handed to vkQueuePresentKHR a
-// second time -- the caller presents with none instead. Everything this records is fenced on the CPU
-// before it returns, so the present needs nothing to wait on.
+// Three steps around one round trip. The pass encodes a proxy of the frame on the GPU, that proxy
+// crosses to the helper and comes back as the model's answer, and the pass composes the answer onto
+// the frame. Between them the work is fenced on the CPU, which is what makes the split possible at
+// all: the model is in another process and there is nothing to wait on but a sequence number.
 //
-// The image arrives in VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, which is what the game transitioned it to
-// before handing it to vkQueuePresentKHR, and it must be back in that layout on every path out --
-// including the fail-open one. It is not COLOR_ATTACHMENT_OPTIMAL: that is where the game's render
-// pass left it, one transition earlier, and naming it here made every barrier a layout mismatch and
-// handed the present engine an image in a layout it does not accept.
+// The caller's present semaphores are consumed by the first submit, because that submit is the first
+// thing to touch the image. They are therefore unsignalled by the time this returns and must not be
+// handed to vkQueuePresentKHR again; the caller presents with none.
+//
+// Every path out leaves the swapchain image in PRESENT_SRC_KHR, including the ones that give up.
 static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
                            VkImage swapchainImage, uint32_t waitCount,
-                           const VkSemaphore* waitSemaphores, uint32_t* outW, uint32_t* outH) {
+                           const VkSemaphore* waitSemaphores) {
+    if (!sc.comp) return false;
     VkDevice d = dc->self;
-    size_t bytes = size_t(sc.width) * sc.height * 4;
     VkCommandBuffer cb = sc.cb;
     const bool time = TimeEnabled();
     const double t0 = time ? NowMs() : 0.0;
 
+    const dlssnr::FrameSettings fs = dlssnr::FrameSettings::Read(dc->shm.hdr);
+    const bool linearHdr =
+        dlssnr::ColourIsLinearHdr(sc.format, dc->shm.hdr ? dc->shm.hdr->colourMode.load() : kColourAuto);
+
+    if (!sc.comp->Prepare(sc.width, sc.height, sc.format, fs, linearHdr)) {
+        Log("[layer] composition cannot run here: %s", sc.comp->Reason());
+        return false;
+    }
+
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
 
-    // Only the capture submit waits. The later ones are ordered behind it on the same queue and are
-    // fenced on the CPU besides, and a semaphore may only be waited on once per signal.
+    // Only the first submit waits: the later one is ordered behind it on the same queue and fenced
+    // besides, and a binary semaphore may be waited on once per signal.
     std::vector<VkPipelineStageFlags> waitStages(waitCount, VK_PIPELINE_STAGE_TRANSFER_BIT);
     si.waitSemaphoreCount = waitCount;
     si.pWaitSemaphores = waitCount ? waitSemaphores : nullptr;
@@ -760,74 +734,61 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         si.pWaitSemaphores = nullptr;
         si.pWaitDstStageMask = nullptr;
     };
-    VkBufferImageCopy region{};
-    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.imageExtent = { sc.width, sc.height, 1 };
 
-    auto restorePresentLayout = [&]() {
-        dropWaits();
-        if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
-        Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    const auto runLeg = [&]() {
         if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
         if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence), "vkQueueSubmit")) return false;
-        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return false;
+        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
+            return false;
         dc->vkResetFences(d, 1, &sc.fence);
         return true;
     };
 
-    // ---- capture: swapchain -> bufIn ----
+    // ---- leg 1: the frame the model is shown ----
     if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
-    Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT);
-    dc->vkCmdCopyImageToBuffer(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               sc.bufIn.buffer, 1, &region);
-    if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
-    if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence), "vkQueueSubmit")) return false;
-    if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return false;
-    dc->vkResetFences(d, 1, &sc.fence);
+    if (!sc.comp->RecordCapture(cb, swapchainImage, fs)) {
+        dc->vkEndCommandBuffer(cb);
+        return false;
+    }
+    if (!runLeg()) return false;
     dropWaits();
     const double tCapture = time ? NowMs() : 0.0;
 
-    // ---- ship to helper ----
-    if (!ShmProcessFrame(dc->shm, sc.width, sc.height,
-                         sc.format == VK_FORMAT_R8G8B8A8_UNORM || sc.format == VK_FORMAT_R8G8B8A8_SRGB,
-                         sc.bufIn.mapped)) {
-        restorePresentLayout();
+    // ---- the round trip ----
+    if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ProxyPixels(),
+                         sc.comp->ModelPixels())) {
+        // Fail-open. Leg 1 already put the image back in PRESENT_SRC_KHR, so the original frame is
+        // what gets presented and nothing else is owed.
         return false;
     }
-    *outW = sc.width; *outH = sc.height;
+    sc.comp->MarkModelFrame();
     const double tHelper = time ? NowMs() : 0.0;
 
-    // ---- return: bufOut -> swapchain ----
-    std::memcpy(sc.bufOut.mapped, dc->shm.outPixels, bytes);
+    // ---- leg 2: the answer, composed back ----
     if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
-    Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT);
-    dc->vkCmdCopyBufferToImage(cb, sc.bufOut.buffer, swapchainImage,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    Barrier(dc, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
-    if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence), "vkQueueSubmit")) return false;
-    if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return false;
-    dc->vkResetFences(d, 1, &sc.fence);
+    if (!sc.comp->RecordCompose(cb, swapchainImage, fs)) {
+        dc->vkEndCommandBuffer(cb);
+        return false;
+    }
+    if (!runLeg()) return false;
     const double tReturn = time ? NowMs() : 0.0;
+
+    if (dc->shm.hdr) {
+        ShmStore64(dc->shm.hdr->layerFramesLo, dc->shm.hdr->layerFramesHi, ++dc->framesComposed);
+        dc->shm.hdr->layerWidth.store(sc.width);
+        dc->shm.hdr->layerHeight.store(sc.height);
+        dc->shm.hdr->layerFormat.store(uint32_t(sc.format));
+        dc->shm.hdr->layerCompositionUp.store(1);
+        dc->shm.hdr->layerMsBits.store(FloatToBits(float(tReturn - t0)));
+        dc->shm.hdr->layerHeartbeat.fetch_add(1);
+    }
 
     if (time) {
         static int frameNo = 0;
         if (++frameNo % TimeInterval() == 0) {
-            Log("[time] capture=%.2f helper=%.2f return=%.2f total=%.2f ms",
-                tCapture - t0, tHelper - tCapture, tReturn - tHelper, tReturn - t0);
+            Log("[time] encode=%.2f helper=%.2f resolve=%.2f total=%.2f ms (model %ux%u)",
+                tCapture - t0, tHelper - tCapture, tReturn - tHelper, tReturn - t0,
+                sc.comp->ModelWidth(), sc.comp->ModelHeight());
         }
     }
     return true;
@@ -879,9 +840,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             if (!sc.ready || dc->shm.dead) continue;
             const uint32_t waitCount = waitsConsumed ? 0u : pPresentInfo->waitSemaphoreCount;
             waitsConsumed = true;
-            uint32_t ow = 0, oh = 0;
             ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]], waitCount,
-                           pPresentInfo->pWaitSemaphores, &ow, &oh);
+                           pPresentInfo->pWaitSemaphores);
             // On failure we simply present the original frame (fail-open). The semaphores are still
             // consumed -- the capture submit waits on them before anything can fail -- so the flag
             // stays set and the present below still drops them.
