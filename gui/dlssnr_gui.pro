@@ -6,6 +6,7 @@ TEMPLATE = app
 INCLUDEPATH += $$PWD/../common
 
 SOURCES += \
+    ../layer_linux/src/hotkey.cpp \
     main.cpp \
     mainwindow.cpp \
     passdialog.cpp \

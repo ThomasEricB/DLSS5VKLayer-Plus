@@ -27,6 +27,7 @@
 
 #include "../../common/shm_protocol.h"
 #include "composition.h"
+#include "hotkey.h"
 #include "vk_table.h"
 
 #include <dlfcn.h>
@@ -331,6 +332,33 @@ static bool DuplicateLayerCopy() {
         return false;
     }();
     return dup;
+}
+
+// One set of keyboards for the process, however many devices the game creates.
+static dlssnr::Hotkeys g_hotkeys;
+
+// The key to watch, from the header if the interface has set one and from the environment otherwise,
+// so it can be bound in a launch option without the interface being involved.
+static uint32_t ToggleKey(const ShmHeader* hdr) {
+    static const uint32_t fromEnv = [] {
+        const char* v = getenv("DLSSNR_TOGGLE_KEY");
+        return v && *v ? dlssnr::KeyCodeFromName(v) : 0u;
+    }();
+    if (fromEnv) return fromEnv;
+    return hdr ? hdr->toggleKey.load() : 0u;
+}
+
+// Polled before anything asks whether the pass is enabled, because asking first would make turning it
+// off a one-way door: the early return would skip the very code that reads the key to turn it back on.
+static void PollHotkeys(DeviceChain* dc) {
+    if (!ShmOpen(dc->shm) || !dc->shm.hdr) return;
+    const uint32_t key = ToggleKey(dc->shm.hdr);
+    if (!key || !g_hotkeys.Pressed(key)) return;
+
+    const bool wasOn = dc->shm.hdr->enabled.load() != 0;
+    dc->shm.hdr->enabled.store(wasOn ? 0u : 1u);
+    dc->shm.hdr->controlSeq.fetch_add(1);
+    Log("[hotkey] %s -> neural rendering %s", dlssnr::KeyNameFromCode(key), wasOn ? "off" : "on");
 }
 
 static bool LayerEnabled() {
@@ -829,6 +857,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
 
     if (!dc->inert && LayerEnabled()) {
         std::lock_guard<std::mutex> lk(dc->lock);
+        PollHotkeys(dc);
         if (!ShmNeuralEnabled(dc->shm)) return dc->vkQueuePresentKHR(queue, pPresentInfo);
         uint32_t family = 0;
         auto qit = dc->queueFamilies.find(queue);

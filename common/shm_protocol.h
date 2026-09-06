@@ -232,6 +232,15 @@ struct ShmHeader {
     // Writes one set of matched before/after frames per session when the layer next presents.
     std::atomic<uint32_t> captureRequest;
 
+    // A Linux KEY_ code the layer watches to toggle the pass, or 0 for none. Unbound by default,
+    // because a key that does something unexpected is worse than a key that does nothing.
+    //
+    // Only useful where the layer can read the keyboard at all: an X11 or XWayland session, inside
+    // gamescope, or anywhere the user is in the 'input' group. A game presenting through winewayland
+    // is a Wayland client whose keys never reach this process, and keyboards get no uaccess ACL, so
+    // there the answer is a desktop shortcut bound to 'dlssnr-shmctl toggle enabled' instead.
+    std::atomic<uint32_t> toggleKey;
+
     // Which proxy the model is shown, and whether its answer is composed or substituted. See
     // ReversibleMode. Default 0 keeps the picture identical to the pre-import behaviour.
     std::atomic<uint32_t> reversibleMode;

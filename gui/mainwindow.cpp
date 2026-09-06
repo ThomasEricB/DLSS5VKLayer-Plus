@@ -2,6 +2,7 @@
 #include "passdialog.h"
 #include "../common/runner_discovery.h"
 #include "shm_binder.h"
+#include "../layer_linux/src/hotkey.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -495,6 +496,43 @@ QWidget* MainWindow::buildSettings() {
         binder->AddBool(f, "Swap sides", &ShmHeader::compareSwap,
                         "Which side the edited frame sits on. Worth having because the eye is not "
                         "even-handed about left and right.");
+
+        // The in-game key, and an honest account of when it can work.
+        //
+        // The layer has no window, so what it can read depends on the session. On a Wayland desktop a
+        // game's keys go to the compositor and never reach this process, and /dev/input is not
+        // readable without the 'input' group -- keyboards get no uaccess ACL, deliberately, because
+        // that would let any program keylog. Where the layer cannot read a key the desktop still can,
+        // so the command below is offered as the way that always works.
+        auto* keyCombo = new QComboBox(page);
+        keyCombo->addItem("None", 0u);
+        for (const char* name : { "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11",
+                                  "F12", "HOME", "END", "INSERT", "DELETE", "PAGEUP", "PAGEDOWN",
+                                  "PAUSE", "SCROLLLOCK", "GRAVE" })
+            keyCombo->addItem(name, dlssnr::KeyCodeFromName(name));
+        if (hdr) {
+            const int idx = keyCombo->findData(hdr->toggleKey.load());
+            keyCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+        }
+        keyCombo->setToolTip("Toggles the pass in game. Read by the layer, which works on an X11 or "
+                             "XWayland session and anywhere you are in the 'input' group. It cannot "
+                             "work for a game presenting through winewayland.");
+        f->addRow("Toggle key", keyCombo);
+        connect(keyCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, keyCombo](int) {
+            if (!hdr) return;
+            hdr->toggleKey.store(keyCombo->currentData().toUInt());
+            hdr->controlSeq.fetch_add(1);
+        });
+
+        auto* keyNote = new QLabel(
+            QString("If that key does nothing -- a Wayland game, or not in the 'input' group -- bind "
+                    "this to a shortcut in your desktop's own settings instead. That works over a "
+                    "fullscreen game and needs no permissions:\n\n    dlssnr-shmctl %1 toggle enabled")
+                .arg(shmPath),
+            page);
+        keyNote->setWordWrap(true);
+        keyNote->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        f->addRow(keyNote);
 
         auto* capRow = new QHBoxLayout;
         captureFrames = new QSpinBox(page);

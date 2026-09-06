@@ -64,6 +64,7 @@ const Setting kSettings[] = {
     { "reversible", &ShmHeader::reversibleMode, false, "0 knee, 1 neutwo, 2 replace, 3 hybrid, 4 hybrid+replace" },
     { "applymodel", &ShmHeader::applyModel, false, "0 show the clean frame, 1 apply the edit" },
     { "hold", &ShmHeader::holdFrame, false, "0/1 freeze the frame the pass works on" },
+    { "togglekey", &ShmHeader::toggleKey, false, "Linux KEY_ code the layer watches, 0 for none" },
 };
 
 void Usage() {
@@ -76,6 +77,7 @@ void Usage() {
                  "  resume          clear the quit flag and nudge the readers\n"
                  "  reset           re-initialise the whole header to defaults\n"
                  "  capture <n>     write n matched before/after frames\n"
+                 "  toggle <key>    flip a setting between 0 and 1\n"
                  "  set <key> <v>   change one setting\n"
                  "  settings        list the settings and their current values\n");
     std::fprintf(stderr, "\nsettings:\n");
@@ -180,7 +182,8 @@ int main(int argc, char** argv) {
     const char* cmd = argv[2];
 
     const bool create = std::strcmp(cmd, "resume") == 0 || std::strcmp(cmd, "reset") == 0 ||
-                        std::strcmp(cmd, "set") == 0 || std::strcmp(cmd, "capture") == 0;
+                        std::strcmp(cmd, "set") == 0 || std::strcmp(cmd, "capture") == 0 ||
+                        std::strcmp(cmd, "toggle") == 0;
 
     void* base = nullptr;
     int fd = -1;
@@ -213,6 +216,34 @@ int main(int argc, char** argv) {
             if (!Initialised(h)) ShmInitDefaults(h);
             h->captureRequest.store(uint32_t(std::atoi(argv[3])));
             h->controlSeq.fetch_add(1);
+        }
+    } else if (std::strcmp(cmd, "toggle") == 0) {
+        // The one command worth binding to a key.
+        //
+        // On Wayland a game is a client and its keys never reach this process, and /dev/input is not
+        // readable without the 'input' group -- keyboards get no uaccess ACL, deliberately, because
+        // that would let any program keylog. So on a Wayland game the layer cannot read a key at all,
+        // and the way to get an in-game toggle is to bind this command to a shortcut in the desktop's
+        // own settings, where the compositor already has the key and will deliver it over a fullscreen
+        // window.
+        if (argc != 4) { Usage(); rc = 2; }
+        else {
+            if (!Initialised(h)) ShmInitDefaults(h);
+            bool found = false;
+            for (const auto& st : kSettings) {
+                if (std::strcmp(st.name, argv[3]) != 0) continue;
+                found = true;
+                const uint32_t now = (h->*st.field).load();
+                const uint32_t next = now ? 0u : 1u;
+                (h->*st.field).store(st.isFloat ? FloatToBits(float(next)) : next);
+                h->controlSeq.fetch_add(1);
+                std::printf("%s=%u\n", st.name, next);
+                break;
+            }
+            if (!found) {
+                std::fprintf(stderr, "unknown setting: %s\n", argv[3]);
+                rc = 2;
+            }
         }
     } else if (std::strcmp(cmd, "set") == 0) {
         if (argc != 5) { Usage(); rc = 2; }
