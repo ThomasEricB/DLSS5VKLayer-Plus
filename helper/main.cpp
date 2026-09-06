@@ -95,6 +95,12 @@ static bool ShmOpen(ShmMap& s) {
     s.outPixels = s.inPixels + kMaxFrame;
     if (s.hdr->magic.load() != kShmMagic || s.hdr->version.load() != kShmVersion ||
         s.hdr->passes.load() == 0) {
+        // Loud, for the same reason the layer says it: a live process on the other side of a version
+        // mismatch silently resets this one's header back, and every setting looks dead.
+        if (s.hdr->magic.load() == kShmMagic && s.hdr->version.load() != kShmVersion)
+            Log("[helper] header is version %u but this helper is v%u -- another process is out of "
+                "date, re-initialising it; update the layer, the helper and the GUI together",
+                s.hdr->version.load(), kShmVersion);
         ShmInitDefaults(s.hdr);
     }
     if (s.hdr->quit.load()) Log("[helper] clearing stale quit flag");
@@ -828,11 +834,18 @@ struct NeuralState {
     bool passNeedsReset[kMaxPasses] = {};
     uint32_t livePasses = 0;
 
+    // A pass is dirty when the header's tuning for it no longer matches what its feature was built
+    // with. It keeps answering with the old tuning until the replacement is ready, so a retune is a
+    // swap inside one frame rather than a gap in the chain.
+    bool passDirty[kMaxPasses] = {};
+    NgxTuning lastSeenTuning[kMaxPasses] = {};
+
     // Rebuilds are spaced rather than done at once: back-to-back NGX creation exhausts the driver's
-    // latches and the model stops answering until the process restarts.
-    uint32_t lastTuningSeq = 0;
-    uint64_t frames = 0;
-    uint64_t buildAfter = 0;
+    // latches and the model stops answering until the process restarts. The spacing is wall-clock
+    // milliseconds from the header (0 = no spacing) rather than frames, because a frame-counted wait
+    // crawls on a 30 fps game and races on a 144 fps one.
+    double buildAfterMs = 0;
+    double tuningChangedMs = 0;
 
     uint64_t evaluates = 0;
 
@@ -853,8 +866,8 @@ struct NeuralState {
     bool pendingMvClear = false;  // scene cut: zero MVec inside the prep cmd
 };
 
-// How long to wait after a change before rebuilding, and between one rebuild and the next.
-static constexpr uint64_t kSettleFrames = 30;
+// How long to wait after a change before rebuilding, and between one rebuild and the next, is now
+// the header's rebuildSettleMs -- wall-clock milliseconds, user-adjustable, 0 meaning no spacing.
 
 static void SrcAccessForLayout(VkImageLayout layout, VkAccessFlags* a, VkPipelineStageFlags* s) {
     *a = 0; *s = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
@@ -2012,6 +2025,7 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     DestroyImage2D(ns.vk, ns.mv);
     DestroyImage2D(ns.vk, ns.depth);
     ns.livePasses = 0;
+    std::memset(ns.passDirty, 0, sizeof(ns.passDirty));
 
     if (!CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.colorIn) ||
         !CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.workA) ||
@@ -2075,12 +2089,14 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     }
 
     ns.tuning[0] = first;
+    ns.lastSeenTuning[0] = first;
     ns.passNeedsReset[0] = true;
     ns.livePasses = 1;
     ns.w = w;
     ns.h = h;
     ns.ready = true;
-    ns.buildAfter = ns.frames + kSettleFrames;
+    ns.tuningChangedMs = NowMs();
+    ns.buildAfterMs = NowMs() + shm.hdr->rebuildSettleMs.load();
 
     // The motion field's units go with the field, so they are set as soon as there is a feature to
     // tell. The per-pass resource binding happens in BindPass; this is the part that does not change
@@ -2126,67 +2142,104 @@ static void FillResource(NVSDK_NGX_Resource_VK& r, GpuImage& img, bool rw) {
 
 // Bring the built features into line with what the header asks for.
 //
-// One build per call and never before the settle window has passed. Both halves matter: NGX creation
-// is expensive and back-to-back creation exhausts the driver's latches, after which the model stops
-// answering until the process restarts.
+// A retuned pass is replaced on its own -- retuning pass 2 no longer tears down passes 0 and 1 --
+// and it keeps answering with the tuning it was built with until the replacement is ready, so a
+// slider change is a swap inside one frame rather than a gap in the chain. Builds are spaced by the
+// header's rebuildSettleMs rather than done back to back: NGX creation is expensive and back-to-back
+// creation exhausts the driver's latches, after which the model stops answering until the process
+// restarts. A spacing of 0 means no wait at all -- everything pending is built within this call.
 static void MaintainPasses(NeuralState& ns, ShmMap& shm, uint32_t wanted) {
     if (!ns.ready || ns.ngx.disabled) return;
+
+    const uint32_t spacing = shm.hdr->rebuildSettleMs.load();
+    const double now = NowMs();
 
     // Has anything the model latches at creation changed?
     //
     // Compared by value rather than by watching tuningSeq. The sequence is a hint, not the truth: a
     // header reset returns it to zero while this process still remembers a larger number, and the
     // change that follows then looks like no change at all. Seven atomic loads per live pass per
-    // frame is nothing next to a control that silently stops working.
-    {
-        ns.lastTuningSeq = shm.hdr->tuningSeq.load();
-        bool any = false;
+    // frame is nothing next to a control that silently stops working. Every new value re-arms the
+    // wait, so dragging a slider debounces rather than rebuilding at each tick.
+    auto scanDirty = [&]() -> int {
+        int first = -1;
         for (uint32_t i = 0; i < ns.livePasses; ++i) {
-            if (TuningFor(shm.hdr, i) != ns.tuning[i]) { any = true; break; }
+            const NgxTuning t = TuningFor(shm.hdr, i);
+            if (!(t == ns.lastSeenTuning[i])) { ns.lastSeenTuning[i] = t; ns.tuningChangedMs = now; }
+            ns.passDirty[i] = !(t == ns.tuning[i]);
+            if (ns.passDirty[i] && first < 0) first = (int)i;
         }
-        if (any) {
-            Log("[helper] model tuning changed; rebuilding %u pass(es) after a settle", ns.livePasses);
+        return first;
+    };
+
+    // With a spacing set, the buildAfterMs gate lets exactly one action through per call; with 0,
+    // every pending action runs here in order.
+    for (uint32_t guard = 0; guard < 2 * kMaxPasses; ++guard) {
+        const int dirty = scanDirty();
+
+        if (wanted < ns.livePasses) {
             vkDeviceWaitIdle(ns.vk.device);
-            NgxReleaseAllPasses(ns.ngx, ns.vk.device);
-            ns.livePasses = 0;
-
-            // ns.ready stays true on purpose. It means "the snippet is loaded and the surfaces
-            // exist", not "a feature is built" -- clearing it would send EnsureNeural back through
-            // NgxLoadAndInit, which reloads a 165 MB DLL and re-runs the caller spoof to rebuild
-            // something that only needed its features made again. The features come back through the
-            // build path below, one at a time.
-            ns.ngx.ready = true;
-            ns.buildAfter = ns.frames + kSettleFrames;
-            return;
+            for (uint32_t i = wanted; i < ns.livePasses; ++i) {
+                NgxReleasePass(ns.ngx, i, ns.vk.device);
+                ns.passDirty[i] = false;
+            }
+            ns.livePasses = wanted;
+            ns.buildAfterMs = now + spacing;
+            continue;
         }
-    }
 
-    if (wanted < ns.livePasses) {
-        vkDeviceWaitIdle(ns.vk.device);
-        for (uint32_t i = wanted; i < ns.livePasses; ++i) NgxReleasePass(ns.ngx, i, ns.vk.device);
-        ns.livePasses = wanted;
-        return;
-    }
+        if (now - ns.tuningChangedMs < (double)spacing || now < ns.buildAfterMs) break;
 
-    // Frames where nothing is built fail open: the layer presents the game's own frame, which is the
-    // right answer while the model has no feature to answer with.
-    if (wanted > ns.livePasses && ns.frames >= ns.buildAfter) {
-        const uint32_t pass = ns.livePasses;
-        NgxTuning t = TuningFor(shm.hdr, pass);
-        NgxSetCreateTuning(ns.ngx, t);
-        if (!BeginCmd(ns.vk.cmdCreate)) return;
-        const bool built = NgxCreatePass(ns.ngx, pass, ns.w, ns.h, ns.vk.cmdCreate);
-        SubmitAndWait(ns.vk, ns.vk.cmdCreate);
-        if (built) {
-            ns.tuning[pass] = t;
-            ns.passNeedsReset[pass] = true;
-            ns.livePasses = pass + 1;
-        } else {
-            // A later pass failing is a ceiling, not a fault: the chain simply runs at what fits.
-            Log("[helper] pass %u would not build; holding the chain at %u", pass, ns.livePasses);
-            shm.hdr->helperPassCeiling.store(ns.livePasses);
+        if (dirty >= 0) {
+            const uint32_t pass = (uint32_t)dirty;
+            Log("[helper] pass %u retuned; rebuilding it (spacing %u ms)", pass, spacing);
+            vkDeviceWaitIdle(ns.vk.device);
+            NgxReleasePass(ns.ngx, pass, ns.vk.device);
+            const NgxTuning t = TuningFor(shm.hdr, pass);
+            NgxSetCreateTuning(ns.ngx, t);
+            if (BeginCmd(ns.vk.cmdCreate)) {
+                const bool built = NgxCreatePass(ns.ngx, pass, ns.w, ns.h, ns.vk.cmdCreate);
+                SubmitAndWait(ns.vk, ns.vk.cmdCreate);
+                if (built) {
+                    ns.tuning[pass] = t;
+                    ns.lastSeenTuning[pass] = t;
+                    ns.passDirty[pass] = false;
+                    ns.passNeedsReset[pass] = true;
+                } else {
+                    // The chain skips the hole and the next settle retries the build.
+                    Log("[helper] pass %u rebuild failed; skipping it until it builds", pass);
+                }
+            }
+            ns.buildAfterMs = now + spacing;
+            continue;
         }
-        ns.buildAfter = ns.frames + kSettleFrames;
+
+        // Frames where nothing is built fail open: the layer presents the game's own frame, which is
+        // the right answer while the model has no feature to answer with.
+        if (wanted > ns.livePasses) {
+            const uint32_t pass = ns.livePasses;
+            const NgxTuning t = TuningFor(shm.hdr, pass);
+            NgxSetCreateTuning(ns.ngx, t);
+            if (!BeginCmd(ns.vk.cmdCreate)) return;
+            const bool built = NgxCreatePass(ns.ngx, pass, ns.w, ns.h, ns.vk.cmdCreate);
+            SubmitAndWait(ns.vk, ns.vk.cmdCreate);
+            if (built) {
+                ns.tuning[pass] = t;
+                ns.lastSeenTuning[pass] = t;
+                ns.passNeedsReset[pass] = true;
+                ns.livePasses = pass + 1;
+            } else {
+                // A later pass failing is a ceiling, not a fault: the chain simply runs at what fits.
+                Log("[helper] pass %u would not build; holding the chain at %u", pass, ns.livePasses);
+                shm.hdr->helperPassCeiling.store(ns.livePasses);
+                ns.buildAfterMs = now + spacing;
+                break;
+            }
+            ns.buildAfterMs = now + spacing;
+            continue;
+        }
+
+        break;
     }
 }
 
@@ -2196,7 +2249,6 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
 
     const size_t px = size_t(w) * h;
     const size_t bytes = px * 4;
-    ++ns.frames;
 
     if (!ShmNeuralEnabled(shm.hdr)) {
         std::memcpy(shm.outPixels, shm.inPixels, bytes);
@@ -2298,6 +2350,9 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     GpuImage* last = nullptr;
 
     for (uint32_t pass = 0; pass < passes; ++pass) {
+        // A failed rebuild leaves a hole; the chain runs without that pass rather than losing the
+        // frame with it.
+        if (!ns.ngx.features[pass]) continue;
         GpuImage *in = nullptr, *out = nullptr;
         BindPass(ns, pass, in, out);
 

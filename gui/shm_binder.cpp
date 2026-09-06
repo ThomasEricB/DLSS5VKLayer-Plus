@@ -25,15 +25,19 @@ void ShmBinder::Write(Field field, uint32_t raw, Latch latch) {
 }
 
 QCheckBox* ShmBinder::AddBool(QFormLayout* form, const QString& label, Field field, const QString& tip,
-                              Latch latch) {
+                              Latch latch, bool invert) {
     auto* w = new QCheckBox(label, _parent);
     w->setToolTip(tip);
     form->addRow(w);
-    connect(w, &QCheckBox::toggled, this, [this, field, latch](bool on) { Write(field, on ? 1u : 0u, latch); });
-    _reloaders.push_back([this, w, field] {
+    connect(w, &QCheckBox::toggled, this, [this, field, latch, invert](bool on) {
+        const bool v = invert ? !on : on;
+        Write(field, v ? 1u : 0u, latch);
+    });
+    _reloaders.push_back([this, w, field, invert] {
         if (!_hdr) return;
         QSignalBlocker block(w);
-        w->setChecked((_hdr->*field).load() != 0);
+        const bool v = (_hdr->*field).load() != 0;
+        w->setChecked(invert ? !v : v);
     });
     _reloaders.back()();
     return w;

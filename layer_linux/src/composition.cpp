@@ -61,6 +61,7 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
     s.applyModel = h->applyModel.load();
     s.holdFrame = h->holdFrame.load();
     s.downscaler = h->scalingDownscaler.load();
+    s.compositionBypass = h->compositionBypass.load();
 
     s.whitePointManual = BitsToFloat(h->whitePointBits.load());
     s.whitePointScale = BitsToFloat(h->whitePointScaleBits.load());
@@ -87,7 +88,8 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
     s.workingScale = clamp(s.workingScale, 0.25f, 2.0f, 1.0f);
     if (s.downscaler >= kScalerCount || s.downscaler == kScalerFsr1) s.downscaler = kScalerLanczos3;
 
-    if (s.transfer > 1) s.transfer = 1;
+    // Native + edit is mode 2; the clamp used to stop at 1 and silently killed it.
+    if (s.transfer > 2) s.transfer = 2;
     if (s.debugView > 3) s.debugView = 0;
     if (s.compareMode > 2) s.compareMode = 0;
     if (s.reversibleMode >= kReversibleModeCount) s.reversibleMode = kReversibleKnee;
@@ -525,6 +527,14 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.CompareSwap = s.compareSwap;
     c.ReversibleMode = s.reversibleMode;
     c.ApplyModel = s.applyModel;
+
+    // The model's answer IS the frame. The raw-answer debug path returns the model's picture ahead of
+    // every step of the composition -- no ratio, no guard, no blend, no compare -- and it returns
+    // before the normalisation step, so the scale that step would have applied has to come from here.
+    if (s.compositionBypass) {
+        c.DebugView = 2;
+        c.DebugScale = _linearHdr ? ResolvedWhitePoint(s) : 1.0f;
+    }
 
     // A frame the game already tone mapped goes through the encode untouched, and the composition
     // works in its units rather than normalising by a white point that means nothing here.

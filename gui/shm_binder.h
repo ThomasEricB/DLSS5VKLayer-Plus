@@ -37,8 +37,10 @@ class ShmBinder : public QObject {
 
     void SetHeader(ShmHeader* header) { _hdr = header; }
 
+    // invert: the checkbox reads as the opposite of the stored bit -- a box labelled "Enabled" over
+    // a field that stores the negative, like the composition switch over compositionBypass.
     QCheckBox* AddBool(QFormLayout* form, const QString& label, Field field, const QString& tip,
-                       Latch latch = Live);
+                       Latch latch = Live, bool invert = false);
     QSpinBox* AddInt(QFormLayout* form, const QString& label, Field field, int lo, int hi,
                      const QString& tip, Latch latch = Live);
     QDoubleSpinBox* AddFloat(QFormLayout* form, const QString& label, Field field, double lo, double hi,

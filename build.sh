@@ -65,10 +65,21 @@ if command -v qmake6 >/dev/null 2>&1; then
     # The binder's regression test. Offscreen, so it needs no display; run it with
     #   QT_QPA_PLATFORM=offscreen ./build/binder_test
     if pkg-config --exists Qt6Widgets; then
-        /usr/lib/qt6/moc -I gui -I common gui/shm_binder.h -o build/gui/moc_binder_test.cpp
-        g++ -O2 -std=c++17 -fPIC -I gui -I common $(pkg-config --cflags Qt6Widgets) \
-            test_gui/binder_test.cpp gui/shm_binder.cpp build/gui/moc_binder_test.cpp \
-            $(pkg-config --libs Qt6Widgets) -o build/binder_test
+        # Qt6 dropped QT_INSTALL_LIBEXECDIR, so probe PATH and the distro layouts instead.
+        MOC="$(command -v moc 2>/dev/null || true)"
+        if [ ! -x "$MOC" ]; then
+            for c in /usr/lib64/qt6/libexec/moc /usr/lib/qt6/libexec/moc /usr/lib/qt6/moc; do
+                if [ -x "$c" ]; then MOC="$c"; break; fi
+            done
+        fi
+        if [ -x "$MOC" ]; then
+            "$MOC" -I gui -I common gui/shm_binder.h -o build/gui/moc_binder_test.cpp
+            g++ -O2 -std=c++17 -fPIC -I gui -I common $(pkg-config --cflags Qt6Widgets) \
+                test_gui/binder_test.cpp gui/shm_binder.cpp build/gui/moc_binder_test.cpp \
+                $(pkg-config --libs Qt6Widgets) -o build/binder_test
+        else
+            echo "  binder_test skipped: moc not found"
+        fi
     fi
 else
     echo "  skipped: qmake6 not found"

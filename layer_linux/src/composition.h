@@ -56,6 +56,8 @@ struct FrameSettings {
     uint32_t applyModel = 1;
     uint32_t holdFrame = 0;
     uint32_t downscaler = kScalerLanczos3;
+    // 1: present the model's raw answer as the frame -- no blend, no guard, no compare.
+    uint32_t compositionBypass = 0;
 
     static FrameSettings Read(const ShmHeader* h);
 };

@@ -30,7 +30,7 @@
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
-static constexpr uint32_t kShmVersion = 4;
+static constexpr uint32_t kShmVersion = 6;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
@@ -341,6 +341,20 @@ struct ShmHeader {
     // How far the helper has answered *successfully*. seq_resp says a frame came back; this says it
     // was worth using, so the layer can present the game's own frame when it was not.
     std::atomic<uint32_t> seq_ok;
+
+    // 0: the composition blends the model's edit onto the frame under the strength and guard limits.
+    // 1: no composition at all -- the model's raw answer IS the presented frame, and the limits,
+    // enlargement and compare overlays are moot. Default 1: the composition is off until the user
+    // turns it on.
+    std::atomic<uint32_t> compositionBypass;
+
+    // Wall-clock milliseconds the helper waits after the last tuning change before it rebuilds a
+    // feature, and between one rebuild and the next. NGX creation is expensive and back-to-back
+    // creation was seen to exhaust the driver's latches on some setups, so the default spaces
+    // rebuilds rather than firing them at once; 0 means no spacing -- build the moment the change
+    // settles and chain the remaining builds back to back. It is time rather than frames because a
+    // frame-counted wait crawls on a 30 fps game and races on a 144 fps one.
+    std::atomic<uint32_t> rebuildSettleMs;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -356,7 +370,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1876, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1884, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -430,6 +444,8 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->mvecScaleMode.store(kMVecPixels);
     h->mvecQuality.store(kMVecBalanced);
     h->seq_ok.store(0);
+    h->compositionBypass.store(1);
+    h->rebuildSettleMs.store(250);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);
