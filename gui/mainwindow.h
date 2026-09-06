@@ -12,6 +12,7 @@ class QLabel;
 class QTimer;
 class QComboBox;
 class QLineEdit;
+class ShmBinder;
 
 class MainWindow : public QWidget {
     Q_OBJECT
@@ -22,7 +23,6 @@ public:
 private slots:
     void startHelper();
     void stopHelper();
-    void writeControls();
     void updateStatus();
 
 private:
@@ -36,6 +36,7 @@ private:
     void populateRunners();
     void applyRunnerSelection(int index);
     bool ensureShm();
+    QWidget* buildSettings();
 
     QString projectDir;
     QString helperCliPath;
@@ -56,18 +57,16 @@ private:
     QPushButton* startBtn = nullptr;
     QPushButton* stopBtn = nullptr;
     QPushButton* passBtn = nullptr;
+    QPushButton* captureBtn = nullptr;
     QPushButton* browseRunnerBtn = nullptr;
     QComboBox* runnerCombo = nullptr;
     QLineEdit* runnerPathEdit = nullptr;
     QLabel* statusLabel = nullptr;
+    QLabel* costLabel = nullptr;
+    QLabel* whitePointLabel = nullptr;
+    QSpinBox* captureFrames = nullptr;
     QProcess* statusProcess = nullptr;
     bool helperRunning = false;
 
-    QCheckBox* enabledBox = nullptr;
-    QSpinBox* passesSpin = nullptr;
-    QDoubleSpinBox* intensitySpin = nullptr;
-    QDoubleSpinBox* localToneSpin = nullptr;
-    QDoubleSpinBox* localStructureSpin = nullptr;
-    QDoubleSpinBox* skinStructureSpin = nullptr;
-    QDoubleSpinBox* sharpnessSpin = nullptr;
+    ShmBinder* binder = nullptr;
 };

@@ -36,6 +36,15 @@ echo "[5/5] Qt helper GUI"
 if command -v qmake6 >/dev/null 2>&1; then
     mkdir -p build/gui
     (cd build/gui && qmake6 ../../gui/dlssnr_gui.pro && make -j"$(nproc)")
+
+    # The binder's regression test. Offscreen, so it needs no display; run it with
+    #   QT_QPA_PLATFORM=offscreen ./build/binder_test
+    if pkg-config --exists Qt6Widgets; then
+        /usr/lib/qt6/moc -I gui -I common gui/shm_binder.h -o build/gui/moc_binder_test.cpp
+        g++ -O2 -std=c++17 -fPIC -I gui -I common $(pkg-config --cflags Qt6Widgets) \
+            test_gui/binder_test.cpp gui/shm_binder.cpp build/gui/moc_binder_test.cpp \
+            $(pkg-config --libs Qt6Widgets) -o build/binder_test
+    fi
 else
     echo "  skipped: qmake6 not found"
 fi
@@ -69,6 +78,7 @@ echo "  build/smoke.exe"
 echo "  build/runner_probe"
 echo "  build/dlssnr-shmctl"
 echo "  build/gui/dlssnr_gui (if Qt6/qmake6 is available)"
+echo "  build/binder_test    (QT_QPA_PLATFORM=offscreen ./build/binder_test)"
 echo
 echo "use it:"
 echo "  GUI: ./build/gui/dlssnr_gui          # start/stop helper + live settings"

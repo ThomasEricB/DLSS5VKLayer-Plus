@@ -90,13 +90,23 @@ enum ReversibleMode : uint32_t {
     kReversibleModeCount = 5,
 };
 
-// The filter that brings the model's answer back down when it ran above native resolution.
-// Only consulted when the working scale is above 1.0.
+// The filter that brings the model's answer back down when it ran above native resolution. Only
+// consulted when the working scale is above 1.0.
+//
+// These are OptiScaler's own Scaler numbers, kept identical so a value copied from an OptiScaler
+// profile means the same thing here. FSR1 keeps slot 0 for that reason even though this pass cannot
+// use it -- it wants a different constant block, and it is an upscaler rather than the averaging
+// filter the down-leg needs. A header asking for it falls back to Lanczos3.
 enum Downscaler : uint32_t {
-    kDownscaleBilinear = 0,
+    kDownscaleFsr1 = 0,  // unsupported here; reserved so the numbering matches upstream
     kDownscaleBicubic = 1,
-    kDownscaleLanczos3 = 2,  // upstream's default: the sharp one
-    kDownscalerCount = 3,
+    kDownscaleCatmullRom = 2,
+    kDownscaleLanczos2 = 3,
+    kDownscaleLanczos3 = 4,  // upstream's default: the sharp one
+    kDownscaleKaiser2 = 5,
+    kDownscaleKaiser3 = 6,
+    kDownscaleMagic = 7,
+    kDownscalerCount = 8,
 };
 
 // What the helper has managed to do, for the GUI and for the layer's fail-open decision.

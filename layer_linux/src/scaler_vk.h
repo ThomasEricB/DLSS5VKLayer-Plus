@@ -35,6 +35,12 @@ enum ScalerFilter : uint32_t {
     kScalerCount = 8,
 };
 
+// The protocol carries this number, so the two enumerations have to agree. They are separate types
+// because the layer should not have to include the shared header to name a filter -- but a mismatch
+// between them was a real bug: the default came out as Catmull-Rom because the protocol's older,
+// narrower numbering put Lanczos3 at 2.
+static_assert(kScalerLanczos3 == 4, "the protocol's Downscaler numbering must match this one");
+
 const char* ScalerFilterName(uint32_t filter);
 
 class ScalerVk : public Shader_Vk {
