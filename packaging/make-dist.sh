@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="${DLSSNR_VERSION:-0.2.1}"
+VERSION="${DLSSNR_VERSION:-0.2.2}"
 RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
 RELEASE="${RELEASE:-1}"
 DIST="dist"
@@ -54,13 +54,15 @@ stage_variant() {
   # One manifest per architecture, each naming its own library and its own layer name. The loader
   # keys implicit layers by name, so sharing one name means it keeps a single entry and then rejects
   # it for the wrong word size -- which is why Steam's overlay is _32 beside _64.
-  sed "s#./libVkLayer_NV_dlssnr.so#/usr/lib64/dlssnr/layer/libVkLayer_NV_dlssnr.so#" \
+  sed -e "s#./libVkLayer_NV_dlssnr.so#/usr/lib64/dlssnr/layer/libVkLayer_NV_dlssnr.so#" \
+      -e 's#"implementation_version"#"library_arch": "64",\n    "implementation_version"#' \
     layer_linux/manifest/VK_LAYER_NV_dlssnr.json \
     > "$root/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.x86_64.json"
 
   if [ -f "$BUILD/layer32/libVkLayer_NV_dlssnr.so" ]; then
     sed -e "s#./libVkLayer_NV_dlssnr.so#/usr/lib64/dlssnr/layer32/libVkLayer_NV_dlssnr.so#" \
         -e 's#"VK_LAYER_NV_dlssnr"#"VK_LAYER_NV_dlssnr_32"#' \
+        -e 's#"implementation_version"#"library_arch": "32",\n    "implementation_version"#' \
       layer_linux/manifest/VK_LAYER_NV_dlssnr.json \
       > "$root/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.i686.json"
   fi

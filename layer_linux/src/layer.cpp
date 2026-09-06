@@ -333,8 +333,18 @@ static bool ShmOpen(ShmMap& s) {
     s.hdr = (ShmHeader*)m;
     // A mapping left by an older build has a different magic, a different version, or a header
     // laid out differently; re-initialising is the only safe reading of any of those.
+    //
+    // But say so, loudly. A live process on the other side of the mismatch keeps re-initialising the
+    // other way, and the two then silently reset each other's settings forever -- the layer keeps
+    // composing with its old field set and every setting the newer side writes is invisible. That is
+    // indistinguishable from "the new feature does nothing", which is how a stale layer reads until
+    // someone checks the log.
     if (s.hdr->magic.load() != kShmMagic || s.hdr->version.load() != kShmVersion ||
         s.hdr->passes.load() == 0) {
+        if (s.hdr->magic.load() == kShmMagic && s.hdr->version.load() != kShmVersion)
+            Log("[shm] header is version %u but this layer is v%u -- another process is out of date, "
+                "re-initialising it; update the layer, the helper and the GUI together",
+                s.hdr->version.load(), kShmVersion);
         ShmInitDefaults(s.hdr);
     }
     s.lastHeartbeat = s.hdr->heartbeat.load();

@@ -6,6 +6,7 @@
 #include "guard.h"
 #include "logging.h"
 #include "ngx_param.h"
+#include <chrono>
 #include <cstring>
 
 namespace dlssnr {
@@ -480,10 +481,13 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
     if (s.features[pass]) return true;
 
     DWORD seh = 0;
+    const auto t0 = std::chrono::steady_clock::now();
     NVSDK_NGX_Result createResult = CallCreateSafely(s.createFeature, recordingCmd,
         FEATURE_DLSSNR, s.params, &s.features[pass], &seh);
-    Log("[ngx] VULKAN_CreateFeature(18) pass %u -> %#x seh=%#x handle=%p size=%ux%u",
-        pass, (uint32_t)createResult, seh, (void*)s.features[pass], width, height);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    Log("[ngx] VULKAN_CreateFeature(18) pass %u -> %#x seh=%#x handle=%p size=%ux%u in %.0f ms",
+        pass, (uint32_t)createResult, seh, (void*)s.features[pass], width, height, ms);
     if (!NVSDK_NGX_SUCCEED(createResult) || !s.features[pass]) {
         s.features[pass] = nullptr;
         // Only the first pass failing is fatal; a later one failing simply caps the chain, which is
