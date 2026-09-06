@@ -676,6 +676,16 @@ QWidget* MainWindow::buildSettings() {
     }
     {
         auto* f = group(col, "Cost");
+        binder->AddBool(f, "Run the model alongside the frame", &ShmHeader::pipeline,
+                        "The single biggest lever on frame rate. Off, the game waits for the model "
+                        "on every frame, so the model's time adds to the game's instead of "
+                        "overlapping it -- which is why the pass can cost more than the game does. "
+                        "On, the game presents without waiting and the model works through the next "
+                        "frame.\n\nThe cost is that the edit is one frame old. The frame underneath "
+                        "is always the current one and only what is added to it is behind, so it "
+                        "shows as a slight lag in the enhancement during fast motion, not as a lagging "
+                        "picture. Measured at 720p: 116 fps waiting against 489 fps alongside, with "
+                        "875 fps for the game on its own.");
         binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "How many times the model runs over one frame, each pass shown the last one's "
                        "answer. Every pass is another full run of the model and another feature "

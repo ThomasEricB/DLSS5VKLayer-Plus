@@ -1,4 +1,6 @@
 #include "composition.h"
+
+#include <cstdlib>
 #include "log.h"
 
 #include <algorithm>
@@ -46,7 +48,16 @@ bool ColourIsLinearHdr(VkFormat swapchainFormat, uint32_t colourMode) {
 FrameSettings FrameSettings::Read(const ShmHeader* h) {
     FrameSettings s;
     if (!h) return s;
-    s.pipelined = ShmPipelined(h);
+    // DLSSNR_PIPELINE overrides the header either way, so it can be set in a launch option without
+    // the interface being involved -- and so a game can be started with it off when the header says
+    // on, which is the shape a bug report needs.
+    {
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_PIPELINE");
+            return v && *v ? (v[0] == '1' ? 1 : 0) : -1;
+        }();
+        s.pipelined = forced >= 0 ? (forced == 1) : ShmPipelined(h);
+    }
     s.transferStrength = BitsToFloat(h->transferStrengthBits.load());
     s.colourStrength = BitsToFloat(h->colourStrengthBits.load());
     s.maxRatio = BitsToFloat(h->maxRatioBits.load());

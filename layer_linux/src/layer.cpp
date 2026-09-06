@@ -1229,6 +1229,15 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             dc->shm.hdr->layerMeasuredWhiteBits.store(FloatToBits(sc.comp->MeasuredWhitePoint()));
             dc->shm.hdr->layerHeartbeat.fetch_add(1);
         }
+
+        if (time) {
+            static int frameNo = 0;
+            if (++frameNo % TimeInterval() == 0) {
+                Log("[time] alongside=%.2f ms (model %ux%u, answer %s)", NowMs() - t0,
+                    sc.comp->ModelWidth(), sc.comp->ModelHeight(),
+                    haveAnswer ? "new this frame" : "carried from an earlier one");
+            }
+        }
         return true;
     }
 
