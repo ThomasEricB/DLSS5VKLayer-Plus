@@ -22,8 +22,9 @@ echo "[3/5] smoke .exe"
 x86_64-w64-mingw32-g++ -O2 -std=c++17 -static $VK_INC -idirafter /usr/include \
     test_layer/smoke.cpp -o build/smoke.exe
 
-echo "[4/5] runner probe"
+echo "[4/5] runner probe + shm control"
 g++ -O2 -std=c++17 -Wall common/runner_discovery.cpp tools/runner_probe.cpp -o build/runner_probe
+g++ -O2 -std=c++17 -Wall tools/shmctl.cpp -o build/dlssnr-shmctl
 
 echo "[5/5] Qt helper GUI"
 if command -v qmake6 >/dev/null 2>&1; then
@@ -60,6 +61,7 @@ echo "  build/layer/libVkLayer_NV_dlssnr.so (+ installed implicit manifest)"
 echo "  build/dlssnr_helper.exe"
 echo "  build/smoke.exe"
 echo "  build/runner_probe"
+echo "  build/dlssnr-shmctl"
 echo "  build/gui/dlssnr_gui (if Qt6/qmake6 is available)"
 echo
 echo "use it:"

@@ -78,7 +78,7 @@ sed "s#/usr/lib64/dlssnr/layer/libVkLayer_NV_dlssnr.so#$LIBDIR/layer/libVkLayer_
   "$root/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.json" \
   > "$MANIFEST_DIR/VK_LAYER_NV_dlssnr.json"
 
-chmod 755 "$BINDIR/dlssnr-helper" "$BINDIR/dlssnr-gui" "$LIBDIR/bin/runner_probe" 2>/dev/null || true
+chmod 755 "$BINDIR/dlssnr-helper" "$BINDIR/dlssnr-gui" "$LIBDIR/bin/runner_probe" "$LIBDIR/bin/dlssnr-shmctl" 2>/dev/null || true
 chmod 755 "$LIBDIR/layer/libVkLayer_NV_dlssnr.so" 2>/dev/null || true
 chmod 755 "$LIBDIR/helper/dlssnr_helper.exe" 2>/dev/null || true
 

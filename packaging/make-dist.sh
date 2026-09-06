@@ -12,6 +12,7 @@ export DLSSNR_SKIP_MANIFEST_INSTALL=1
 
 [ -f "$BUILD/dlssnr_helper.exe" ] || ./build.sh
 [ -f "$BUILD/runner_probe" ] || ./build.sh
+[ -f "$BUILD/dlssnr-shmctl" ] || ./build.sh
 [ -f "$BUILD/gui/dlssnr_gui" ] || ./build.sh
 
 mkdir -p "$DIST"
@@ -36,6 +37,7 @@ stage_variant() {
   cp "$BUILD/layer/libVkLayer_NV_dlssnr.so" "$root/usr/lib64/dlssnr/layer/"
   cp "$BUILD/dlssnr_helper.exe" "$root/usr/lib64/dlssnr/helper/"
   cp "$BUILD/runner_probe" "$root/usr/lib64/dlssnr/bin/"
+  cp "$BUILD/dlssnr-shmctl" "$root/usr/lib64/dlssnr/bin/"
   cp "$BUILD/gui/dlssnr_gui" "$root/usr/bin/dlssnr-gui"
   cp dlssnr-helper "$root/usr/bin/dlssnr-helper"
   ln -sf ../lib64/dlssnr/bin/runner_probe "$root/usr/bin/dlssnr-runner-probe"
@@ -50,7 +52,7 @@ stage_variant() {
 
   chmod 755 "$pkg_dir/install.sh" "$pkg_dir/uninstall.sh"
   chmod 755 "$root/usr/bin/dlssnr-helper" "$root/usr/bin/dlssnr-gui"
-  chmod 755 "$root/usr/lib64/dlssnr/bin/runner_probe"
+  chmod 755 "$root/usr/lib64/dlssnr/bin/runner_probe" "$root/usr/lib64/dlssnr/bin/dlssnr-shmctl"
   chmod 755 "$root/usr/lib64/dlssnr/layer/libVkLayer_NV_dlssnr.so"
   chmod 755 "$root/usr/lib64/dlssnr/helper/dlssnr_helper.exe"
 

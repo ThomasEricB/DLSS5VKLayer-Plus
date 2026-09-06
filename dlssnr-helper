@@ -219,6 +219,41 @@ detect_runner_probe() {
   return 1
 }
 
+detect_shmctl() {
+  local d c
+  d="$(detect_install_dir)"
+  for c in \
+    "$d/build/dlssnr-shmctl" \
+    "$d/bin/dlssnr-shmctl" \
+    "$d/dlssnr-shmctl" \
+    "/usr/lib64/dlssnr/bin/dlssnr-shmctl" \
+    "/usr/lib/dlssnr/bin/dlssnr-shmctl" \
+    "/usr/bin/dlssnr-shmctl" \
+    "$HOME/.local/lib/dlssnr/bin/dlssnr-shmctl"; do
+    if [ -x "$c" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Read or write the shared-memory header.
+#
+# This used to be `dd bs=1 seek=20`, a hardcoded byte offset into a C++ struct. It was right for one
+# header layout and silently wrong for the next: what sat at offset 20 became the frame height, so
+# the line that stopped the helper would have corrupted the frame size instead. dlssnr-shmctl
+# includes the header and derives its own offsets.
+shm_control() {
+  local tool
+  tool="$(detect_shmctl || true)"
+  if [ -z "$tool" ]; then
+    echo "warning: dlssnr-shmctl not found; cannot $1 the shared-memory header" >&2
+    return 1
+  fi
+  "$tool" "$shm" "$1"
+}
+
 proton_score() {
   local name="$1" v base=700000
   case "$name" in
@@ -508,7 +543,7 @@ cmd_start() {
   mkdir -p "$(dirname "$log")" "$(dirname "$shm")"
   ( umask 077; touch "$shm" )
   chmod 600 "$shm" 2>/dev/null || true
-  printf '\x00\x00\x00\x00' | dd of="$shm" bs=1 seek=20 count=4 conv=notrunc status=none 2>/dev/null || true
+  shm_control resume
 
   export WINEPREFIX="$WINE_PREFIX_DIR"
   export DLSSNR_SHM="$shm"
@@ -576,7 +611,7 @@ cmd_stop() {
   local pids pid
 
   if [ -f "$shm" ]; then
-    printf '\x01\x00\x00\x00' | dd of="$shm" bs=1 seek=20 count=4 conv=notrunc status=none 2>/dev/null || true
+    shm_control quit
   fi
 
   if running_pid; then
