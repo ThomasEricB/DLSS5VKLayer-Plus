@@ -96,12 +96,16 @@ if [ "${DLSSNR_SKIP_MANIFEST_INSTALL:-0}" != "1" ]; then
     # One manifest per architecture, each naming its own library. The loader reads every manifest in
     # the directory and skips the one whose library is the wrong word size, which is exactly how Steam
     # ships its own overlay (steamoverlay_i386.json beside steamoverlay_x86_64.json).
-    sed "s#./libVkLayer_NV_dlssnr.so#$PWD/build/layer/libVkLayer_NV_dlssnr.so#" \
+    # library_arch lets the loader skip the manifest for the other word size by reading it, rather
+    # than by trying to dlopen the library and reporting "wrong ELF class" for every process.
+    sed -e "s#./libVkLayer_NV_dlssnr.so#$PWD/build/layer/libVkLayer_NV_dlssnr.so#" \
+        -e 's#"implementation_version"#"library_arch": "64",\n    "implementation_version"#' \
         layer_linux/manifest/VK_LAYER_NV_dlssnr.json > "$IMPLICIT_DIR/VK_LAYER_NV_dlssnr.x86_64.json"
 
     if [ -f build/layer32/libVkLayer_NV_dlssnr.so ]; then
         sed -e "s#./libVkLayer_NV_dlssnr.so#$PWD/build/layer32/libVkLayer_NV_dlssnr.so#" \
             -e 's#"VK_LAYER_NV_dlssnr"#"VK_LAYER_NV_dlssnr_32"#' \
+            -e 's#"implementation_version"#"library_arch": "32",\n    "implementation_version"#' \
             layer_linux/manifest/VK_LAYER_NV_dlssnr.json > "$IMPLICIT_DIR/VK_LAYER_NV_dlssnr.i686.json"
     else
         rm -f "$IMPLICIT_DIR/VK_LAYER_NV_dlssnr.i686.json"
