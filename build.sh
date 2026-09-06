@@ -10,8 +10,11 @@ mkdir -p build/layer
 VK_INC="-I standalone_runner/third_party"
 
 echo "[1/5] Linux layer .so"
-g++ -O2 -std=c++17 -shared -fPIC -Wall $VK_INC \
-    layer_linux/src/layer.cpp -o build/layer/libVkLayer_NV_dlssnr.so -lpthread
+g++ -O2 -std=c++17 -shared -fPIC -Wall $VK_INC -I layer_linux/src \
+    layer_linux/src/layer.cpp \
+    layer_linux/src/shader_vk.cpp \
+    layer_linux/src/dlssnr_pass.cpp \
+    -o build/layer/libVkLayer_NV_dlssnr.so -lpthread
 cp layer_linux/manifest/VK_LAYER_NV_dlssnr.json build/layer/
 
 echo "[2/5] Windows helper .exe"
