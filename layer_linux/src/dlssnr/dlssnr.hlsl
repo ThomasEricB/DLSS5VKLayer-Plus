@@ -233,10 +233,21 @@ Texture2D<float4>   gExposure : register(t4);
 #ifdef VK_MODE
 [[vk::binding(5, 0)]]
 #endif
+// Declared with no format, deliberately.
+//
+// One binding serves surfaces of three different formats here -- R8G8B8A8_UNORM for the proxy, the
+// swapchain's own UNORM twin for the composed frame, R16G16B16A16_SFLOAT where that twin cannot be
+// written as a storage image -- so no single format operand can be right for all of them. Declaring
+// Rgba32f and binding something else is undefined behaviour, and undefined values in one channel is
+// what a magenta or blue pixel is. Unknown makes the write take its format from the view, which is
+// what this pass has always needed; it costs the shaderStorageImageWriteWithoutFormat feature, which
+// the layer enables on the device.
+[[vk::image_format("unknown")]]
 RWTexture2D<float4> gTarget   : register(u0);  // encode: the proxy. resolve: the frame.
 #ifdef VK_MODE
 [[vk::binding(6, 0)]]
 #endif
+[[vk::image_format("unknown")]]
 RWTexture2D<float4> gKeep     : register(u1);  // encode: the untouched copy. unused by the resolve.
 #ifdef VK_MODE
 [[vk::binding(7, 0)]]

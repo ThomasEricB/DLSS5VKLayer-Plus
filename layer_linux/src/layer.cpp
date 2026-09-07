@@ -916,6 +916,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     dci.enabledExtensionCount = uint32_t(deviceExts.size());
     dci.ppEnabledExtensionNames = deviceExts.empty() ? nullptr : deviceExts.data();
 
+    // Ask for the one feature the composition shader needs.
+    //
+    // Its storage images are declared with no format, because one binding serves surfaces of three
+    // different formats and no single operand is right for all of them. That is what the pass has
+    // always needed; declaring a format it does not bind is undefined behaviour, and undefined values
+    // in a channel is what a magenta or blue pixel is.
+    //
+    // Written wherever the game put its features: into VkPhysicalDeviceFeatures2 in the pNext chain
+    // if it used that, into a copy of pEnabledFeatures otherwise, and into a fresh one if it asked
+    // for no features at all. Only ever setting a bit, never clearing one.
+    VkPhysicalDeviceFeatures ownFeatures{};
+    if (pCreateInfo->pEnabledFeatures) ownFeatures = *pCreateInfo->pEnabledFeatures;
+    VkPhysicalDeviceFeatures2* chained = nullptr;
+    for (auto* n = (VkBaseOutStructure*) const_cast<void*>(pCreateInfo->pNext); n; n = n->pNext) {
+        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            chained = (VkPhysicalDeviceFeatures2*) n;
+            break;
+        }
+    }
+    if (chained) {
+        chained->features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    } else {
+        ownFeatures.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+        dci.pEnabledFeatures = &ownFeatures;
+    }
+
     // The chain link the next layer reads. Saved because a retry has to hand the rest of the chain
     // the same starting point; the layers below advance it themselves as they call down.
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
