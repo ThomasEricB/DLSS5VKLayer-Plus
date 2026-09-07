@@ -193,6 +193,7 @@ void Composition::DropAll() {
     _superUp.reset();
     _superDown.reset();
     _crossfade.reset();
+    _globalMotion.reset();
     _settled = false;
     _targetValid = false;
     _superSample = false;
@@ -507,6 +508,13 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
     if (!_crossfade->CanRender()) {
         Log("[comp] the settle blend could not be built; a new answer will be taken whole");
         _crossfade.reset();
+    }
+
+    _globalMotion = std::make_unique<GlobalMotionVk>(_vk, _instance, _device, _physicalDevice, width, height);
+    if (!_globalMotion->CanRender()) {
+        Log("[comp] the global motion estimate could not be built; the pipelined path falls back to "
+            "the helper's field");
+        _globalMotion.reset();
     }
 
     if (!ok || !okWork || !okMeter || !okSuper) {
@@ -960,11 +968,29 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     Transition(cb, _keep, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     Transition(cb, _composed, VK_IMAGE_LAYOUT_GENERAL);
 
+    // Measure how far the picture has moved since the frame this answer belongs to.
+    //
+    // Both ends of that interval are right here: the proxy kept aside when the request went out, and
+    // the one just encoded. The helper's field cannot answer this -- it only ever sees one frame per
+    // round trip, so what it measures is the interval *before* the answer's frame, the right length
+    // through the wrong window. This measures the window that matters.
+    bool globalMotion = false;
+    if (s.pipelined && sent && _globalMotion) {
+        Image* stale = _proxyTarget.image ? &_proxyTarget : nullptr;
+        if (blending && _proxySent.image) stale = &_proxySent;
+        if (stale) {
+            Transition(cb, _proxy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            Transition(cb, *stale, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            globalMotion = _globalMotion->Record(cb, _proxy.view, stale->view);
+            if (globalMotion) _globalMotion->BarrierResultForRead(cb);
+        }
+    }
+
     DlssNrConstants res = BaseConstants(s);
     res.Mode = DlssNrMode_Resolve;
     res.Width = _width;
     res.Height = _height;
-    const bool reproject = s.pipelined && sent && _motionValid && _motion.image;
+    const bool reproject = s.pipelined && sent && (globalMotion || (_motionValid && _motion.image));
     if (s.pipelined) {
         static bool said = false;
         if (!said) {
@@ -974,7 +1000,16 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         }
     }
     res.ReprojectEdit = reproject ? 1u : 0u;
-    if (reproject) {
+    VkImageView motionView = _motion.view;
+    if (reproject && globalMotion) {
+        // One texel, sampled everywhere, which is a global translation expressed as a motion field.
+        // The guide size is the frame's own, because the estimate is already in the frame's pixels.
+        motionView = _globalMotion->ResultView();
+        res.MvScaleX = 1.0f;
+        res.MvScaleY = 1.0f;
+        res.GuideWidth = _width;
+        res.GuideHeight = _height;
+    } else if (reproject) {
         // The field is in pixels of the frame, which is what the estimate produces, and covers the
         // whole frame.
         //
@@ -1009,7 +1044,7 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         Transition(cb, _motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     if (!_pass->Dispatch(cb, res, _width, _height, source->view, answer->view, _keep.view,
-                         reproject ? _motion.view : VK_NULL_HANDLE, _composed.view, VK_NULL_HANDLE))
+                         reproject ? motionView : VK_NULL_HANDLE, _composed.view, VK_NULL_HANDLE))
         return false;
 
     Transition(cb, _composed, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);

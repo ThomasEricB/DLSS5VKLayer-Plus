@@ -20,6 +20,7 @@
 // goes in the constant block.
 #include "capture.h"
 #include "crossfade/crossfade_vk.h"
+#include "motion/globalmotion_vk.h"
 #include "dlssnr_pass.h"
 #include "scaler_vk.h"
 #include "vk_table.h"
@@ -277,6 +278,11 @@ class Composition {
     // walked toward them over a few frames rather than replaced between one frame and the next.
     Image _proxyTarget{}, _workTarget{}, _modelTarget{};
     std::unique_ptr<CrossfadeVk> _crossfade;
+
+    // Measures, in the layer, how far the picture moved between the frame the answer belongs to and
+    // this one. That is the interval the composition actually needs, and the only place both ends of
+    // it exist. See globalmotion.comp.
+    std::unique_ptr<GlobalMotionVk> _globalMotion;
 
     // Set once the running pair holds a real answer. Until then there is nothing to walk away from
     // and the first arrival is taken whole -- blending toward it out of an uninitialised surface

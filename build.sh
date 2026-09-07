@@ -16,7 +16,8 @@ LAYER_SRC="layer_linux/src/layer.cpp
     layer_linux/src/capture.cpp
     layer_linux/src/scaler_vk.cpp
     layer_linux/src/hotkey.cpp
-    layer_linux/src/crossfade/crossfade_vk.cpp"
+    layer_linux/src/crossfade/crossfade_vk.cpp
+    layer_linux/src/motion/globalmotion_vk.cpp"
 
 echo "[1/5] Linux layer .so (64-bit)"
 # Keep the loader's entry points, and nothing else, visible -- and bind our own references to them

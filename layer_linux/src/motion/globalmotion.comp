@@ -1,0 +1,163 @@
+#version 450
+// How far the picture has moved since the frame the model's answer belongs to.
+//
+// The pipelined path lays an edit computed on an earlier frame onto the current one. The edit is
+// therefore in the wrong place by however much the picture moved in between -- measured at about
+// 17 ms, which during an ordinary turn is on the order of a hundred pixels. That displacement is the
+// ghost, and no threshold removes it, because the edit is not doubtful, it is misplaced.
+//
+// The helper's optical flow was meant to correct this and cannot, for a reason that is structural
+// rather than a matter of tuning: the helper only receives one frame per round trip, so its field
+// describes the interval *before* the answer's frame rather than the interval since. It is the right
+// length and the wrong window.
+//
+// The layer has both endpoints of the right window sitting in memory already. _proxySent is the
+// picture the answer was computed from; _proxy is this frame. The displacement between those two is
+// exactly what the composition needs, and estimating it as a single global translation fits two
+// parameters to thousands of samples -- hugely overdetermined, and so far more robust than a dense
+// per-pixel field over the same large displacement.
+//
+// Global translation captures camera yaw and pitch, which is the motion that produces the artifact:
+// over a small angle a rotation moves the whole picture by very nearly a constant, and unlike
+// translation of the camera it does so independently of depth -- which matters because this layer
+// only ever sees the finished frame and has no depth buffer to consult.
+//
+// Three entry points, selected at compile time, so the pipeline stays three small dispatches whose
+// cost does not grow with the frame: the working images are a fixed size whatever the display is.
+
+// 256 lanes. The match pass is the expensive one and it reduces over the whole working image, so the
+// wider the workgroup the fewer passes each lane makes over it. The reduce and pick passes do not
+// care -- reduce is dispatched over its own output and pick is a single lane -- so one size serves.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#if defined(PASS_REDUCE)
+// Full-resolution proxy -> a small luma image. Bilinear, so the reduction is an average rather than a
+// sample, which is what keeps a one-pixel-per-frame motion visible after the shrink.
+layout(binding = 0) uniform Params { uvec2 dstSize; uvec2 pad; } pc;
+layout(binding = 1) uniform sampler2D uSrc;
+layout(r32f, binding = 2) uniform writeonly image2D uDst;
+
+void main() {
+    ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+    if (id.x >= int(pc.dstSize.x) || id.y >= int(pc.dstSize.y)) return;
+    vec2 uv = (vec2(id) + 0.5) / vec2(pc.dstSize);
+    vec3 c = texture(uSrc, uv).rgb;
+    imageStore(uDst, id, vec4(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0, 0, 1));
+}
+
+#elif defined(PASS_MATCH)
+// One workgroup per candidate offset; each reduces the absolute difference over the whole small
+// image. Brute force on purpose: the search is a few hundred candidates over a few thousand pixels,
+// which is nothing, and it has no local minimum to get trapped in the way an iterative solver does.
+layout(binding = 0) uniform Params {
+    uvec2 size; int radius; int useBase;
+    float cellX; float cellY; int pad0; int pad1;
+} pc;
+layout(r32f, binding = 1) uniform readonly image2D uNow;
+layout(r32f, binding = 2) uniform readonly image2D uThen;
+layout(std430, binding = 3) buffer Cost { float cost[]; };
+// The coarse level's answer, when this is the fine level. Searching a small window around it costs a
+// fraction of widening the coarse search, and buys the accuracy that matters: at the coarse scale one
+// cell is several pixels of the real frame, and a residual of a couple of pixels is enough to
+// decorrelate fine detail completely -- which is most of what the model was asked to enhance.
+layout(rgba32f, binding = 4) uniform readonly image2D uBase;
+
+shared float sPartial[256];
+
+void main() {
+    const int span = 2 * pc.radius + 1;
+    const int slot = int(gl_WorkGroupID.x);
+    ivec2 base = ivec2(0);
+    if (pc.useBase != 0) {
+        vec2 b = imageLoad(uBase, ivec2(0)).xy;
+        base = ivec2(round(b / vec2(pc.cellX, pc.cellY)));
+    }
+    const ivec2 off = base + ivec2(slot % span, slot / span) - ivec2(pc.radius);
+    const uint lane = gl_LocalInvocationIndex;
+
+    float sum = 0.0;
+    float n = 0.0;
+    // Strided so every lane walks the whole image rather than a block of it: a block-per-lane split
+    // makes each lane's partial depend on what happens to be in its corner of the picture.
+    for (uint i = lane; i < pc.size.x * pc.size.y; i += 256u) {
+        ivec2 p = ivec2(int(i % pc.size.x), int(i / pc.size.x));
+        ivec2 q = p + off;
+        if (q.x < 0 || q.y < 0 || q.x >= int(pc.size.x) || q.y >= int(pc.size.y)) continue;
+        sum += abs(imageLoad(uNow, p).r - imageLoad(uThen, q).r);
+        n += 1.0;
+    }
+    sPartial[lane] = n > 0.0 ? sum / n : 1e9;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lane < s) sPartial[lane] = min(sPartial[lane], sPartial[lane + s]);
+        barrier();
+    }
+    // Averaged rather than summed, so an offset that pushes most of the image off the edge is not
+    // rewarded for comparing fewer pixels.
+    if (lane == 0u) cost[slot] = sPartial[0];
+}
+
+#elif defined(PASS_PICK)
+// The lowest cost, refined to sub-pixel by a parabola through its two neighbours, written out in
+// pixels of the full frame. A single workgroup: there are only a few hundred candidates.
+layout(binding = 0) uniform Params {
+    int radius; float scaleX; float scaleY; int useBase;
+} pc;
+layout(std430, binding = 1) readonly buffer Cost { float cost[]; };
+layout(rgba32f, binding = 3) uniform readonly image2D uBase;
+// A one-by-one image rather than a buffer, on purpose. The composition already samples a motion
+// field; a field that is a single texel returns the same vector at every pixel, which is precisely a
+// global translation -- so this drops into the existing shader without touching a single binding.
+layout(rgba32f, binding = 2) uniform writeonly image2D uResult;
+
+float At(int x, int y, int span) {
+    x = clamp(x, 0, span - 1);
+    y = clamp(y, 0, span - 1);
+    return cost[y * span + x];
+}
+
+void main() {
+    if (gl_LocalInvocationIndex != 0u) return;
+    const int span = 2 * pc.radius + 1;
+
+    int best = 0;
+    float bestCost = 1e30;
+    float worst = 0.0;
+    float mean = 0.0;
+    for (int i = 0; i < span * span; ++i) {
+        float c = cost[i];
+        mean += c;
+        worst = max(worst, c);
+        if (c < bestCost) { bestCost = c; best = i; }
+    }
+    mean /= float(span * span);
+
+    int bx = best % span, by = best / span;
+    // Parabolic refinement, so the estimate is not quantised to whole cells of the small image --
+    // which at this scale is several pixels of the real frame.
+    float cx0 = At(bx - 1, by, span), cx2 = At(bx + 1, by, span);
+    float cy0 = At(bx, by - 1, span), cy2 = At(bx, by + 1, span);
+    float dx = (cx0 - cx2) / max(2.0 * (cx0 - 2.0 * bestCost + cx2), 1e-6);
+    float dy = (cy0 - cy2) / max(2.0 * (cy0 - 2.0 * bestCost + cy2), 1e-6);
+    dx = clamp(dx, -1.0, 1.0);
+    dy = clamp(dy, -1.0, 1.0);
+
+    // How much better the winner is than the field it won against. A picture with real structure
+    // gives a sharp minimum; a flat wall, a fade, or a scene that simply changed gives a shallow one,
+    // and a displacement read off a shallow minimum is a guess. The composition fades the edit out
+    // where this is low rather than warping by a number nobody should trust.
+    float confidence = clamp((mean - bestCost) / max(mean, 1e-6), 0.0, 1.0);
+
+    // The coarse displacement is quantised to this level's cell, which is exactly what the fine
+    // search was centred on, so it is added back in whole rather than re-derived.
+    vec2 base = vec2(0.0);
+    if (pc.useBase != 0) {
+        vec2 b = imageLoad(uBase, ivec2(0)).xy;
+        base = round(b / vec2(pc.scaleX, pc.scaleY)) * vec2(pc.scaleX, pc.scaleY);
+    }
+    imageStore(uResult, ivec2(0, 0),
+               vec4(base.x + (float(bx - pc.radius) + dx) * pc.scaleX,
+                    base.y + (float(by - pc.radius) + dy) * pc.scaleY,
+                    confidence, 1.0));
+}
+#endif
