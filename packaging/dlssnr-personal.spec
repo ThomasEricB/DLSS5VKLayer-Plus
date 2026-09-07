@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 1
+%global pkg_release 2
 
 Name:           dlssnr-personal
 Version:        0.2.5
@@ -50,6 +50,14 @@ cp -a root/usr %{buildroot}/usr
 %doc %{_datadir}/doc/dlssnr/dxvk-license.txt
 
 %changelog
+* Mon Sep 07 2026 DLSS5VKLayer - 0.2.5-2
+- GUI: the binary now loads on distros whose Qt6 exports the meta-object data symbols with protected
+  visibility (CachyOS/Arch). GCC bakes copy relocations against QSpinBox::staticMetaObject and friends
+  even into a PIE, and glibc 2.41+ refuses to copy-relocate a protected symbol, so the GUI died at exec
+  with GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS. The GUI is now built with clang++ plus
+  -Wl,-z,nocopyreloc -Wl,-z,indirect-extern-access, which reaches every Qt data symbol through the GOT
+  -- legal under either visibility, and unchanged on the distros that always worked.
+
 * Mon Sep 07 2026 DLSS5VKLayer - 0.2.5-1
 - HDR input. On an HDR swapchain -- float16 linear, or 10-bit with a PQ colour space -- the proxy
   crosses as float16 carrying linear light normalised by the white point, PQ-decoded on the way in
