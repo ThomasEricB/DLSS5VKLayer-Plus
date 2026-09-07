@@ -556,7 +556,7 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->rebuildSettleMs.store(250);
     h->settlePercent.store(100);
     h->ghostSlackPercent.store(50);
-    h->editBlurMilli.store(40);
+    h->editBlurMilli.store(0);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);

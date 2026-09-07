@@ -858,6 +858,19 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // have produced. Where the frame is flat sigma collapses and nothing stale survives; where it
         // is detailed sigma is wide and a real edit passes untouched. The test costs nine encodes and
         // no texture fetches beyond the ones the neighbourhood needs.
+        // One encode, not nine.
+        //
+        // Encoding every neighbour was the obvious way to write this and it cost the pipelined path
+        // its entire reason to exist: measured at 899 fps before and 82 after, because SoftKnee
+        // carries an exp and two branches, and nine of those unrolled wrecks the occupancy of a pass
+        // that runs on every pixel of every frame. The frame rate collapse then fed back -- with
+        // frames taking twelve milliseconds instead of one the model kept up with every one of them,
+        // so its cost stopped being amortised over a round trip and was paid in full, every frame.
+        //
+        // The statistics are taken in the frame's own space instead and carried through the encode by
+        // its local slope. The encode is monotonic and smooth, so over the spread of one 3x3
+        // neighbourhood a secant through the centre point is an entirely adequate stand-in for it --
+        // and it is exact at the centre, which is the sample the test actually compares.
         float3 m1 = float3(0.0, 0.0, 0.0);
         float3 m2 = float3(0.0, 0.0, 0.0);
         const int2 last = int2(int(gWidth) - 1, int(gHeight) - 1);
@@ -869,19 +882,23 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             {
                 const int2 at = clamp(int2(id.xy) + int2(ox, oy), int2(0, 0), last);
                 const float3 here = gOriginal.Load(int3(at, 0)).rgb / normScale;
-                const float3 enc = EncodeLikeProxy(here);
-                m1 += enc;
-                m2 += enc * enc;
+                m1 += here;
+                m2 += here * here;
 
-                // Kept for the bound at the end of the pass, which needs the frame's own range and
-                // not the encoded one. Free here: the neighbourhood is already being read.
+                // The bound at the end of the pass needs the frame's own range, and the neighbourhood
+                // is already being read, so it costs nothing to take it here.
                 const float l = dot(here, kLuma);
                 nbLumaMin = min(nbLumaMin, l);
                 nbLumaMax = max(nbLumaMax, l);
             }
         }
-        const float3 mu = m1 / 9.0;
-        const float3 sigma = sqrt(max(m2 / 9.0 - mu * mu, float3(0.0, 0.0, 0.0)));
+        const float3 muLin = m1 / 9.0;
+        const float3 sigmaLin = sqrt(max(m2 / 9.0 - muLin * muLin, float3(0.0, 0.0, 0.0)));
+
+        const float3 nowProxy = EncodeLikeProxy(original);
+        const float3 slope = (nowProxy + 1e-4) / (original + 1e-4);
+        const float3 mu = nowProxy + (muLin - original) * slope;
+        const float3 sigma = sigmaLin * slope;
 
         // How far outside the neighbourhood's own spread a stale sample may sit. The floor keeps a
         // perfectly flat region from rejecting its own quantisation noise -- without it an 8-bit

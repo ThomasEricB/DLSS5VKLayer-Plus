@@ -50,13 +50,14 @@ static uint32_t FindMemoryType(VkPhysicalDevice pd, uint32_t bits, VkMemoryPrope
 }
 
 int main(int argc, char** argv) {
-    uint32_t frames = 400, width = 1280, height = 720;
+    uint32_t frames = 400, width = 1280, height = 720, load = 0;
     float speed = 6.0f;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = uint32_t(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--speed") && i + 1 < argc) speed = float(atof(argv[++i]));
         else if (!strcmp(argv[i], "--width") && i + 1 < argc) width = uint32_t(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--height") && i + 1 < argc) height = uint32_t(atoi(argv[++i]));
+        else if (!strcmp(argv[i], "--load") && i + 1 < argc) load = uint32_t(atoi(argv[++i]));
     }
 
     // ---- window -----------------------------------------------------------
@@ -309,7 +310,7 @@ int main(int argc, char** argv) {
                              0, 0, nullptr, 0, nullptr, 1, &bar);
     };
 
-    printf("pan: %ux%u, %.1f px/frame, %u frames\n", width, height, speed, frames);
+    printf("pan: %ux%u, %.1f px/frame, %u frames, load %u\n", width, height, speed, frames, load);
     fflush(stdout);
 
     uint32_t slot = 0;
@@ -340,6 +341,17 @@ int main(int argc, char** argv) {
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
         vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(cb, (width + 7) / 8, (height + 7) / 8, 1);
+
+        // The app's own load. Repeats of the same pass, which is enough: what matters is that there
+        // is GPU work belonging to the frame for the model's work to overlap with.
+        for (uint32_t extra = 0; extra < load; ++extra) {
+            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            vkCmdDispatch(cb, (width + 7) / 8, (height + 7) / 8, 1);
+        }
 
         barrier(cb, sceneImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);

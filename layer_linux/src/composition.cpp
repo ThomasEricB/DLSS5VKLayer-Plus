@@ -900,10 +900,23 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     Image* answer = &_modelTarget;
     Image* source = sent ? (_workTarget.image ? &_workTarget : &_proxyTarget)
                          : (_work.image ? &_work : &_proxy);
-    if (sent && _crossfade) {
-        // Taken whole the first time: there is nothing behind it yet to come from.
-        const float alpha = _settled ? std::min(std::max(s.settleRate, 0.0f), 1.0f) : 1.0f;
 
+    // Taken whole the first time: there is nothing behind it yet to come from.
+    const float alpha = _settled ? std::min(std::max(s.settleRate, 0.0f), 1.0f) : 1.0f;
+
+    // At full rate the blend is the identity, so do not run it.
+    //
+    // This is not a micro-optimisation. The blend is up to three dispatches a frame and two of them
+    // are at the model's raster, which above a working scale of 1 is larger than the frame -- at 200%
+    // on a 2560x1080 display that is two passes over 11 megapixels each, recorded into the game's own
+    // command buffer and paid for out of the game's frame time. Running them to compute
+    // lerp(x, y, 1) == y was measured taking the pipelined path's whole advantage away: with the
+    // model saturating the GPU there is no headroom for work that does nothing.
+    // Decided by the setting, not by this frame's alpha: the first answer is taken whole even when
+    // the rate is low, and that first dispatch is what fills the surfaces every later blend reads
+    // from. Keying off alpha would skip it and then blend out of an uninitialised image forever.
+    const bool blending = sent && _crossfade && s.settleRate < 0.999f;
+    if (blending) {
         Transition(cb, _proxyTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         Transition(cb, _proxySent, VK_IMAGE_LAYOUT_GENERAL);
         if (!_crossfade->Dispatch(cb, _proxyTarget.view, _proxySent.view, _width, _height, alpha))
@@ -938,7 +951,7 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         if (!_superDown->Dispatch(cb, answer->view, _modelNative.view, _modelW, _modelH, _width, _height))
             return false;
         Transition(cb, _modelNative, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        source = sent ? (_crossfade ? &_proxySent : &_proxyTarget) : &_proxy;
+        source = sent ? (blending ? &_proxySent : &_proxyTarget) : &_proxy;
         answer = &_modelNative;
     }
     Transition(cb, *answer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
