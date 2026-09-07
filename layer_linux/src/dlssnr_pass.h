@@ -62,6 +62,13 @@ class DlssNrPass : public Shader_Vk {
                   VkImageView InMotion, VkImageView InTarget, VkImageView InKeep,
                   VkImageLayout InSourceLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                   VkImageLayout InMotionLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // The constant ring, for a caller that wants to patch a slot on the GPU instead of writing it
+    // from the host. NextConstantSlot is the slot the next Dispatch will take, so a copy recorded
+    // before that Dispatch lands in the right place.
+    VkBuffer ConstantBuffer() const { return _constantBuffer; }
+    VkDeviceSize ConstantSlotStride() const { return _slotStride; }
+    uint32_t NextConstantSlot() const { return _slot; }
 };
 
 }  // namespace dlssnr

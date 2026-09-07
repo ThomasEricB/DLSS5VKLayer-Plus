@@ -184,6 +184,14 @@ struct alignas(256) DlssNrConstants
     // preExposure * trim, so the live white point is ExposurePreMul / exposure. Mirrored in the cbuffer.
     uint32_t UseGameExposure;
     float ExposurePreMul;
+
+    // The float16 HDR proxy. HdrProxy = 1 makes the encode write linear light normalised by the white
+    // point into a float16 surface -- no knee, no sRGB, no ceiling -- and the resolve reads it back
+    // without the sRGB decode. HdrTransfer = 1 says the swapchain itself carries PQ, so the frame is
+    // PQ-decoded on the way in and PQ-encoded on the way out. Both zero keeps the SDR path
+    // byte-identical. Trailing, mirroring the cbuffer.
+    uint32_t HdrProxy;
+    uint32_t HdrTransfer;
 };
 
 class DlssNr_Common

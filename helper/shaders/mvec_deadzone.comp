@@ -11,6 +11,13 @@
 // Vectors are in full-resolution pixel units (current -> previous). The
 // deadzone threshold is in the same units so it removes static-geometry
 // noise (< 1 px) without clipping slow intentional camera pans.
+//
+// The flow format is a COMPILE-TIME choice (-D FLOW_FIXED5=1 or =0), not a
+// specialization constant: on this driver a spec-constant branch evaluated
+// false at runtime despite specialization, sending SFIXED5 bits through
+// unpackHalf2x16 and writing NaN into MVec (which faults NGX). Two modules
+// from one source carry no branch to mispredict, so both flow formats run
+// entirely on the GPU and the host readback paths are gone.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -19,24 +26,29 @@ layout(constant_id = 1) const uint  cSrcW     = 480u;  // flow grid width
 layout(constant_id = 2) const uint  cSrcH     = 270u;  // flow grid height
 layout(constant_id = 3) const uint  cDstW     = 1920u; // MVec width
 layout(constant_id = 4) const uint  cDstH     = 1080u; // MVec height
-layout(constant_id = 5) const uint  cFixed5   = 1u;    // 1 = SFIXED5 bits, 0 = half-float bits
 layout(constant_id = 6) const float cDeadzone = 0.5;   // px, full-res units
 layout(constant_id = 7) const uint  cBilinear = 1u;    // 1 = bilinear upscale, 0 = nearest
 
 layout(rg16ui,   binding = 0) uniform readonly  highp uimage2D srcFlow;
 layout(rgba16f,  binding = 1) uniform writeonly highp image2D  dstMVec;
 
+#ifndef FLOW_FIXED5
+#error "compile with -D FLOW_FIXED5=1 (R16G16_SFIXED5_NV) or -D FLOW_FIXED5=0 (R16G16_SFLOAT)"
+#endif
+
 vec2 DecodeFlow(uvec2 raw) {
-    // NOTE: do NOT branch on the cFixed5 spec constant here. On this driver a
-    // spec-constant branch in this shader evaluated false at runtime despite
-    // specialization, sending SFIXED5 bits through unpackHalf2x16 and writing
-    // NaN into MVec (which faults NGX). The helper only builds this pipeline
-    // for SFIXED5 flow; SFLOAT flow uses the legacy CPU/hybrid paths.
+#if FLOW_FIXED5
     int ix = int(raw.x);
     int iy = int(raw.y);
     if (ix > 32767) ix -= 65536;
     if (iy > 32767) iy -= 65536;
     return vec2(float(ix), float(iy)) * (1.0 / 32.0);
+#else
+    // R16G16_SFLOAT texels read through the R16G16_UINT view are raw half
+    // bits; unpackHalf2x16 is their exact inverse. The uint packs low->x,
+    // high->y, matching the R/G component order.
+    return unpackHalf2x16(raw.x | (raw.y << 16));
+#endif
 }
 
 // Deadzone applied per NVOF grid vector: low-magnitude noise clamps to exact

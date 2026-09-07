@@ -110,6 +110,7 @@ static const SettingEntry kSettingsTable[] = {
     {"set_motion_quality", &ShmHeader::mvecQuality, false},
     {"set_motion_units", &ShmHeader::mvecScaleMode, false},
     {"set_colour_mode", &ShmHeader::colourMode, false},
+    {"set_hdr_mode", &ShmHeader::hdrMode, false},
     {"set_white_point_source", &ShmHeader::whitePointSource, false},
     {"set_paper_white", &ShmHeader::whitePointBits, true},
     {"set_white_point_scale", &ShmHeader::whitePointScaleBits, true},
@@ -665,9 +666,10 @@ void MainWindow::updateCompositionVisibility() {
 //
 // Grouped the way upstream groups them, because the grouping carries meaning: what the model was
 // told and what a pass costs, how the answer is composed onto the frame, how color is interpreted,
-// and the tools for looking at the result. Enabling the pass, the model's own controls, the cost and
-// the composition are one story and share the Rendering tab; motion, color and inspection are each
-// their own.
+// and the tools for looking at the result. Enabling the pass, the model's own controls and the cost
+// share the Rendering tab; the composition and the color the composition works in share theirs --
+// color strength, the white point and the guard are all part of how the answer lands, and none of
+// them mean anything while the answer is presented raw; motion and inspection are each their own.
 QWidget* MainWindow::buildSettings() {
     auto* tabs = new QTabWidget(this);
     binder = new ShmBinder(hdr, tabs);
@@ -749,9 +751,30 @@ QWidget* MainWindow::buildSettings() {
         passBtn = new QPushButton("Per-pass settings...", col->parentWidget());
         f->addRow(passBtn);
     }
+
+    scrollTab("Motion", &col);
     {
-        // Bottom of the tab: what the model decided is one thing, how much of it lands is another,
-        // and the answer is presented raw until this is switched on.
+        auto* f = group(col, "Motion");
+        binder->AddBool(f, "Estimate motion vectors", &ShmHeader::mvecEnabled,
+                        "The model reasons about what moved between frames. A layer at present time "
+                        "has no motion vectors from the engine, so they are estimated on the GPU's "
+                        "optical-flow engine from the two frames the helper already has. Off hands "
+                        "the model a zero field, which is what it used to get.");
+        binder->AddChoice(f, "Motion quality", &ShmHeader::mvecQuality,
+                          { "Fast", "Balanced", "Quality" },
+                          "How much of the frame's budget the flow estimate may take.");
+        binder->AddChoice(f, "Motion units", &ShmHeader::mvecScaleMode,
+                          { "Normalised", "Pixels", "UV 0..1" },
+                          "What the numbers in the field mean to the model. Pixels is what the "
+                          "estimate produces; the others are for matching a model that expects them.");
+    }
+
+    scrollTab("Composition", &col);
+    {
+        // What the model decided is one thing and how much of it lands is another; the answer is
+        // presented raw until this is switched on. The color group sits under it because the color
+        // the composition works in -- the white point it normalises by, how much of the model's hue
+        // arrives -- is part of the same decision, and means nothing while the answer is raw.
         auto* f = group(col, "Composition");
         compositionForm = f;
         bypassCheck = binder->AddBool(
@@ -785,27 +808,18 @@ QWidget* MainWindow::buildSettings() {
                                              "sharpness. Only does anything below a working scale "
                                              "of 1.");
     }
-
-    scrollTab("Motion", &col);
-    {
-        auto* f = group(col, "Motion");
-        binder->AddBool(f, "Estimate motion vectors", &ShmHeader::mvecEnabled,
-                        "The model reasons about what moved between frames. A layer at present time "
-                        "has no motion vectors from the engine, so they are estimated on the GPU's "
-                        "optical-flow engine from the two frames the helper already has. Off hands "
-                        "the model a zero field, which is what it used to get.");
-        binder->AddChoice(f, "Motion quality", &ShmHeader::mvecQuality,
-                          { "Fast", "Balanced", "Quality" },
-                          "How much of the frame's budget the flow estimate may take.");
-        binder->AddChoice(f, "Motion units", &ShmHeader::mvecScaleMode,
-                          { "Normalised", "Pixels", "UV 0..1" },
-                          "What the numbers in the field mean to the model. Pixels is what the "
-                          "estimate produces; the others are for matching a model that expects them.");
-    }
-
-    scrollTab("Color", &col);
     {
         auto* f = group(col, "Color");
+        binder->AddChoice(f, "HDR input", &ShmHeader::hdrMode,
+                          { "Auto", "Off", "Force float16" },
+                          "Let the model see the frame's real light instead of a tone-mapped copy. "
+                          "Auto turns it on when the swapchain is HDR -- a float swapchain, or 10-bit "
+                          "with a PQ colour space -- and the proxy then crosses as float16 carrying "
+                          "linear light, PQ-decoded first when the swapchain carries PQ. Off keeps "
+                          "the 8-bit proxy whatever the game presents. Force feeds the float proxy "
+                          "to an SDR swapchain too, which is an A/B tool rather than a preference. "
+                          "The model has the last word: if it refuses float input the pass falls back "
+                          "to 8-bit on its own.");
         binder->AddChoice(f, "Frame holds", &ShmHeader::colourMode,
                           { "Auto", "A finished picture", "Linear light" },
                           "Whether the swapchain carries a frame the game already tone mapped or "

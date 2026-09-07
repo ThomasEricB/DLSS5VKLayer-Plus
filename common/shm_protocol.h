@@ -14,9 +14,11 @@
 //   [kHeaderBytes, +kMaxFrame)              the proxy the layer encoded, for the model
 //   [kHeaderBytes + kMaxFrame, +kMaxFrame)  the model's answer, for the composition
 //
-// The proxy is always R8G8B8A8_UNORM, display-referred: the encode has already scaled and sRGB-encoded
-// whatever the swapchain held, so the helper never has to know what format the game presents in and
-// there is no channel swizzle left to get wrong. `format` is kept for older helpers and is always 1.
+// The proxy is R8G8B8A8_UNORM, display-referred, unless the HDR path is on: then it is
+// R16G16B16A16_SFLOAT carrying linear light normalised by the white point, and the model is shown the
+// highlights the SDR encode throws away. `proxyFormat` says which one the helper actually built --
+// the model has the last word, and the layer encodes to match it. `format` is kept for older helpers
+// and is always 1.
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -30,11 +32,22 @@
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
-static constexpr uint32_t kShmVersion = 6;
+// v7: the pixel regions moved from 8 KiB to 64 KiB. VK_EXT_external_memory_host -- which lets the
+// GPU write the proxy straight into this file's pages instead of through a staging copy -- demands
+// the imported pointer be aligned to minImportedHostPointerAlignment, and NVIDIA's driver answers
+// 64 KiB. A stale v6 mapping must be re-created, not half-read at the wrong offsets.
+// v10: the HDR proxy. The pixel regions grew to eight bytes a pixel so a float16 frame fits, the
+// header carries the HDR decision and the proxy's real format, and a stale v9 mapping would put the
+// answer region at the wrong offset.
+static constexpr uint32_t kShmVersion = 10;
+
+
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
-static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
-static constexpr size_t kHeaderBytes = 8192;
+// Eight bytes a pixel: the float16 proxy needs them, and the 8-bit path simply uses the first half of
+// each region. The mapping is file-backed and sparse, so an SDR session never commits the second half.
+static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 8;
+static constexpr size_t kHeaderBytes = 65536;
 
 // The ceiling on how many times the model runs over one frame, and what the slider offers unless the
 // ceiling is lifted. Both are OptiScaler's numbers (DlssNr::kMaxPasses / kDefaultMaxPasses) and the
@@ -126,6 +139,28 @@ enum HelperState : uint32_t {
 };
 
 // How the motion field the helper hands the model is scaled. From bmitch87's motion-vector work.
+// The HDR input path. The layer detects what the swapchain carries, the user decides whether to use
+// it, and the helper's model has the final say on whether a float16 proxy is actually built.
+enum HdrMode : uint32_t {
+    kHdrAuto = 0,   // HDR when the swapchain is HDR
+    kHdrOff = 1,    // always the SDR proxy, whatever the swapchain
+    kHdrForce = 2,  // float16 proxy even for an SDR swapchain (an A/B tool, not a preference)
+};
+
+enum HdrKind : uint32_t {
+    kHdrNone = 0,       // 8-bit swapchain: already tone mapped
+    kHdrLinearFp16 = 1, // R16G16B16A16_SFLOAT: linear light, open range
+    kHdrPq10 = 2,       // 10-bit with a PQ/BT.2020 colour space: ST 2084 code
+};
+
+// What the crossing images actually are, published by the helper: the model decides, and the layer
+// encodes to match rather than to hope.
+enum ProxyFormat : uint32_t {
+    kProxyUnknown = 0,
+    kProxyRgba8 = 1,
+    kProxyRgba16F = 2,
+};
+
 enum MVecScaleMode : uint32_t {
     kMVecNormalized = 0,
     kMVecPixels = 1,
@@ -355,6 +390,59 @@ struct ShmHeader {
     // settles and chain the remaining builds back to back. It is time rather than frames because a
     // frame-counted wait crawls on a 30 fps game and races on a 144 fps one.
     std::atomic<uint32_t> rebuildSettleMs;
+
+    // The raster the helper actually answered, echoed before seq_resp. More than one swapchain can
+    // share this channel -- a game and the Steam overlay, or a game mid-resize with its old and new
+    // swapchains both presenting -- and seq_resp only says *a* frame came back. Without the echo a
+    // swapchain waiting on its own request can be satisfied by another's answer and copy the wrong
+    // number of bytes, which is the row-shifted colour garbage this field exists to refuse.
+    std::atomic<uint32_t> answeredW;
+    std::atomic<uint32_t> answeredH;
+
+    // Phase 5: the dma-buf exchange, carried entirely through this header.
+    //
+    // The helper owns both images that cross the boundary -- the proxy it reads and the answer it
+    // writes -- because it is the one process that can hand out a dma-buf descriptor without any
+    // help: Wine's ws2_32 has no AF_UNIX and Wine traps direct syscalls, so SCM_RIGHTS is out, but
+    // vkGetMemoryFdKHR returns a plain Linux fd number that the helper can simply name here. The
+    // layer, native and unrestricted, opens /proc/<pid>/fd/<fd> to take its own reference on the
+    // same buffer. That open needs ptrace_mask off (yama ptrace_scope 0) or a descendant
+    // relationship; where it fails, the shared-memory transport carries the frame instead.
+    //
+    // Each export sequence increments when the fd or the image behind it changes; the importer
+    // re-opens on a new sequence. The layer's flags say which surfaces it is reading and writing
+    // through the fd path, set before seq_req and honoured on exactly that frame.
+    std::atomic<uint32_t> proxyExportSeq;  // helper: proxyPid/proxyFd/proxyGen are current
+    std::atomic<uint32_t> proxyPid;        // the helper's Linux pid
+    std::atomic<uint32_t> proxyFd;         // its fd number for the proxy image
+    std::atomic<uint32_t> proxyGen;        // rebuilt (size or channel) since
+    std::atomic<uint32_t> answerExportSeq; // helper: answerPid/answerFd/answerGen are current
+    std::atomic<uint32_t> answerPid;
+    std::atomic<uint32_t> answerFd;
+    std::atomic<uint32_t> answerGen;
+    // The importer's echo: the export sequence each side has taken a reference at, restated every
+    // frame, 0 for none. The helper reads and writes the fd path only while its own current
+    // sequence is echoed back -- which also means a restarted helper is not read through a
+    // descriptor the layer has not re-opened yet, and a restarted layer is not trusted by the
+    // helper's stale memory.
+    std::atomic<uint32_t> layerProxySeq;
+    std::atomic<uint32_t> layerAnswerSeq;
+
+    // The HDR input path. hdrMode is the user's choice (see HdrMode); hdrDetected and hdrKind are the
+    // layer's reading of the primary swapchain's format and colour space; hdrActive is the decision
+    // the layer actually encoded this frame under, and proxyFormat is what the helper built the
+    // crossing images as. The layer uses the float16 path only while both agree it exists -- if the
+    // model refused the float input, proxyFormat stays 8-bit and the encode tone maps as before.
+    std::atomic<uint32_t> hdrMode;
+    std::atomic<uint32_t> hdrDetected;
+    std::atomic<uint32_t> hdrActive;
+    std::atomic<uint32_t> proxyFormat;
+    // What the proxy bytes in the shared region actually are for the request being made: the layer
+    // writes this immediately before seq_req, so the helper reads the width from the same statement
+    // that announced the pixels. It lags hdrActive by the frames it takes to switch the crossing
+    // images over, and the helper refuses a frame whose width does not match what it built -- which
+    // is one presented-as-is frame at a toggle, never a misread one.
+    std::atomic<uint32_t> hdrEncode;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -370,7 +458,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1884, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1952, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -439,6 +527,11 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->applyModel.store(1);
     h->holdFrame.store(0);
     h->scalingDownscaler.store(kDownscaleLanczos3);
+
+    h->hdrMode.store(kHdrAuto);
+    h->hdrDetected.store(kHdrNone);
+    h->hdrActive.store(0);
+    h->proxyFormat.store(kProxyRgba8);
 
     h->mvecEnabled.store(1);
     h->mvecScaleMode.store(kMVecPixels);
