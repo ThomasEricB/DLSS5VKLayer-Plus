@@ -2757,9 +2757,16 @@ int main() {
             }
             continue;
         }
+        // The moment this helper first knew there was work. Everything between the layer's publish
+        // and here is wake-up latency and belongs to nobody's compute.
+        shm.hdr->dbgDetectMs.store(DoubleBits(NowMs()));
         bool ok = ProcessFrame(ns, shm);
         if (!ok) Log("[helper] frame %u failed (w=%u h=%u)", req, shm.hdr->width.load(), shm.hdr->height.load());
         shm.hdr->seq_ok.store(ok ? req : 0);
+        // Stamped before the sequence number, because the sequence number is what the layer is
+        // watching -- writing it afterwards would put the timestamp in the past of a reader that has
+        // already moved on.
+        shm.hdr->dbgWrittenMs.store(DoubleBits(NowMs()));
         shm.hdr->seq_resp.store(req);
         lastReq = req;
         if (ns.ngx.disabled) {

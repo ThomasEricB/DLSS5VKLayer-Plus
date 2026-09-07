@@ -167,6 +167,13 @@ struct ShmMap {
     uint64_t ageSum = 0;
     uint32_t ageCount = 0;
     uint32_t ageMax = 0;
+
+    // Where the round trip goes. See the attribution note in shm_protocol.h.
+    double recordMs = 0.0;      // when this frame's proxy pixels were recorded
+    double publishMs = 0.0;     // when the request was handed to the helper
+    double rtSum = 0.0, helperSum = 0.0, wakeSum = 0.0, returnSum = 0.0, deferSum = 0.0;
+    uint32_t rtCount = 0;
+    bool clocksComparable = true;
     size_t importedBytes = 0;
     bool zeroCopy = false;
     bool dead = false;
@@ -460,11 +467,50 @@ static void ShmNoteAge(ShmMap& s) {
         const float r = float(double(age) / double(interval));
         s.reprojScale = r < 0.25f ? 0.25f : (r > 3.0f ? 3.0f : r);
     }
+    {
+        const double collect = NowMs();
+        const double detect = BitsDouble(s.hdr->dbgDetectMs.load());
+        const double written = BitsDouble(s.hdr->dbgWrittenMs.load());
+        const double rt = collect - s.publishMs;
+        const double helper = written - detect;
+        // The two spans that need no cross-clock comparison, and are therefore always believable.
+        if (rt > 0.0 && helper >= 0.0 && helper <= rt) {
+            s.rtSum += rt;
+            s.helperSum += helper;
+            s.deferSum += s.publishMs - s.recordMs;
+            // The split into wake and return is only meaningful if the two clocks share an epoch.
+            const double wake = detect - s.publishMs;
+            const double back = collect - written;
+            if (wake >= 0.0 && back >= 0.0 && wake + back <= rt + 1.0) {
+                s.wakeSum += wake;
+                s.returnSum += back;
+            } else {
+                s.clocksComparable = false;
+            }
+            ++s.rtCount;
+        }
+    }
     s.ageSum += age;
     s.ageMax = age > s.ageMax ? uint32_t(age) : s.ageMax;
     if (++s.ageCount >= 300) {
         Log("[pipe] answers are %.1f frames old on average, worst %u; reprojection scaled by %.2f",
             double(s.ageSum) / double(s.ageCount), s.ageMax, s.reprojScale);
+        if (s.rtCount) {
+            const double n = double(s.rtCount);
+            const double rt = s.rtSum / n, helper = s.helperSum / n;
+            if (s.clocksComparable) {
+                Log("[pipe] round trip %.2f ms = wake %.2f + helper %.2f + return %.2f; "
+                    "the proxy was recorded %.2f ms before it was even published",
+                    rt, s.wakeSum / n, helper, s.returnSum / n, s.deferSum / n);
+            } else {
+                Log("[pipe] round trip %.2f ms = helper %.2f + handshake %.2f (the two clocks do not "
+                    "share an epoch, so wake and return cannot be separated); the proxy was recorded "
+                    "%.2f ms before it was even published",
+                    rt, helper, rt - helper, s.deferSum / n);
+            }
+            s.rtSum = s.helperSum = s.wakeSum = s.returnSum = s.deferSum = 0.0;
+            s.rtCount = 0;
+        }
         s.ageSum = 0;
         s.ageCount = 0;
         s.ageMax = 0;
@@ -496,6 +542,9 @@ static bool ShmPublish(ShmMap& s, uint32_t w, uint32_t h, const void* proxy) {
     s.pendingReq = req;
     s.prevPublishedAtFrame = s.publishedAtFrame;
     s.publishedAtFrame = s.frames;
+    s.publishMs = NowMs();
+    s.hdr->dbgRecordMs.store(DoubleBits(s.recordMs));
+    s.hdr->dbgPublishMs.store(DoubleBits(s.publishMs));
     return true;
 }
 
@@ -1487,6 +1536,10 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             }
         }
         if (mayPublish) {
+            // When these pixels were recorded, which is earlier than when they are published -- the
+            // publish waits for the slot's fence. That gap is part of the edit's real age and was
+            // missing from every staleness number measured so far.
+            dc->shm.recordMs = NowMs();
             sc.pendingSlot = slot;
             sc.pendingW = sc.comp->ModelWidth();
             sc.pendingH = sc.comp->ModelHeight();

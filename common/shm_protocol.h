@@ -30,13 +30,14 @@
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
+// v13: round-trip attribution timestamps.
 // v12: editBlurMilli, the frequency split that keeps a stale edit from ghosting.
 // v11: ghostSlackPercent, the neighbourhood bound that stops a stale edit showing as a ghost.
 // v10: settlePercent, the rate the pipelined edit walks toward a new answer.
 // v8: two sides grew the header at once -- compositionBypass and rebuildSettleMs upstream, pipeline
 // here -- so neither side's number describes this layout.
 // v9: a third region for the motion field, so the header, the file size and the offsets all moved.
-static constexpr uint32_t kShmVersion = 12;
+static constexpr uint32_t kShmVersion = 13;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
@@ -450,6 +451,26 @@ struct ShmHeader {
     // content to have held still and tone does not, and this is the line between them. 40 -- four
     // percent of the width -- is roughly that hundred pixels on a 2560-wide frame.
     std::atomic<uint32_t> editBlurMilli;
+
+    // Round-trip attribution. Each side writes its own clock; see the note on comparability below.
+    //
+    // The pipelined path's whole problem is that an answer arrives about 20 ms after the frame it
+    // describes, and 20 ms of camera motion is the ghost. Of that 20 ms the helper's own measured
+    // work -- upload, model, readback -- is 4.6 ms. Three quarters of it was unattributed, and
+    // guessing at it produced a proposal to optimise the transport, which is 0.34 ms of the 20.
+    //
+    // The layer writes recordMs (when the proxy's pixels were recorded) and publishMs (when the
+    // request was handed over). The helper writes detectMs (when its poll first saw the request) and
+    // writtenMs (when the answer was in shared memory). Two spans need no cross-clock comparison at
+    // all and are therefore always trustworthy: the helper's internal time, and the layer's total
+    // round trip. Their difference is the handshake cost in both directions together. Splitting that
+    // into wake and return does need the two clocks to share an epoch -- steady_clock here and
+    // QueryPerformanceCounter under Wine, which both rest on CLOCK_MONOTONIC, so they should -- and
+    // the layer checks that the split comes out non-negative before believing it.
+    std::atomic<uint64_t> dbgRecordMs;
+    std::atomic<uint64_t> dbgPublishMs;
+    std::atomic<uint64_t> dbgDetectMs;
+    std::atomic<uint64_t> dbgWrittenMs;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -465,7 +486,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1916, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1952, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -482,6 +503,20 @@ inline float BitsToFloat(uint32_t u) {
     float f = 0.0f;
     std::memcpy(&f, &u, sizeof(f));
     return f;
+}
+
+// Milliseconds cross the boundary as bits, for the same reason the floats above do: a double is not
+// guaranteed to be a lock-free atomic, and the two processes are compiled by different toolchains.
+inline uint64_t DoubleBits(double d) {
+    uint64_t u = 0;
+    std::memcpy(&u, &d, sizeof(u));
+    return u;
+}
+
+inline double BitsDouble(uint64_t u) {
+    double d = 0.0;
+    std::memcpy(&d, &u, sizeof(d));
+    return d;
 }
 
 inline void ShmStoreString(std::atomic<uint32_t>& seq, char* dst, size_t cap, const char* src) {
