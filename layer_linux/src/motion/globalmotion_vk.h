@@ -112,7 +112,7 @@ class GlobalMotionVk {
     VkBuffer _costBuf = VK_NULL_HANDLE;
     VkDeviceMemory _costMem = VK_NULL_HANDLE;
 
-    std::unique_ptr<GmPass> _reduce, _match, _pick;
+    std::unique_ptr<GmPass> _reduce, _match, _pick, _lk;
     bool _ok = false;
 };
 

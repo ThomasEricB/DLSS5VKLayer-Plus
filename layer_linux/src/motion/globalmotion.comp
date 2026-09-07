@@ -204,4 +204,86 @@ void main() {
     imageStore(uState, ivec2(0, 0), vec4(0.0, 0.0, 0.0, 0.0));
     imageStore(uResult, ivec2(0, 0), vec4(measured, confidence, 1.0));
 }
+#elif defined(PASS_LK)
+// Gradient refinement of the residual, which is what makes the estimate smooth.
+//
+// A discrete search is integer-resolution by construction: it can only name a cell. At the finest
+// level here a cell is eight pixels of a 2560-wide frame, so even a perfect half-cell parabola leaves
+// the answer quantised to about four pixels -- and four pixels of the whole picture, jumping a
+// different way each frame, is exactly the trembling that was reported. No amount of tuning the
+// search removes it, because the search does not have the resolution to remove.
+//
+// So the search is used for what it is good at -- finding the right basin over a large range, robustly
+// -- and the last fraction of a pixel is solved for instead. Linearising the picture about the
+// current estimate gives a two-by-two system in the residual shift:
+//
+//     [ SIGMA Ix*Ix  SIGMA Ix*Iy ] [du]     [ SIGMA Ix*e ]
+//     [ SIGMA Ix*Iy  SIGMA Iy*Iy ] [dv]  =  [ SIGMA Iy*e ]
+//
+// with e the difference between the two pictures at the current estimate. Six sums and one solve for
+// the whole frame, which is why this costs nothing: it is a global model, so every pixel contributes
+// to the same two numbers. This is the standard pairing -- a coarse search for range, gradients for
+// precision -- and it is used because neither half works alone.
+layout(binding = 0) uniform Params {
+    uvec2 size; float cellX; float cellY;
+    float maxStep; int pad0; int pad1; int pad2;
+} pc;
+layout(binding = 1) uniform sampler2D uNowS;
+layout(binding = 2) uniform sampler2D uThenS;
+layout(rgba32f, binding = 3) uniform image2D uResult;
+
+shared float sAcc[64][5];
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex;
+    vec2 est = imageLoad(uResult, ivec2(0, 0)).xy;
+    // The estimate is in pixels of the frame; here it is wanted in cells of this working image.
+    const vec2 offCells = est / vec2(pc.cellX, pc.cellY);
+
+    float a = 0.0, b = 0.0, c = 0.0, d = 0.0, e2 = 0.0;
+    for (uint i = lane; i < pc.size.x * pc.size.y; i += 64u) {
+        ivec2 p = ivec2(int(i % pc.size.x), int(i / pc.size.x));
+        // Skip the border, where a gradient would reach outside the picture.
+        if (p.x < 2 || p.y < 2 || p.x >= int(pc.size.x) - 2 || p.y >= int(pc.size.y) - 2) continue;
+        vec2 uv = (vec2(p) + 0.5) / vec2(pc.size);
+        float n = texture(uNowS, uv).r;
+        vec2 tuv = (vec2(p) + offCells + 0.5) / vec2(pc.size);
+        if (any(lessThan(tuv, vec2(0.0))) || any(greaterThan(tuv, vec2(1.0)))) continue;
+        float t = texture(uThenS, tuv).r;
+        float ix = 0.5 * (texture(uNowS, uv + vec2(1.0 / float(pc.size.x), 0.0)).r -
+                          texture(uNowS, uv - vec2(1.0 / float(pc.size.x), 0.0)).r);
+        float iy = 0.5 * (texture(uNowS, uv + vec2(0.0, 1.0 / float(pc.size.y))).r -
+                          texture(uNowS, uv - vec2(0.0, 1.0 / float(pc.size.y))).r);
+        float err = t - n;
+        a += ix * ix; b += ix * iy; c += iy * iy;
+        d += ix * err; e2 += iy * err;
+    }
+    sAcc[lane][0] = a; sAcc[lane][1] = b; sAcc[lane][2] = c; sAcc[lane][3] = d; sAcc[lane][4] = e2;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (lane < s)
+            for (int k = 0; k < 5; ++k) sAcc[lane][k] += sAcc[lane + s][k];
+        barrier();
+    }
+    if (lane != 0u) return;
+
+    a = sAcc[0][0]; b = sAcc[0][1]; c = sAcc[0][2]; d = sAcc[0][3]; e2 = sAcc[0][4];
+    float det = a * c - b * b;
+    // A picture with no gradient in some direction cannot say how far it moved in that direction, and
+    // the solve would answer anyway. Refuse instead and keep what the search found.
+    //
+    // The condition has to be relative to how much gradient there actually is, not an absolute floor.
+    // A frame of nearly flat wall with a little noise on it produces a small but non-zero Hessian, an
+    // absolute test passes it, and the solve then answers from the noise -- a different answer every
+    // frame, which is the trembling this pass exists to remove rather than to cause.
+    const float scale = max(a + c, 1e-12);
+    if (det > 0.02 * scale * scale) {
+        vec2 step = -vec2(c * d - b * e2, a * e2 - b * d) / det;
+        // In cells here; a refinement larger than the search's own resolution is not a refinement.
+        if (all(lessThan(abs(step), vec2(pc.maxStep))) && !any(isnan(step)))
+            imageStore(uResult, ivec2(0, 0),
+                       vec4(est + step * vec2(pc.cellX, pc.cellY),
+                            imageLoad(uResult, ivec2(0, 0)).zw));
+    }
+}
 #endif

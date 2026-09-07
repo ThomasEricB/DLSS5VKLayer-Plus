@@ -74,7 +74,8 @@ GlobalMotionVk::GlobalMotionVk(const DeviceTable* vk, const InstanceTable* insta
         _w[lvl] = 160u << lvl;
         _h[lvl] = std::max<uint32_t>(16, uint32_t(std::lround(double(_w[lvl]) * double(frameHeight) /
                                                               double(frameWidth))));
-        if (!MakeImg(_now[lvl], _w[lvl], _h[lvl]) || !MakeImg(_then[lvl], _w[lvl], _h[lvl]) ||
+        if (!MakeImg(_now[lvl], _w[lvl], _h[lvl], VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT) ||
+            !MakeImg(_then[lvl], _w[lvl], _h[lvl], VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT) ||
             !MakeImg(_result[lvl], 1, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
             return;
     }
@@ -151,7 +152,15 @@ GlobalMotionVk::GlobalMotionVk(const DeviceTable* vk, const InstanceTable* insta
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
         8 * sizeof(uint32_t), false);
 
-    _ok = _reduce->CanRender() && _match->CanRender() && _pick->CanRender();
+    _lk = std::make_unique<GmPass>(
+        "dlssnr-gm-lk", vk, instance, device, physicalDevice, gm_lk_spv, sizeof(gm_lk_spv),
+        std::vector<VkDescriptorType>{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+        8 * sizeof(uint32_t), true);
+
+    _ok = _reduce->CanRender() && _match->CanRender() && _pick->CanRender() && _lk->CanRender();
     if (_ok)
         Log("[gm] global motion estimate ready, %ux%u then %ux%u, search +-%d then +-%d",
             _w[0], _h[0], _w[1], _h[1], _radius[0], _radius[1]);
@@ -161,6 +170,7 @@ GlobalMotionVk::~GlobalMotionVk() {
     _reduce.reset();
     _match.reset();
     _pick.reset();
+    _lk.reset();
     for (int lvl = 0; lvl < 2; ++lvl) {
         DropImg(_now[lvl]);
         DropImg(_then[lvl]);
@@ -335,6 +345,32 @@ bool GlobalMotionVk::Record(VkCommandBuffer cb, VkImageView now, VkImageView the
                                          nullptr);
             _vk->vkCmdDispatch(cb, 1, 1, 1);
         }
+        flush();
+    }
+
+    // The last fraction of a pixel, solved for rather than searched for.
+    {
+        const int lvl = 1;  // the finest level
+        Barrier(cb, _now[lvl], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Barrier(cb, _then[lvl], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Barrier(cb, _result[lvl], VK_IMAGE_LAYOUT_GENERAL);
+        struct LC {
+            uint32_t w, h; float cellX, cellY; float maxStep; uint32_t p0, p1, p2;
+        } lc{ _w[lvl], _h[lvl], float(_frameW) / float(_w[lvl]), float(_frameH) / float(_h[lvl]),
+              0.5f, 0, 0, 0 };
+        VkDescriptorBufferInfo ubo{};
+        VkDescriptorSet set = _lk->Begin(&lc, sizeof(lc), &ubo);
+        VkDescriptorImageInfo ni{ _lk->Sampler(), _now[lvl].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo ti{ _lk->Sampler(), _then[lvl].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo ri{ VK_NULL_HANDLE, _result[lvl].view, VK_IMAGE_LAYOUT_GENERAL };
+        write(set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &ubo);
+        write(set, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ni, nullptr);
+        write(set, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ti, nullptr);
+        write(set, 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ri, nullptr);
+        _vk->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _lk->Pipeline());
+        _vk->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _lk->Layout(), 0, 1, &set, 0,
+                                     nullptr);
+        _vk->vkCmdDispatch(cb, 1, 1, 1);
         flush();
     }
     return true;
