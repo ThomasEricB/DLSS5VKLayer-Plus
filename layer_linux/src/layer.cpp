@@ -1418,26 +1418,26 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         }
     }
 
-    // Bypass presents the model's raw answer as the frame, with no composition at all -- so with the
-    // round trip running alongside, the picture on screen would be the model's answer for an older
-    // frame, whole. Not a stale edit on a current frame, a stale frame. Everything that makes the
-    // pipelined path safe lives in the composition it is bypassing: the frame's own pixels
-    // underneath, the reprojection, the check that the edit still describes what is there.
+    // Bypassing the composition and running alongside used to be refused outright, and the reason was
+    // sound at the time: bypass makes the model's answer the frame itself, so a pipelined one is a
+    // whole stale frame rather than a stale edit on a current one -- and one answer arrives per round
+    // trip, so the picture would freeze in steps while the game ran on.
     //
-    // So the two do not combine, and the round trip waits while the composition is bypassed. Said
-    // once, because it is a setting the user chose and they should know which one is winning.
-    // Bypass presents the model's raw answer as the frame, with no composition at all -- so with the
-    // round trip running alongside, the picture on screen would be the model's answer for an older
-    // frame, whole. Everything that makes the pipelined path safe lives in the composition it is
-    // bypassing: the frame's own pixels underneath, the reprojection, the check that the edit still
-    // describes what is there.
-    const bool pipelined = fs.pipelined && !fs.compositionBypass;
-    if (fs.pipelined && fs.compositionBypass) {
+    // What removes that objection is the layer measuring its own displacement. The stale frame can be
+    // warped to where the camera is now, every frame, including the frames between answers -- which is
+    // asynchronous reprojection, and it is what makes a low answer rate look like continuous motion
+    // rather than a slideshow. The resolve already samples the model at the reprojected position, so
+    // the bypass path needed nothing: it was only ever being denied the chance to run.
+    //
+    // Still refused when there is no estimate to warp with, because then the original objection
+    // stands exactly as it did.
+    const bool canWarpBypass = sc.comp && sc.comp->HasGlobalMotion();
+    const bool pipelined = fs.pipelined && (!fs.compositionBypass || canWarpBypass);
+    if (fs.pipelined && fs.compositionBypass && !canWarpBypass) {
         static std::once_flag said;
         std::call_once(said, [] {
-            Log("[layer] the composition is bypassed, so the model's answer is the frame itself and "
-                "cannot be a frame old; running the round trip in front of the frame instead. Turn "
-                "the composition on to run it alongside.");
+            Log("[layer] the composition is bypassed and there is no motion estimate to reproject the "
+                "model's answer with, so the round trip runs in front of the frame instead");
         });
     }
 

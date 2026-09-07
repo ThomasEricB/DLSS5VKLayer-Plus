@@ -616,16 +616,13 @@ void MainWindow::updateCompositionVisibility() {
     const bool bypass = hdr && hdr->compositionBypass.load() != 0;
     for (QWidget* w : compositionRows) compositionForm->setRowVisible(w, !bypass);
 
-    // Running alongside and bypassing the composition do not combine, and the interface has to say
-    // so. It did not: the box stayed ticked and looked live while the layer quietly ignored it, so
-    // the pass ran in front of every frame -- measured at 42 fps against 547 -- with nothing on
-    // screen to explain why. A control that lies about whether it is doing anything is worse than one
-    // that is switched off.
-    if (pipelineCheck) {
-        pipelineCheck->setEnabled(!bypass);
-        pipelineCheck->setText(bypass ? "Run the model alongside the frame (needs the composition)"
+    // These two used to be mutually exclusive, and the box stayed ticked while the layer ignored it,
+    // which is a control that lies. They combine now -- with the composition bypassed the model's
+    // answer is reprojected to the current camera every frame rather than presented where it was --
+    // so the box works either way and only its description changes.
+    if (pipelineCheck)
+        pipelineCheck->setText(bypass ? "Run the model alongside the frame (answer is reprojected)"
                                       : "Run the model alongside the frame");
-    }
 }
 
 // The settings, on tabs.
