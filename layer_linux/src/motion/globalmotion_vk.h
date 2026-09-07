@@ -83,12 +83,23 @@ class GlobalMotionVk {
     // few hundred candidate offsets over it is nothing.
     uint32_t _w[2]{}, _h[2]{};
     uint32_t _frameW = 0, _frameH = 0;
-    // Chosen from the displacement readings rather than from the correlation metric, which on this
-    // workload has a run-to-run spread of about 0.09 and cannot tell these apart. The reproducer pans
-    // at a known 2:1, and at radius 12 -- reaching +-108 frame pixels -- the reported ratio broke
-    // whenever the magnitude passed about 110, which is the search running out of room. At 16 it
-    // reaches +-140 and the ratio stays clean through the 129 pixel peaks.
-    int _radius[2] = { 16, 3 };
+    // Both of these were argued into the wrong place before being measured, so the reasoning is
+    // worth keeping.
+    //
+    // A coarser first level looks strictly better on paper -- range comes from cell size, so 96 wide
+    // reaches further than 160 for a third of the work. Measured twice, it is worse: 83% of the
+    // synchronous path's agreement against 93% for 160, because the coarse answer it hands the fine
+    // level is too rough for a three-cell window to recover.
+    //
+    // A wider radius does buy range, and at 12 the search reaches +-108 frame pixels while
+    // displacements were seen to reach 129. But widening it to 16 cost 30% of the frame rate, and
+    // this runs on the game's own queue -- so it lengthens the round trip, and the round trip is the
+    // displacement it was widened to cover. It pays for range in the currency that buys range.
+    //
+    // So: 160 wide, radius 12, and clipping handled rather than avoided. A match on the edge of the
+    // window reports almost no confidence, and the composition fades the edit instead of warping by a
+    // number known to be short. Degrading is cheaper than never being short.
+    int _radius[2] = { 12, 3 };
 
     // Two levels. The coarse one finds the displacement at all; the fine one pins it down to about a
     // pixel, which is what fine detail needs to stay correlated.
