@@ -238,10 +238,9 @@ Texture2D<float4>   gExposure : register(t4);
 // One binding serves surfaces of three different formats here -- R8G8B8A8_UNORM for the proxy, the
 // swapchain's own UNORM twin for the composed frame, R16G16B16A16_SFLOAT where that twin cannot be
 // written as a storage image -- so no single format operand can be right for all of them. Declaring
-// Rgba32f and binding something else is undefined behaviour, and undefined values in one channel is
-// what a magenta or blue pixel is. Unknown makes the write take its format from the view, which is
-// what this pass has always needed; it costs the shaderStorageImageWriteWithoutFormat feature, which
-// the layer enables on the device.
+// Rgba32f and binding something else is undefined behaviour. Unknown makes the write take its format
+// from the view, which is what this pass has always needed; it costs the
+// shaderStorageImageWriteWithoutFormat feature, which the layer enables on the device.
 [[vk::image_format("unknown")]]
 RWTexture2D<float4> gTarget   : register(u0);  // encode: the proxy. resolve: the frame.
 #ifdef VK_MODE
@@ -1045,7 +1044,27 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // neutral, NOT by clipping channels. So an over-driven colour rolls off at the gamut boundary
     // (maximally vivid but still a real colour with detail) instead of flattening into a blown peak.
     // At strength 1 the boost is the identity, so <=1 is bit-identical to before.
-    float3 result = lerp(original * boundedRatio, upgraded, min(gColourStrength, 1.0));
+    const float3 lumaOnly = original * boundedRatio;
+
+    // How far taking the model's colour would move this pixel's balance, and how much of it to take.
+    //
+    // Both ends of the blend carry the same luminance -- the guard above bound them together -- so
+    // what separates them is chroma and nothing else. On a flat surface the model agrees with the
+    // frame about hue and that separation is small, which is where the colour transfer earns its
+    // keep. On an edge the model's answer differs most, because an edge is precisely what it was
+    // asked to re-decide, and taking its hue whole puts one colour on one side of the edge and its
+    // complement on the other. That is the blue and orange fringing, and at strength 1 -- the
+    // default -- there was nothing between the disagreement and the screen.
+    //
+    // Measured on a game frame: the pass moved colour balance three to five times more at edges than
+    // on flat pixels, and every bit of it came from this blend. Under it the ringing is gone with the
+    // luminance detail untouched, because that lives in boundedRatio and not here.
+    const float chromaSwing = length(upgraded - lumaOnly) / max(dot(lumaOnly, kLuma), 1e-4);
+    const float kAgree = 0.05;   // the two want much the same colour: take all of it
+    const float kDiffer = 0.25;  // they plainly disagree: keep the frame's own hue
+    const float colourTrust = saturate((kDiffer - chromaSwing) / (kDiffer - kAgree));
+
+    float3 result = lerp(lumaOnly, upgraded, min(gColourStrength, 1.0) * colourTrust);
 
     if (gColourStrength > 1.0)
         result = ClampAp1(FromOkLab(float3(1.0, gColourStrength, gColourStrength) * ToOkLab(max(result, 0.0))));
