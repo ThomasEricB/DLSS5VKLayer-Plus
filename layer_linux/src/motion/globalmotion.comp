@@ -140,10 +140,25 @@ void main() {
     // which at this scale is several pixels of the real frame.
     float cx0 = At(bx - 1, by, span), cx2 = At(bx + 1, by, span);
     float cy0 = At(bx, by - 1, span), cy2 = At(bx, by + 1, span);
-    float dx = (cx0 - cx2) / max(2.0 * (cx0 - 2.0 * bestCost + cx2), 1e-6);
-    float dy = (cy0 - cy2) / max(2.0 * (cy0 - 2.0 * bestCost + cy2), 1e-6);
-    dx = clamp(dx, -1.0, 1.0);
-    dy = clamp(dy, -1.0, 1.0);
+
+    // Refine only where the minimum has a real shape to refine.
+    //
+    // The denominator here is the curvature of the cost surface, and dividing by it when it is nearly
+    // zero is what put a tremble on a completely still camera. Two frames of a motionless scene are
+    // not identical in any real game -- dithering, grain, a jittered sample pattern -- so the surface
+    // is flat with a little noise on it, the curvature is nothing, the old floor of 1e-6 let the
+    // quotient run away, and the clamp handed back a whole cell of displacement whose sign was picked
+    // by the noise. Four pixels at the fine level, eight at the coarse, different every frame, on a
+    // camera that was not moving.
+    //
+    // So the curvature has to be a real fraction of the cost before it is believed, and the offset is
+    // held to half a cell either way -- which is all a parabola through three samples can honestly
+    // say, since past that the true minimum belongs to the neighbouring sample instead.
+    const float kCurve = 1e-4 + 0.02 * mean;
+    const float curveX = cx0 - 2.0 * bestCost + cx2;
+    const float curveY = cy0 - 2.0 * bestCost + cy2;
+    float dx = curveX > kCurve ? clamp((cx0 - cx2) / (2.0 * curveX), -0.5, 0.5) : 0.0;
+    float dy = curveY > kCurve ? clamp((cy0 - cy2) / (2.0 * curveY), -0.5, 0.5) : 0.0;
 
     // How much better the winner is than the field it won against. A picture with real structure
     // gives a sharp minimum; a flat wall, a fade, or a scene that simply changed gives a shallow one,
@@ -179,38 +194,14 @@ void main() {
     vec2 measured = vec2(base.x + (float(bx - pc.radius) + dx) * pc.scaleX,
                         base.y + (float(by - pc.radius) + dy) * pc.scaleY);
 
-    // Only the finest level is smoothed, and it keeps its own memory. Sharing one state across levels
-    // was tried and was worse than no smoothing at all: the coarse pass runs first with its history
-    // cleared, zeroes the velocity, and leaves the fine pass predicting that the camera has stopped.
-    if (pc.track == 0) {
-        imageStore(uResult, ivec2(0, 0), vec4(measured, confidence, 1.0));
-        return;
-    }
-
-    // Between one answer and the next the reference picture is fixed, so the displacement from it
-    // grows smoothly -- the camera does not jump. The search is independent every frame, though, and
-    // measured against a known 6 pixels a frame it returned -10, 6, 14, 14, -10, 24: right on average
-    // and wrong every frame. That scatter is the judder. It is not a low frame rate, it is a frame
-    // rate whose steps are all different sizes, which the eye reads as one.
-    vec4 state = imageLoad(uState, ivec2(0, 0));
-    vec2 prev = imageLoad(uResult, ivec2(0, 0)).xy;
-    bool haveHistory = state.z > 0.5 && pc.reset == 0;
-
-    vec2 outp = measured;
-    if (haveHistory) {
-        // A constant-velocity prediction, because steady motion is the case that has to look right
-        // and a plain average would lag it.
-        vec2 predicted = prev + state.xy;
-        vec2 err = measured - predicted;
-        // Past this much disagreement the measurement is discarded and the prediction carries the
-        // frame, which is what stops one bad match putting a jolt on screen.
-        outp = dot(err, err) > pc.rejectPx * pc.rejectPx
-                   ? predicted
-                   : mix(predicted, measured, clamp(pc.alpha, 0.0, 1.0));
-    }
-    vec2 newVel = haveHistory ? mix(state.xy, outp - prev, 0.35) : vec2(0.0);
-
-    imageStore(uState, ivec2(0, 0), vec4(newVel, 1.0, 0.0));
-    imageStore(uResult, ivec2(0, 0), vec4(outp, confidence, 1.0));
+    // No temporal smoothing. It was tried twice and is worse both times.
+    //
+    // The constant-velocity form is underdamped: with the blend and the velocity gain used, the
+    // system matrix has complex eigenvalues of magnitude 0.74, so every disturbance decays as an
+    // oscillation rather than settling. That is a tremble by construction, and it is not fixable by
+    // choosing the constants more carefully without solving the real problem, which is that the
+    // measurement itself must not jump. Fixing the refinement above is that.
+    imageStore(uState, ivec2(0, 0), vec4(0.0, 0.0, 0.0, 0.0));
+    imageStore(uResult, ivec2(0, 0), vec4(measured, confidence, 1.0));
 }
 #endif

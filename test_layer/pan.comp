@@ -7,7 +7,7 @@
 // fine noise floor, so a pass that is working has real detail to enhance.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0, rgba16f) uniform writeonly image2D outImage;
-layout(push_constant) uniform PC { vec2 offset; uvec2 size; } pc;
+layout(push_constant) uniform PC { vec2 offset; uvec2 size; float contrast; float noise; uint frame; } pc;
 
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 
@@ -53,6 +53,17 @@ void main() {
     // Fine grain everywhere, so a working pass has detail to act on even on the floor.
     lum *= 0.92 + 0.16 * fbm(w * 1.7);
 
+    // Flattened toward a constant when asked, to imitate the case the panels cannot: a menu screen or
+    // a plain wall, where a global match has almost nothing to lock onto and the cost surface is
+    // nearly level.
+    lum = mix(0.12, lum, pc.contrast);
+
+    // A little that changes every frame even when nothing moves. Real frames are never identical --
+    // dithering, grain, a jittered sample pattern -- and a scene that repeats itself exactly is the
+    // one case a matcher can never fail on. Without this the reproducer cannot show what a still
+    // camera looks like in a real game.
+    if (pc.noise > 0.0)
+        lum += pc.noise * (hash(vec2(id) + vec2(float(pc.frame) * 7.13, float(pc.frame) * 3.71)) - 0.5);
     vec3 c = vec3(lum) * vec3(0.95, 1.0, 1.06);
     imageStore(outImage, id, vec4(c, 1.0));
 }

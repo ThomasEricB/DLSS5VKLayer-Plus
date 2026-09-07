@@ -29,7 +29,7 @@
 #define CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
     fprintf(stderr, "%s:%d: %s -> %d\n", __FILE__, __LINE__, #x, int(r_)); exit(1); } } while (0)
 
-struct PushConstants { float offsetX, offsetY; uint32_t width, height; };
+struct PushConstants { float offsetX, offsetY; uint32_t width, height; float contrast, noise; uint32_t frameNo; };
 
 static std::vector<char> ReadFile(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
@@ -52,12 +52,16 @@ static uint32_t FindMemoryType(VkPhysicalDevice pd, uint32_t bits, VkMemoryPrope
 int main(int argc, char** argv) {
     uint32_t frames = 400, width = 1280, height = 720, load = 0;
     float speed = 6.0f;
+    float contrast = 1.0f;
+    float noise = 0.0f;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = uint32_t(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--speed") && i + 1 < argc) speed = float(atof(argv[++i]));
         else if (!strcmp(argv[i], "--width") && i + 1 < argc) width = uint32_t(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--height") && i + 1 < argc) height = uint32_t(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--load") && i + 1 < argc) load = uint32_t(atoi(argv[++i]));
+        else if (!strcmp(argv[i], "--contrast") && i + 1 < argc) contrast = float(atof(argv[++i]));
+        else if (!strcmp(argv[i], "--noise") && i + 1 < argc) noise = float(atof(argv[++i]));
     }
 
     // ---- window -----------------------------------------------------------
@@ -337,6 +341,9 @@ int main(int argc, char** argv) {
         pc.offsetY = speed * 0.5f * float(frame);
         pc.width = width;
         pc.height = height;
+        pc.contrast = contrast;
+        pc.noise = noise;
+        pc.frameNo = frame;
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
         vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);

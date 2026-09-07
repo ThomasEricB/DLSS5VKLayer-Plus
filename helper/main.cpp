@@ -2129,9 +2129,14 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
         else ns.sceneCutStreak = 0;
         cut = ns.sceneCutStreak >= 2;
 
-        // The baseline follows the scene, but not into a cut: letting a cut raise it would leave the
-        // detector deaf for the next few frames, which is when a second cut is most likely.
-        if (!over) ns.cutBaseline += (float(mean) - ns.cutBaseline) * 0.1f;
+        // The baseline follows the scene either way, only more slowly while something looks like a
+        // cut. Updating it solely when the difference was *under* threshold could never work: during
+        // sustained fast movement every frame is over, so the baseline stayed at whatever the scene
+        // had been doing before -- often a still camera, near zero -- and the detector called a cut on
+        // every frame for as long as the player kept moving. 185 in a single run, each one throwing
+        // away the model's temporal history. The slower rate while over threshold keeps a real cut
+        // from raising the baseline enough to hide the next one.
+        ns.cutBaseline += (float(mean) - ns.cutBaseline) * (over ? 0.02f : 0.1f);
     }
     if (cut)
         Log("[mvec] scene cut detected mean=%d baseline=%.1f streak=%u", mean, ns.cutBaseline,
