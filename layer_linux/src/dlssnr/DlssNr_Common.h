@@ -202,6 +202,9 @@ struct alignas(256) DlssNrConstants
     // The radius, in uv, that splits a stale edit into the part that can ghost and the part that
     // cannot. 0 disables the split and applies the edit whole, which is what it did before.
     float EditBlurUv;
+
+    // Set when Motion's z channel says how far the displacement in x and y can be trusted.
+    uint32_t MotionConfident;
 };
 
 class DlssNr_Common

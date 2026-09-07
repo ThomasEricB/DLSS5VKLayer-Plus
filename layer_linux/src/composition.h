@@ -132,6 +132,11 @@ class Composition {
     bool RecordKeepSent(VkCommandBuffer cb);
     bool HasSentProxy() const { return _targetValid; }
 
+    // Whether the layer can measure the displacement itself. When it can, the helper's field is not
+    // read, and asking for it costs the helper a frame-sized copy and a blocking submit per round
+    // trip for nothing.
+    bool HasGlobalMotion() const { return _globalMotion != nullptr; }
+
     // How many round trips of motion the stale edit has to be moved by. The layer measures it; see
     // ShmMap::reprojScale.
     void SetReprojScale(float r) { _reprojScale = r; }

@@ -33,6 +33,7 @@ cbuffer Params : register(b0)
     uint  gReprojectEdit;  // 1 when gMotion holds a field that maps this frame back to that one
     float gGhostSlack;     // how far past its neighbours' brightness a pipelined pixel may land
     float gEditBlurUv;     // radius, in uv, that splits the stale edit into what may ghost and what cannot
+    uint  gMotionConfident;// 1 when gMotion's z channel carries how much the displacement is trusted
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -779,10 +780,21 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // displacement of n of its pixels is the same fraction of the picture whatever that raster
         // is. Dividing by the frame instead made the offset wrong by the working scale, which is why
         // supersampling ghosted while native did not.
-        const float2 mv = gMotion.SampleLevel(gLinear, cmpUv, 0).xy;
+        const float4 mvSample = gMotion.SampleLevel(gLinear, cmpUv, 0);
+        const float2 mv = mvSample.xy;
         const float2 back = float2(mv.x * gMvScaleX / max(gGuideWidth, 1u),
                                    mv.y * gMvScaleY / max(gGuideHeight, 1u));
         editUv = cmpUv + back;
+
+        // How much the displacement is worth trusting, when whoever measured it said.
+        //
+        // The layer's estimate reports how sharp its match was, and a shallow match means the picture
+        // had nothing to match on, or changed rather than moved, or moved further than the search
+        // could follow. Measured on a steady pan the figure sits between 0.7 and 1.0, so the knee is
+        // set below that: full trust from 0.5, nothing left by 0.15. It is a floor under the estimate
+        // rather than a tuning control -- on the cases it is meant to catch it goes to almost zero.
+        if (gMotionConfident != 0)
+            editValid *= smoothstep(0.15, 0.5, mvSample.z);
 
         // Off the edge of the frame the model saw means this content was not in it, so there is no
         // edit for it and the honest answer is the frame's own pixels.

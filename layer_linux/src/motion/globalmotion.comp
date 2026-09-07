@@ -148,6 +148,18 @@ void main() {
     // where this is low rather than warping by a number nobody should trust.
     float confidence = clamp((mean - bestCost) / max(mean, 1e-6), 0.0, 1.0);
 
+    // A winner sitting on the edge of the window is not a winner, it is the search running out of
+    // room: the true displacement is somewhere further out and this is the closest the search could
+    // get to it. Observed directly -- a pan whose displacement is a clean 2:1 in x and y reported
+    // ratios of 1.5 whenever the magnitude reached the edge of the range. Saying so costs nothing and
+    // lets the composition fade rather than warp by a number that is known to be short.
+    // Only at the coarse level. There, the window is the whole range the search can see, so its edge
+    // really does mean "further out than I can look". At the fine level the window is three cells
+    // either side of the coarse answer, and landing on its edge means only that the coarse answer was
+    // slightly off -- which is what the fine level is for. Penalising that was measured taking a
+    // sixth of the agreement away for nothing.
+    if (pc.useBase == 0 && (bx == 0 || by == 0 || bx == span - 1 || by == span - 1)) confidence *= 0.15;
+
     // The coarse displacement is quantised to this level's cell, which is exactly what the fine
     // search was centred on, so it is added back in whole rather than re-derived.
     vec2 base = vec2(0.0);

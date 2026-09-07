@@ -75,7 +75,7 @@ GlobalMotionVk::GlobalMotionVk(const DeviceTable* vk, const InstanceTable* insta
         _h[lvl] = std::max<uint32_t>(16, uint32_t(std::lround(double(_w[lvl]) * double(frameHeight) /
                                                               double(frameWidth))));
         if (!MakeImg(_now[lvl], _w[lvl], _h[lvl]) || !MakeImg(_then[lvl], _w[lvl], _h[lvl]) ||
-            !MakeImg(_result[lvl], 1, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT))
+            !MakeImg(_result[lvl], 1, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
             return;
     }
 
@@ -102,6 +102,34 @@ GlobalMotionVk::GlobalMotionVk(const DeviceTable* vk, const InstanceTable* insta
         return _vk->vkBindBufferMemory(_device, *b, *m, 0) == VK_SUCCESS;
     };
     if (!makeBuf(&_costBuf, &_costMem, VkDeviceSize(span) * span * sizeof(float))) return;
+
+    // A host-visible copy of the result, for the diagnostic readback.
+    {
+        VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bi.size = 4 * sizeof(float);
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (_vk->vkCreateBuffer(_device, &bi, nullptr, &_readBuf) == VK_SUCCESS) {
+            VkMemoryRequirements mr{};
+            _vk->vkGetBufferMemoryRequirements(_device, _readBuf, &mr);
+            VkPhysicalDeviceMemoryProperties mp{};
+            instance->vkGetPhysicalDeviceMemoryProperties(_physical, &mp);
+            uint32_t type = UINT32_MAX;
+            const VkMemoryPropertyFlags want =
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+                if ((mr.memoryTypeBits & (1u << i)) &&
+                    (mp.memoryTypes[i].propertyFlags & want) == want) { type = i; break; }
+            if (type != UINT32_MAX) {
+                VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                ai.allocationSize = mr.size;
+                ai.memoryTypeIndex = type;
+                if (_vk->vkAllocateMemory(_device, &ai, nullptr, &_readMem) == VK_SUCCESS &&
+                    _vk->vkBindBufferMemory(_device, _readBuf, _readMem, 0) == VK_SUCCESS)
+                    _vk->vkMapMemory(_device, _readMem, 0, mr.size, 0, &_readMap);
+            }
+        }
+    }
 
     _reduce = std::make_unique<GmPass>(
         "dlssnr-gm-reduce", vk, instance, device, physicalDevice, gm_reduce_spv, sizeof(gm_reduce_spv),
@@ -136,6 +164,8 @@ GlobalMotionVk::~GlobalMotionVk() {
         DropImg(_then[lvl]);
         DropImg(_result[lvl]);
     }
+    if (_readBuf) _vk->vkDestroyBuffer(_device, _readBuf, nullptr);
+    if (_readMem) _vk->vkFreeMemory(_device, _readMem, nullptr);
     if (_costBuf) _vk->vkDestroyBuffer(_device, _costBuf, nullptr);
     if (_costMem) _vk->vkFreeMemory(_device, _costMem, nullptr);
 }
@@ -297,6 +327,21 @@ bool GlobalMotionVk::Record(VkCommandBuffer cb, VkImageView now, VkImageView the
         }
         flush();
     }
+    return true;
+}
+
+void GlobalMotionVk::RecordReadback(VkCommandBuffer cb) {
+    if (!_ok || !_readBuf) return;
+    Barrier(cb, _result[1], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy r{};
+    r.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    r.imageExtent = { 1, 1, 1 };
+    _vk->vkCmdCopyImageToBuffer(cb, _result[1].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _readBuf, 1, &r);
+}
+
+bool GlobalMotionVk::ReadLast(float out[4]) const {
+    if (!_readMap) return false;
+    std::memcpy(out, _readMap, 4 * sizeof(float));
     return true;
 }
 

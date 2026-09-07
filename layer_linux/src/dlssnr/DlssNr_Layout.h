@@ -53,5 +53,6 @@ DLSSNR_PIN(Pipelined, 92);
 DLSSNR_PIN(ReprojectEdit, 96);
 DLSSNR_PIN(GhostSlack, 100);
 DLSSNR_PIN(EditBlurUv, 104);
+DLSSNR_PIN(MotionConfident, 108);
 
 #undef DLSSNR_PIN

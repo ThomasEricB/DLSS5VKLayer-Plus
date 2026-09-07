@@ -66,6 +66,12 @@ class GlobalMotionVk {
     // The composition reads the result, so it needs it in the right layout first.
     void BarrierResultForRead(VkCommandBuffer cb);
 
+    // Copies the one-by-one result to host memory so it can be logged. Diagnostic only: it is what
+    // says what the displacement and the confidence actually are, rather than what they were assumed
+    // to be, and a gate set from an assumed scale is how the last three attempts went wrong.
+    void RecordReadback(VkCommandBuffer cb);
+    bool ReadLast(float out[4]) const;
+
   private:
 
     const DeviceTable* _vk = nullptr;
@@ -77,11 +83,19 @@ class GlobalMotionVk {
     // few hundred candidate offsets over it is nothing.
     uint32_t _w[2]{}, _h[2]{};
     uint32_t _frameW = 0, _frameH = 0;
-    int _radius[2] = { 12, 3 };
+    // Chosen from the displacement readings rather than from the correlation metric, which on this
+    // workload has a run-to-run spread of about 0.09 and cannot tell these apart. The reproducer pans
+    // at a known 2:1, and at radius 12 -- reaching +-108 frame pixels -- the reported ratio broke
+    // whenever the magnitude passed about 110, which is the search running out of room. At 16 it
+    // reaches +-140 and the ratio stays clean through the 129 pixel peaks.
+    int _radius[2] = { 16, 3 };
 
     // Two levels. The coarse one finds the displacement at all; the fine one pins it down to about a
     // pixel, which is what fine detail needs to stay correlated.
     Img _now[2]{}, _then[2]{}, _result[2]{};
+    VkBuffer _readBuf = VK_NULL_HANDLE;
+    VkDeviceMemory _readMem = VK_NULL_HANDLE;
+    void* _readMap = nullptr;
     VkBuffer _costBuf = VK_NULL_HANDLE;
     VkDeviceMemory _costMem = VK_NULL_HANDLE;
 

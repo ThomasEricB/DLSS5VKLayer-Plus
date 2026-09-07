@@ -982,7 +982,20 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
             Transition(cb, _proxy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             Transition(cb, *stale, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             globalMotion = _globalMotion->Record(cb, _proxy.view, stale->view);
-            if (globalMotion) _globalMotion->BarrierResultForRead(cb);
+            if (globalMotion) {
+                // What the estimate actually said, reported rather than assumed. The gate that will
+                // read the confidence has to be calibrated against real values.
+                if (TimeEnabled()) {
+                    float v[4] = {};
+                    if (_globalMotion->ReadLast(v)) {
+                        static int n = 0;
+                        if (++n % (TimeInterval() * 4) == 0)
+                            Log("[gm] displacement %.1f, %.1f px, confidence %.3f", v[0], v[1], v[2]);
+                    }
+                    _globalMotion->RecordReadback(cb);
+                }
+                _globalMotion->BarrierResultForRead(cb);
+            }
         }
     }
 
@@ -1009,6 +1022,7 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         res.MvScaleY = 1.0f;
         res.GuideWidth = _width;
         res.GuideHeight = _height;
+        res.MotionConfident = 1u;
     } else if (reproject) {
         // The field is in pixels of the frame, which is what the estimate produces, and covers the
         // whole frame.

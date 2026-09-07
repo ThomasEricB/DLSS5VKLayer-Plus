@@ -1450,9 +1450,15 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         // is what the additive path lays the stale edit onto -- while the pair being differenced is
         // the one kept aside when it was sent.
         const size_t modelBytes = size_t(sc.comp->ModelWidth()) * sc.comp->ModelHeight() * 4;
-        // Ask the helper for the motion field: only this path can use one, and it is a frame-sized
-        // copy on its side every frame, so it is not asked for when nothing will read it.
-        if (dc->shm.hdr) dc->shm.hdr->wantMotion.store(1);
+        // Ask the helper for the motion field only when it will actually be read.
+        //
+        // Since the layer measures the displacement itself -- over the interval that matters, which
+        // the helper's field cannot cover -- that field is dead weight whenever the estimate is
+        // available. Publishing it costs the helper a frame-sized copy and a blocking submit on every
+        // round trip, and the round trip is the edit's staleness, which is the ghost. Measured, the
+        // readback it sits inside is 2.8 ms of a 13.8 ms round trip.
+        const bool wantField = !sc.comp->HasGlobalMotion();
+        if (dc->shm.hdr) dc->shm.hdr->wantMotion.store(wantField ? 1u : 0u);
 
         dc->shm.frames++;
         const bool haveAnswer = ShmCollect(dc->shm, modelBytes, sc.comp->ModelPixels());
@@ -1482,7 +1488,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         // The motion field that came with this answer, if one did. It maps this frame back to the
         // frame the answer belongs to, so the edit can be sampled from under its own content rather
         // than left on the edges that content has moved off.
-        if (haveAnswer && dc->shm.hdr && dc->shm.motionBuf) {
+        if (wantField && haveAnswer && dc->shm.hdr && dc->shm.motionBuf) {
             const uint32_t mseq = dc->shm.hdr->motionSeq.load();
             const uint32_t mw = dc->shm.hdr->motionW.load();
             const uint32_t mh = dc->shm.hdr->motionH.load();
