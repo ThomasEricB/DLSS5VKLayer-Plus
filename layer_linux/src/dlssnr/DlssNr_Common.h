@@ -189,6 +189,10 @@ struct alignas(256) DlssNrConstants
     // the additive path: the frame keeps its own pixels and only the edit is a frame behind. Last in
     // the block on purpose -- everything above it has a pinned offset.
     uint32_t Pipelined;
+
+    // Set when Motion holds a field mapping this frame back to the one the answer belongs to, so the
+    // stale pair can be sampled where this pixel was rather than where it is.
+    uint32_t ReprojectEdit;
 };
 
 class DlssNr_Common

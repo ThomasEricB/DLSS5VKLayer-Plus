@@ -141,6 +141,10 @@ struct ShmMap {
     VkDevice zcDevice = VK_NULL_HANDLE;
     VkDeviceMemory inMem = VK_NULL_HANDLE, outMem = VK_NULL_HANDLE;
     VkBuffer inBuf = VK_NULL_HANDLE, outBuf = VK_NULL_HANDLE;
+    VkDeviceMemory motionMem = VK_NULL_HANDLE;
+    VkBuffer motionBuf = VK_NULL_HANDLE;
+    uint8_t* motionPixels = nullptr;
+    uint32_t motionSeqSeen = 0;
     size_t importedBytes = 0;
     bool zeroCopy = false;
     bool dead = false;
@@ -183,6 +187,10 @@ static bool EnsureParentDir(const std::string& path) {
 // what runs, unchanged.
 static void ShmReleaseImports(ShmMap& s, const dlssnr::DeviceTable* vk) {
     if (!vk || s.zcDevice == VK_NULL_HANDLE) return;
+    if (s.motionBuf) vk->vkDestroyBuffer(s.zcDevice, s.motionBuf, nullptr);
+    if (s.motionMem) vk->vkFreeMemory(s.zcDevice, s.motionMem, nullptr);
+    s.motionBuf = VK_NULL_HANDLE;
+    s.motionMem = VK_NULL_HANDLE;
     if (s.inBuf) vk->vkDestroyBuffer(s.zcDevice, s.inBuf, nullptr);
     if (s.outBuf) vk->vkDestroyBuffer(s.zcDevice, s.outBuf, nullptr);
     if (s.inMem) vk->vkFreeMemory(s.zcDevice, s.inMem, nullptr);
@@ -277,6 +285,10 @@ static void ShmImportFrames(ShmMap& s, const dlssnr::DeviceTable* vk, const dlss
         ShmReleaseImports(s, vk);
         return;
     }
+    // Best-effort: without it the pipelined path simply lays the edit down unmoved, as it did before.
+    ShmImportOne(vk, pd, inst, device, s.motionPixels, bytes,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 &s.motionMem, &s.motionBuf);
     s.importedBytes = bytes;
     s.zeroCopy = true;
     Log("[shm] zero copy: both regions imported as device memory (%zu bytes each)", bytes);
@@ -292,22 +304,33 @@ static bool ShmMapFrames(ShmMap& s, size_t bytes) {
 
     if (s.inPixels) munmap(s.inPixels, s.mappedFrameBytes);
     if (s.outPixels) munmap(s.outPixels, s.mappedFrameBytes);
-    s.inPixels = s.outPixels = nullptr;
+    if (s.motionPixels) munmap(s.motionPixels, s.mappedFrameBytes);
+    s.inPixels = s.outPixels = s.motionPixels = nullptr;
     s.mappedFrameBytes = 0;
 
     void* in = mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_SHARED, s.fd, (off_t) kHeaderBytes);
     if (in == MAP_FAILED) { Log("[shm] could not map the input region (%zu bytes)", want); return false; }
 
+    void* motion = mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_SHARED, s.fd,
+                        (off_t) ShmMotionOffset());
+    if (motion == MAP_FAILED) {
+        munmap(in, want);
+        Log("[shm] could not map the motion region (%zu bytes)", want);
+        return false;
+    }
+
     void* out = mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_SHARED, s.fd,
                      (off_t) (kHeaderBytes + kMaxFrame));
     if (out == MAP_FAILED) {
         munmap(in, want);
+        munmap(motion, want);
         Log("[shm] could not map the output region (%zu bytes)", want);
         return false;
     }
 
     s.inPixels = (uint8_t*) in;
     s.outPixels = (uint8_t*) out;
+    s.motionPixels = (uint8_t*) motion;
     s.mappedFrameBytes = want;
     return true;
 }
@@ -1300,7 +1323,30 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         }
     }
 
-    if (fs.pipelined) {
+    // Bypass presents the model's raw answer as the frame, with no composition at all -- so with the
+    // round trip running alongside, the picture on screen would be the model's answer for an older
+    // frame, whole. Not a stale edit on a current frame, a stale frame. Everything that makes the
+    // pipelined path safe lives in the composition it is bypassing: the frame's own pixels
+    // underneath, the reprojection, the check that the edit still describes what is there.
+    //
+    // So the two do not combine, and the round trip waits while the composition is bypassed. Said
+    // once, because it is a setting the user chose and they should know which one is winning.
+    // Bypass presents the model's raw answer as the frame, with no composition at all -- so with the
+    // round trip running alongside, the picture on screen would be the model's answer for an older
+    // frame, whole. Everything that makes the pipelined path safe lives in the composition it is
+    // bypassing: the frame's own pixels underneath, the reprojection, the check that the edit still
+    // describes what is there.
+    const bool pipelined = fs.pipelined && !fs.compositionBypass;
+    if (fs.pipelined && fs.compositionBypass) {
+        static std::once_flag said;
+        std::call_once(said, [] {
+            Log("[layer] the composition is bypassed, so the model's answer is the frame itself and "
+                "cannot be a frame old; running the round trip in front of the frame instead. Turn "
+                "the composition on to run it alongside.");
+        });
+    }
+
+    if (pipelined) {
         // One command buffer, one submit, and no waiting on the helper at all.
         //
         // Order: grab this frame, encode it, put the encode aside as what is being sent, then compose
@@ -1309,6 +1355,10 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         // is what the additive path lays the stale edit onto -- while the pair being differenced is
         // the one kept aside when it was sent.
         const size_t modelBytes = size_t(sc.comp->ModelWidth()) * sc.comp->ModelHeight() * 4;
+        // Ask the helper for the motion field: only this path can use one, and it is a frame-sized
+        // copy on its side every frame, so it is not asked for when nothing will read it.
+        if (dc->shm.hdr) dc->shm.hdr->wantMotion.store(1);
+
         const bool haveAnswer = ShmCollect(dc->shm, modelBytes, sc.comp->ModelPixels());
         // Free to send only when the helper has finished with the last request *and* the last send
         // has actually been handed over. The publish is deferred by a frame now, and recording a
@@ -1316,7 +1366,13 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         // told to read -- and, on the copying fallback, the staging the publish still reads from.
         const bool mayPublish = ShmInputFree(dc->shm) && !dc->shm.dead &&
                                 sc.pendingSlot >= SwapchainState::kSlots;
-        if (haveAnswer) sc.comp->MarkModelFrame();
+        if (haveAnswer) {
+            // The proxy this answer was computed from becomes the matched one, before anything reads
+            // the pair. Until now it was held aside as "in flight" precisely so the composition kept
+            // differencing the previous answer against the picture *it* came from.
+            sc.comp->AdoptSentProxy();
+            sc.comp->MarkModelFrame();
+        }
         const bool willCompose = sc.comp->HasModelFrame() && sc.comp->HasSentProxy();
         if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
         // Grabbed and encoded every frame, whether or not the helper is ready for another request.
@@ -1327,6 +1383,19 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             dc->vkEndCommandBuffer(cb);
             return false;
         }
+        // The motion field that came with this answer, if one did. It maps this frame back to the
+        // frame the answer belongs to, so the edit can be sampled from under its own content rather
+        // than left on the edges that content has moved off.
+        if (haveAnswer && dc->shm.hdr && dc->shm.motionBuf) {
+            const uint32_t mseq = dc->shm.hdr->motionSeq.load();
+            const uint32_t mw = dc->shm.hdr->motionW.load();
+            const uint32_t mh = dc->shm.hdr->motionH.load();
+            if (mseq != dc->shm.motionSeqSeen && mw && mh) {
+                dc->shm.motionSeqSeen = mseq;
+                sc.comp->RecordMotion(cb, dc->shm.motionBuf, mw, mh);
+            }
+        }
+
         // Composed before the encode's proxy is claimed as "sent", so the pair kept aside is still
         // the one this answer was computed from.
         if (willCompose && !sc.comp->RecordCompose(cb, swapchainImage, fs, haveAnswer)) {
@@ -1396,6 +1465,8 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         }
         return true;
     }
+
+    if (dc->shm.hdr && !pipelined) dc->shm.hdr->wantMotion.store(0);
 
     // ---- leg 1: the frame the model is shown ----
     if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;

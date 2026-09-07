@@ -32,7 +32,8 @@
 static constexpr uint32_t kShmMagic = 0x32524E47;
 // v8: two sides grew the header at once -- compositionBypass and rebuildSettleMs upstream, pipeline
 // here -- so neither side's number describes this layout.
-static constexpr uint32_t kShmVersion = 8;
+// v9: a third region for the motion field, so the header, the file size and the offsets all moved.
+static constexpr uint32_t kShmVersion = 9;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
@@ -163,7 +164,13 @@ inline std::string ShmRuntimeDir() {
 
 inline std::string ShmDefaultPath() { return ShmRuntimeDir() + "/shm.bin"; }
 
-inline size_t ShmTotalBytes() { return kHeaderBytes + kMaxFrame * 2; }
+// Three regions now: the proxy going out, the answer coming back, and the motion field that says
+// where each of this frame's pixels was in the frame the answer belongs to. Sparse on disk, so the
+// third costs what is written rather than what is reserved.
+inline size_t ShmTotalBytes() { return kHeaderBytes + kMaxFrame * 3; }
+
+// Where the helper writes the motion field and the layer reads it.
+inline size_t ShmMotionOffset() { return kHeaderBytes + kMaxFrame * 2; }
 
 // Both pixel regions start on a page boundary, and that is load-bearing rather than tidy.
 //
@@ -360,6 +367,17 @@ struct ShmHeader {
     // shader takes an additive path for it so the game's own pixels survive; the layer keeps the
     // proxy that went with each answer so the difference it applies is the edit and nothing else.
     std::atomic<uint32_t> pipeline;
+
+    // The layer asking the helper for the motion field, and the helper saying it put one there.
+    //
+    // Only the pipelined path needs it -- it is what lets a one-frame-old edit be moved to where its
+    // content has got to -- and copying a frame-sized field every frame is not free, so the helper
+    // writes it when asked and not otherwise. motionSeq carries the request the field belongs to, so
+    // the layer can tell a field for the answer it is holding from one for a newer request.
+    std::atomic<uint32_t> wantMotion;
+    std::atomic<uint32_t> motionSeq;
+    std::atomic<uint32_t> motionW;
+    std::atomic<uint32_t> motionH;
     std::atomic<uint32_t> mvecEnabled;
     std::atomic<uint32_t> mvecScaleMode;
     std::atomic<uint32_t> mvecQuality;
@@ -395,7 +413,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1888, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1904, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -478,6 +496,7 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->scalingDownscaler.store(kDownscaleLanczos3);
 
     h->pipeline.store(0);
+    h->wantMotion.store(0);
     h->mvecEnabled.store(1);
     h->mvecScaleMode.store(kMVecPixels);
     h->mvecQuality.store(kMVecBalanced);

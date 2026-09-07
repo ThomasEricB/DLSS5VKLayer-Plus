@@ -50,5 +50,6 @@ DLSSNR_PIN(ApplyModel, 80);
 DLSSNR_PIN(UseGameExposure, 84);
 DLSSNR_PIN(ExposurePreMul, 88);
 DLSSNR_PIN(Pipelined, 92);
+DLSSNR_PIN(ReprojectEdit, 96);
 
 #undef DLSSNR_PIN

@@ -64,6 +64,7 @@ struct ShmMap {
     ShmHeader* hdr = nullptr;
     uint8_t* inPixels = nullptr;
     uint8_t* outPixels = nullptr;
+    uint8_t* motionPixels = nullptr;
 };
 
 static bool ShmOpen(ShmMap& s) {
@@ -92,6 +93,7 @@ static bool ShmOpen(ShmMap& s) {
     if (!s.base) { Log("[helper] MapViewOfFile failed"); return false; }
     s.hdr = (ShmHeader*)s.base;
     s.inPixels = (uint8_t*)s.base + kHeaderBytes;
+    s.motionPixels = (uint8_t*)s.base + ShmMotionOffset();
     s.outPixels = s.inPixels + kMaxFrame;
     if (s.hdr->magic.load() != kShmMagic || s.hdr->version.load() != kShmVersion ||
         s.hdr->passes.load() == 0) {
@@ -198,6 +200,9 @@ struct VkCtx {
     bool hostImport = false;
     VkDeviceMemory frameInMem = VK_NULL_HANDLE, frameOutMem = VK_NULL_HANDLE;
     VkBuffer frameInBuf = VK_NULL_HANDLE, frameOutBuf = VK_NULL_HANDLE;
+    VkDeviceMemory motionMem = VK_NULL_HANDLE;
+    VkBuffer motionBuf = VK_NULL_HANDLE;
+    void* importedMotion = nullptr;
     void* importedIn = nullptr;
     void* importedOut = nullptr;
     size_t importedBytes = 0;
@@ -341,7 +346,19 @@ static bool CreateContext(VkCtx& c) {
     Log("[helper] queue family=%u flags=%#x optical=%u",
         c.queueFamily, fams[c.queueFamily].queueFlags, c.opticalQueueFamily);
 
-    float prio = 1.0f;
+    // Lowest, deliberately.
+    //
+    // This process shares a GPU with the game it is helping, and its work is long: at a working scale
+    // of 200% the model runs over four times the frame's pixels. Asking for the top priority -- which
+    // is what 1.0 does -- tells the driver to let that run ahead of whatever the game has queued, so
+    // the game's frames land whenever the model is between passes rather than when they are ready.
+    // A game that reports a hundred frames a second and delivers them in clumps is what that feels
+    // like. The pass is the guest here; it waits.
+    //
+    // DLSSNR_HELPER_PRIORITY overrides it for anyone wanting to measure the difference.
+    float prio = 0.0f;
+    if (const char* p = getenv("DLSSNR_HELPER_PRIORITY")) prio = (float) atof(p);
+    Log("[helper] queue priority %.2f", prio);
     std::vector<VkDeviceQueueCreateInfo> qcis;
     VkDeviceQueueCreateInfo qci{};
     qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -764,6 +781,9 @@ static bool SubmitAndWait(VkCtx& c, VkCommandBuffer cb) {
 //
 // Best-effort throughout: any failure leaves the buffers null and every user falls back to staging.
 static void ReleaseFrameImports(VkCtx& c) {
+    if (c.motionBuf) vkDestroyBuffer(c.device, c.motionBuf, nullptr);
+    if (c.motionMem) vkFreeMemory(c.device, c.motionMem, nullptr);
+    c.motionBuf = VK_NULL_HANDLE; c.motionMem = VK_NULL_HANDLE; c.importedMotion = nullptr;
     if (c.frameInBuf) vkDestroyBuffer(c.device, c.frameInBuf, nullptr);
     if (c.frameOutBuf) vkDestroyBuffer(c.device, c.frameOutBuf, nullptr);
     if (c.frameInMem) vkFreeMemory(c.device, c.frameInMem, nullptr);
@@ -823,6 +843,16 @@ static bool ImportOneRegion(VkCtx& c, void* host, size_t bytes, VkDeviceMemory* 
 
 // The regions are imported at a page-rounded size covering this frame. The layer maps its own side
 // the same way, so the two agree on the pages even though the addresses differ.
+static void EnsureMotionImport(VkCtx& c, void* motion, size_t bytes) {
+    if (!c.hostImport || !motion) return;
+    const size_t want = ((bytes + kHostImportAlignment - 1) / kHostImportAlignment) * kHostImportAlignment;
+    if (c.motionBuf && c.importedMotion == motion) return;
+    if (c.motionBuf) vkDestroyBuffer(c.device, c.motionBuf, nullptr);
+    if (c.motionMem) vkFreeMemory(c.device, c.motionMem, nullptr);
+    c.motionBuf = VK_NULL_HANDLE; c.motionMem = VK_NULL_HANDLE;
+    if (ImportOneRegion(c, motion, want, &c.motionMem, &c.motionBuf)) c.importedMotion = motion;
+}
+
 static void EnsureFrameImports(VkCtx& c, void* in, void* out, size_t bytes) {
     if (!c.hostImport || !in || !out) return;
 
@@ -2523,6 +2553,42 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
 
     if (!last || !ReadbackPixels(ns.vk, *last, bytes, ns.vk.frameOutBuf)) return false;
     if (!ns.vk.frameOutBuf) std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
+
+    // The motion field, when the layer has asked for one. It says where each pixel of the *next*
+    // frame was in this one, which is what lets the layer move this answer's edit to where its
+    // content has got to instead of leaving it on the previous frame's edges.
+    //
+    // Written only on request: it is a frame-sized copy every frame, and only the pipelined path has
+    // any use for it.
+    if (shm.hdr->wantMotion.load() && ns.flow.enabled && ns.mv.image) {
+        EnsureMotionImport(ns.vk, shm.motionPixels, ImageSizeBytes(ns.vk, ns.mv));
+        const size_t mvBytes = ImageSizeBytes(ns.vk, ns.mv);
+        if (ns.vk.motionBuf) {
+            if (!BeginCmd(ns.vk.cmdScratch)) return false;
+            TransitionImage(ns.vk, ns.vk.cmdScratch, ns.mv, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy r{};
+            r.imageSubresource = { ns.mv.aspect(), 0, 0, 1 };
+            r.imageExtent = { ns.mv.width, ns.mv.height, 1 };
+            vkCmdCopyImageToBuffer(ns.vk.cmdScratch, ns.mv.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   ns.vk.motionBuf, 1, &r);
+            BarrierBeforeExternalRead(ns.vk.cmdScratch);
+            TransitionImage(ns.vk, ns.vk.cmdScratch, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            if (SubmitAndWait(ns.vk, ns.vk.cmdScratch)) {
+                shm.hdr->motionW.store(ns.mv.width);
+                shm.hdr->motionH.store(ns.mv.height);
+                shm.hdr->motionSeq.store(shm.hdr->seq_req.load());
+            }
+        } else if (mvBytes <= ns.vk.stagingSize && ReadbackPixels(ns.vk, ns.mv, mvBytes)) {
+            std::memcpy(shm.motionPixels, ns.vk.readMap, mvBytes);
+            shm.hdr->motionW.store(ns.mv.width);
+            shm.hdr->motionH.store(ns.mv.height);
+            shm.hdr->motionSeq.store(shm.hdr->seq_req.load());
+        }
+    }
     const double tDone = time ? NowMs() : 0.0;
 
     ++ns.evaluates;

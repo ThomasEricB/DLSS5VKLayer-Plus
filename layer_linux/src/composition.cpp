@@ -1,5 +1,7 @@
 #include "composition.h"
 
+#include <utility>
+
 #include <cstdlib>
 #include "log.h"
 
@@ -142,7 +144,13 @@ void Composition::DropAll() {
     DropImage(_work);
     DropImage(_proxySent);
     DropImage(_workSent);
+    DropImage(_proxyFlight);
+    DropImage(_workFlight);
+    _flightValid = false;
+    DropImage(_motion);
     _sentValid = false;
+    _motionValid = false;
+    _motionW = _motionH = 0;
     DropImage(_model);
     DropImage(_composed);
     DropImage(_modelNative);
@@ -412,6 +420,8 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
         MakeImage(_keep, width, height, _keepFormat, sampled | storage) &&
         MakeImage(_proxy, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | storage | src) &&
         MakeImage(_proxySent, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
+        MakeImage(_proxyFlight, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
+
         MakeImage(_model, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
         MakeImage(_composed, width, height, work, storage | src) &&
         MakeHostBuffer(_download, size_t(modelW) * modelH * 4, dst) &&
@@ -431,6 +441,8 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
     const bool okWork = (!needWork || MakeImage(_work, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
                                                 sampled | storage | src)) &&
                         (!needWork || MakeImage(_workSent, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
+                                                sampled | dst)) &&
+                        (!needWork || MakeImage(_workFlight, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
                                                 sampled | dst));
 
     // The averaged answer, and the two filters that get there. Built only when supersampling.
@@ -709,6 +721,35 @@ bool Composition::RecordEncode(VkCommandBuffer cb, const FrameSettings& s) {
 // scale of 200% the model takes several frames, so most frames could not send -- and skipped the
 // encode with it, presenting the same picture until one could. Full frame rate, a third of the
 // pictures.
+// Upload the helper's motion field for the answer being held.
+bool Composition::RecordMotion(VkCommandBuffer cb, VkBuffer from, uint32_t w, uint32_t h) {
+    if (!_usable || !from || !w || !h) return false;
+
+    // Built at the field's own size, which is the raster the model works at -- above a working scale
+    // of 1 that is larger than the frame, and demanding it match the frame is what left supersampling
+    // with no reprojection at all.
+    if (!_motion.image || _motionW != w || _motionH != h) {
+        DropImage(_motion);
+        if (!MakeImage(_motion, w, h, VK_FORMAT_R16G16_SFLOAT,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            _motionValid = false;
+            return false;
+        }
+        _motionW = w;
+        _motionH = h;
+    }
+
+    BarrierAfterExternalWrite(cb);
+    Transition(cb, _motion, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy r{};
+    r.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    r.imageExtent = { _motionW, _motionH, 1 };
+    _vk->vkCmdCopyBufferToImage(cb, from, _motion.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+    Transition(cb, _motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    _motionValid = true;
+    return true;
+}
+
 bool Composition::RecordSend(VkCommandBuffer cb, const FrameSettings& s) {
     if (!_usable) return false;
 
@@ -755,7 +796,7 @@ bool Composition::RecordSend(VkCommandBuffer cb, const FrameSettings& s) {
 // Put aside the picture the model is being shown, so the answer can be differenced against it rather
 // than against whatever the encode has written by the time it comes back.
 bool Composition::RecordKeepSent(VkCommandBuffer cb) {
-    if (!_usable || !_proxySent.image) return false;
+    if (!_usable || !_proxyFlight.image) return false;
 
     const auto copy = [&](Image& from, Image& to) {
         Transition(cb, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -768,9 +809,9 @@ bool Composition::RecordKeepSent(VkCommandBuffer cb) {
                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
         Transition(cb, to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     };
-    copy(_proxy, _proxySent);
-    if (_work.image && _workSent.image) copy(_work, _workSent);
-    _sentValid = true;
+    copy(_proxy, _proxyFlight);
+    if (_work.image && _workFlight.image) copy(_work, _workFlight);
+    _flightValid = true;
     return true;
 }
 
@@ -818,8 +859,27 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     res.Mode = DlssNrMode_Resolve;
     res.Width = _width;
     res.Height = _height;
-    if (!_pass->Dispatch(cb, res, _width, _height, source->view, answer->view, _keep.view, VK_NULL_HANDLE,
-                         _composed.view, VK_NULL_HANDLE))
+    const bool reproject = s.pipelined && sent && _motionValid && _motion.image;
+    if (s.pipelined) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Log("[comp] reprojection %s (sent=%d motionValid=%d image=%d)",
+                reproject ? "on" : "OFF", int(sent), int(_motionValid), int(_motion.image != VK_NULL_HANDLE));
+        }
+    }
+    res.ReprojectEdit = reproject ? 1u : 0u;
+    if (reproject) {
+        // The field is in pixels of the frame, which is what the estimate produces, and covers the
+        // whole frame.
+        res.MvScaleX = 1.0f;
+        res.MvScaleY = 1.0f;
+        res.GuideWidth = _motionW;
+        res.GuideHeight = _motionH;
+        Transition(cb, _motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    if (!_pass->Dispatch(cb, res, _width, _height, source->view, answer->view, _keep.view,
+                         reproject ? _motion.view : VK_NULL_HANDLE, _composed.view, VK_NULL_HANDLE))
         return false;
 
     Transition(cb, _composed, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);

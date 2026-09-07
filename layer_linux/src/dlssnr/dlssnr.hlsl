@@ -30,6 +30,7 @@ cbuffer Params : register(b0)
     uint  gUseGameExposure;// D3D12 source-1 only: 1 = read the game's live exposure in-shader (t4)
     float gExposurePreMul; // preExposure * trim, so the live white point is gExposurePreMul / exposure
     uint  gPipelined;      // 1 when the answer is for an earlier frame than the one being written
+    uint  gReprojectEdit;  // 1 when gMotion holds a field that maps this frame back to that one
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -744,8 +745,40 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     // Sampled rather than loaded: when the model ran at a reduced resolution these are smaller than the
     // frame, and its edit is enlarged here while the frame underneath stays untouched.
-    float4 proxySample = gSource.SampleLevel(gLinear, cmpUv, 0);
-    float4 modelSample = gModel.SampleLevel(gLinear, cmpUv, 0);
+    // Where this pixel was in the frame the answer belongs to.
+    //
+    // A stale edit is spatially aligned to the frame the model saw, so laying it on a later frame
+    // puts the enhancement on the previous frame's edges -- a second, offset copy of everything that
+    // moved. Sampling the stale pair at where this pixel *was* puts the edit back under its own
+    // content. The field is the helper's, estimated by the optical-flow engine between those two
+    // frames, and it points from now to then, which is the direction this needs.
+    float2 editUv = cmpUv;
+    float editValid = 1.0;
+    if (gReprojectEdit != 0 && gGuideWidth > 0 && gGuideHeight > 0)
+    {
+        // Divided by the field's own size, not the frame's. The field is estimated on the raster the
+        // model works at, which above a working scale of 1 is larger than the frame -- and a
+        // displacement of n of its pixels is the same fraction of the picture whatever that raster
+        // is. Dividing by the frame instead made the offset wrong by the working scale, which is why
+        // supersampling ghosted while native did not.
+        const float2 mv = gMotion.SampleLevel(gLinear, cmpUv, 0).xy;
+        const float2 back = float2(mv.x * gMvScaleX / max(gGuideWidth, 1u),
+                                   mv.y * gMvScaleY / max(gGuideHeight, 1u));
+        editUv = cmpUv + back;
+
+        // Off the edge of the frame the model saw means this content was not in it, so there is no
+        // edit for it and the honest answer is the frame's own pixels.
+        const float2 clamped = saturate(editUv);
+        if (any(clamped != editUv))
+        {
+            editUv = cmpUv;
+            editValid = 0.0;
+        }
+        // Everything past this point trusts nothing. The check is below, against the frame itself.
+    }
+
+    float4 proxySample = gSource.SampleLevel(gLinear, editUv, 0);
+    float4 modelSample = gModel.SampleLevel(gLinear, editUv, 0);
 
     // Nothing was encoded on the way in, so nothing is decoded here either.
     float3 proxy = gPassthrough != 0 ? proxySample.rgb : SrgbToLinear(proxySample.rgb);
@@ -769,6 +802,33 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     float originalLuma = dot(original, kLuma);
     float proxyLuma = dot(proxy, kLuma);
+
+    // Does the picture the model was shown still describe what is here?
+    //
+    // This is the whole safety of applying an old edit, and it deliberately trusts neither the flow
+    // nor the age of the answer. The proxy is the encode of the frame the model saw; re-encoding
+    // *this* frame the same way gives what that proxy would be if nothing had changed. Where the two
+    // agree, the edit belongs here and lands in full. Where they disagree -- the flow was wrong, the
+    // content was hidden and is now revealed, the scene simply changed -- the edit is not describing
+    // this pixel and is dropped.
+    //
+    // Trusting the flow instead is what turned a real game into swirling contours: a field that is
+    // merely noisy samples the pair at scattered nearby places, and a smeared edit laid over
+    // everything looks like melted paint. A wrong sample now fails this test and costs nothing but
+    // the enhancement.
+    if (gPipelined != 0 && gApplyModel != 0)
+    {
+        const float3 nowProxy = gPassthrough != 0
+                                    ? saturate(original)
+                                    : (gReversibleMode == 0   ? saturate(SoftKnee(original))
+                                       : gReversibleMode >= 3 ? HybridEncode(original)
+                                                              : NeutwoEncode(original));
+        // One tolerance over the triple: a per-channel test would pass a pixel that changed hue.
+        const float mismatch = length(proxy - nowProxy);
+        const float kAgree = 0.06;   // indistinguishable: keep all of it
+        const float kDiffer = 0.20;  // plainly not the same pixel: keep none
+        editValid *= saturate((kDiffer - mismatch) / (kDiffer - kAgree));
+    }
 
     // Apply the model. Off outputs the frame as the upscaler produced it (clean) while the pass keeps
     // running -- so with Hold frame you can freeze a frame and toggle this to A/B the same frozen frame
@@ -924,7 +984,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // Saturated like the blend in the branch below. Detail strength above 1 is carried further
         // down as a power on the luminance ratio, so scaling the edit by it here as well spends it
         // twice.
-        upgraded = max(original + edit * saturate(gTransferStrength), float3(0.0, 0.0, 0.0));
+        upgraded = max(original + edit * saturate(gTransferStrength) * editValid,
+                       float3(0.0, 0.0, 0.0));
 
         // What bounds the sum. An addition says nothing about where the result lands, so the model's
         // verdict is read as a ratio on the pair it came from and the sum is held near it.
@@ -944,10 +1005,29 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             // absolute 0.1, so a near-black pixel keeps an allowance rather than one that scales away
             // with it. One scalar over the whole triple -- a per-channel bound moves hue.
             const float targetLuma = originalLuma * editRatio;
-            const float maxLuma = max(originalLuma * 2.5, targetLuma * 1.5 + 0.1);
+
+            // Bounded by the guard the user set, and in both directions.
+            //
+            // This path adds a difference, so nothing about it says where the result lands -- and it
+            // was bounded only upwards, only at a fixed 2.5x, and never by the control whose whole
+            // job is to say how far the pass may move a pixel. On a photograph that is generous
+            // enough not to show; on flat high-contrast panels it is not, and an interface put
+            // through it comes back scorched: highlights driven to 2.5x, dark text driven below zero
+            // and clamped flat, which together is the deep-fried look.
+            //
+            // The ratio path a few lines down has been two-sided since a measured collapse -- red
+            // fell 57% while an upward-only bound sat watching it -- and there is no reason this path
+            // should be the exception. The absolute term stays, so a near-black pixel keeps an
+            // allowance rather than one that scales away with it. One scalar over the whole triple:
+            // a per-channel bound moves hue.
+            const float addGuard = max(gMaxRatio, 1.0);
+            const float maxLuma = max(originalLuma * addGuard, targetLuma * 1.5 + 0.1);
+            const float minLuma = originalLuma / addGuard;
 
             if (sumLuma > maxLuma)
                 upgraded *= maxLuma / sumLuma;
+            else if (sumLuma < minLuma)
+                upgraded *= minLuma / sumLuma;
         }
     }
     else

@@ -120,9 +120,27 @@ class Composition {
     bool RecordKeepSent(VkCommandBuffer cb);
     bool HasSentProxy() const { return _sentValid; }
 
+    // The answer for the proxy in flight has arrived, so that proxy becomes the matched one. A swap
+    // of handles rather than a copy -- the surfaces are identical in every respect but their
+    // contents. Must be called before the composition reads the pair.
+    void AdoptSentProxy() {
+        if (!_flightValid) return;
+        std::swap(_proxySent, _proxyFlight);
+        std::swap(_workSent, _workFlight);
+        _flightValid = false;
+        _sentValid = true;
+    }
+
     // Whether this frame recorded a capture readback. The pipelined path does not wait for its own
     // submit, so it has to wait for this one before reading what the copy produced.
     bool CaptureRecorded() const { return _captureRecorded; }
+
+    // Take a motion field for the answer currently held. Sized to the frame, two half floats a pixel,
+    // in pixels of the frame. Without one the stale edit is laid down where it was computed, which is
+    // where it ghosts.
+    bool RecordMotion(VkCommandBuffer cb, VkBuffer from, uint32_t w, uint32_t h);
+    bool HasMotion() const { return _motionValid; }
+    void DropMotion() { _motionValid = false; }
 
     // The two ends of the round trip, when they have to be copied.
     //
@@ -226,8 +244,24 @@ class Composition {
     // since written. The resolve differences the model against the proxy it was actually computed
     // from; differencing it against the proxy of a newer frame is not an approximation, it is a
     // ratio between two unrelated pictures, and that is what put saturated pixels on moving edges.
+    // Two of them, and the pair is the whole point.
+    //
+    // _proxySent is the picture the answer in _model was computed from. _proxyFlight is the one that
+    // has been sent and is still being worked on. They cannot be the same surface: a send happens
+    // several frames before its answer comes back, so overwriting the matched proxy at send time
+    // leaves the composition differencing the old answer against the new picture -- which is not a
+    // stale edit, it is the difference of two frames, and it puts a complete second exposure of the
+    // scene on the screen.
     Image _proxySent{}, _workSent{};
+    Image _proxyFlight{}, _workFlight{};
     bool _sentValid = false;
+    bool _flightValid = false;
+
+    // The motion field for the answer being held, uploaded from the helper's shared region. Says
+    // where each of this frame's pixels was in the frame that answer belongs to.
+    Image _motion{};
+    bool _motionValid = false;
+    uint32_t _motionW = 0, _motionH = 0;
 
     // Supersampling: the model works above the frame, so the proxy is enlarged on the way in and the
     // answer averaged back on the way out. _modelNative holds that average; without it the resolve
