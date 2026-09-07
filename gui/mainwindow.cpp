@@ -692,6 +692,19 @@ QWidget* MainWindow::buildSettings() {
                         "shows as a slight lag in the enhancement during fast motion, not as a lagging "
                         "picture. Measured at 720p: 116 fps waiting against 489 fps alongside, with "
                         "875 fps for the game on its own.");
+        binder->AddInt(f, "Settle the edit (%)", &ShmHeader::settlePercent, 0, 100,
+                       "Only used when the model runs alongside the frame. An answer arrives every "
+                       "few frames, so without this the edit changes all at once on the frame it "
+                       "lands and then holds -- which is what reads as a flicker, and the faster the "
+                       "game runs the more often it steps.\n\nThis is how much of the way toward a "
+                       "new answer the edit moves each frame. 100 takes it whole the moment it "
+                       "arrives, which is the old behaviour.\n\nLower is smoother, and also weaker: "
+                       "two answers taken a few frames apart sit on slightly different geometry, so "
+                       "blending them cancels part of the edit as well as spreading it. On a "
+                       "worst-case measurement 75 keeps 84% of the edit's strength, 60 keeps 77%, 40 "
+                       "keeps 63%. Below 40 the smoothing stops improving and only the strength "
+                       "falls. Raise \"How much of the edit lands\" to make the difference back.",
+                       ShmBinder::Live);
         binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "How many times the model runs over one frame, each pass shown the last one's "
                        "answer. Every pass is another full run of the model and another feature "

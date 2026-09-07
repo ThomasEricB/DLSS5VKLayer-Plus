@@ -19,6 +19,7 @@
 // shader's. Everything in this file is plumbing: which image is bound where, in what layout, and what
 // goes in the constant block.
 #include "capture.h"
+#include "crossfade/crossfade_vk.h"
 #include "dlssnr_pass.h"
 #include "scaler_vk.h"
 #include "vk_table.h"
@@ -62,6 +63,10 @@ struct FrameSettings {
     uint32_t downscaler = kScalerLanczos3;
     // 1: present the model's raw answer as the frame -- no blend, no guard, no compare.
     uint32_t compositionBypass = 0;
+
+    // How much of the way toward a newly arrived answer the running pair moves each frame, 0..1.
+    // 1 is the old take-it-whole behaviour. Only consulted on the pipelined path.
+    float settleRate = 0.4f;
 
     static FrameSettings Read(const ShmHeader* h);
 };
@@ -118,17 +123,20 @@ class Composition {
     // Keep a copy of what this frame is about to send, so the answer can be differenced against it
     // when it arrives. Recorded straight after the encode, in the same command buffer.
     bool RecordKeepSent(VkCommandBuffer cb);
-    bool HasSentProxy() const { return _sentValid; }
+    bool HasSentProxy() const { return _targetValid; }
 
     // The answer for the proxy in flight has arrived, so that proxy becomes the matched one. A swap
     // of handles rather than a copy -- the surfaces are identical in every respect but their
     // contents. Must be called before the composition reads the pair.
+    // A new answer has landed, so the proxy it was computed from stops being the one in flight and
+    // becomes the one being walked toward. Not the one the composition reads: that is _proxySent, and
+    // it moves there a fraction at a time so the edit ramps instead of stepping.
     void AdoptSentProxy() {
         if (!_flightValid) return;
-        std::swap(_proxySent, _proxyFlight);
-        std::swap(_workSent, _workFlight);
+        std::swap(_proxyTarget, _proxyFlight);
+        std::swap(_workTarget, _workFlight);
         _flightValid = false;
-        _sentValid = true;
+        _targetValid = true;
     }
 
     // Whether this frame recorded a capture readback. The pipelined path does not wait for its own
@@ -254,7 +262,17 @@ class Composition {
     // scene on the screen.
     Image _proxySent{}, _workSent{};
     Image _proxyFlight{}, _workFlight{};
-    bool _sentValid = false;
+
+    // Where a newly arrived answer and its proxy are put, so the pair the composition reads can be
+    // walked toward them over a few frames rather than replaced between one frame and the next.
+    Image _proxyTarget{}, _workTarget{}, _modelTarget{};
+    std::unique_ptr<CrossfadeVk> _crossfade;
+
+    // Set once the running pair holds a real answer. Until then there is nothing to walk away from
+    // and the first arrival is taken whole -- blending toward it out of an uninitialised surface
+    // would show whatever the allocation happened to contain.
+    bool _settled = false;
+    bool _targetValid = false;
     bool _flightValid = false;
 
     // The motion field for the answer being held, uploaded from the helper's shared region. Says

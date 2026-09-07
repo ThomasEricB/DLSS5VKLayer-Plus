@@ -76,6 +76,17 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
     s.holdFrame = h->holdFrame.load();
     s.downscaler = h->scalingDownscaler.load();
     s.compositionBypass = h->compositionBypass.load();
+    {
+        const uint32_t pct = h->settlePercent.load();
+        s.settleRate = float(pct > 100 ? 100 : pct) / 100.0f;
+        // DLSSNR_SETTLE, in the same hundredths, so the ramp can be swept from a launch option --
+        // including back to 100, which is the behaviour before it existed.
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_SETTLE");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.settleRate = float(forced > 100 ? 100 : forced) / 100.0f;
+    }
 
     s.whitePointManual = BitsToFloat(h->whitePointBits.load());
     s.whitePointScale = BitsToFloat(h->whitePointScaleBits.load());
@@ -146,9 +157,11 @@ void Composition::DropAll() {
     DropImage(_workSent);
     DropImage(_proxyFlight);
     DropImage(_workFlight);
+    DropImage(_proxyTarget);
+    DropImage(_workTarget);
+    DropImage(_modelTarget);
     _flightValid = false;
     DropImage(_motion);
-    _sentValid = false;
     _motionValid = false;
     _motionW = _motionH = 0;
     DropImage(_model);
@@ -160,6 +173,9 @@ void Composition::DropAll() {
     DropHostBuffer(_upload);
     _superUp.reset();
     _superDown.reset();
+    _crossfade.reset();
+    _settled = false;
+    _targetValid = false;
     _superSample = false;
     _width = _height = _modelW = _modelH = 0;
     _haveModel = false;
@@ -419,10 +435,12 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
         MakeImage(_frame, width, height, work, sampled | dst) &&
         MakeImage(_keep, width, height, _keepFormat, sampled | storage) &&
         MakeImage(_proxy, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | storage | src) &&
-        MakeImage(_proxySent, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
+        MakeImage(_proxySent, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | storage) &&
         MakeImage(_proxyFlight, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
+        MakeImage(_proxyTarget, width, height, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
 
-        MakeImage(_model, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
+        MakeImage(_model, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM, sampled | storage) &&
+        MakeImage(_modelTarget, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM, sampled | dst) &&
         MakeImage(_composed, width, height, work, storage | src) &&
         MakeHostBuffer(_download, size_t(modelW) * modelH * 4, dst) &&
         MakeHostBuffer(_upload, size_t(modelW) * modelH * 4, src);
@@ -441,8 +459,10 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
     const bool okWork = (!needWork || MakeImage(_work, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
                                                 sampled | storage | src)) &&
                         (!needWork || MakeImage(_workSent, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
-                                                sampled | dst)) &&
+                                                sampled | storage)) &&
                         (!needWork || MakeImage(_workFlight, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
+                                                sampled | dst)) &&
+                        (!needWork || MakeImage(_workTarget, modelW, modelH, VK_FORMAT_R8G8B8A8_UNORM,
                                                 sampled | dst));
 
     // The averaged answer, and the two filters that get there. Built only when supersampling.
@@ -460,6 +480,14 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
     } else {
         _superUp.reset();
         _superDown.reset();
+    }
+
+    // The blend that turns a new answer into a ramp. Not fatal if it cannot be built: without it the
+    // composition reads the arrival surfaces directly, which is exactly the behaviour it had before.
+    _crossfade = std::make_unique<CrossfadeVk>(_vk, _instance, _device, _physicalDevice);
+    if (!_crossfade->CanRender()) {
+        Log("[comp] the settle blend could not be built; a new answer will be taken whole");
+        _crossfade.reset();
     }
 
     if (!ok || !okWork || !okMeter || !okSuper) {
@@ -824,32 +852,75 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
 
     if (refreshModel) {
         if (_sharedOut) BarrierAfterExternalWrite(cb);
-        Transition(cb, _model, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        Transition(cb, _modelTarget, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy region{};
         region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         region.imageExtent = { _modelW, _modelH, 1 };
-        _vk->vkCmdCopyBufferToImage(cb, _sharedOut ? _sharedOut : _upload.buffer, _model.image,
+        _vk->vkCmdCopyBufferToImage(cb, _sharedOut ? _sharedOut : _upload.buffer, _modelTarget.image,
                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     }
-    Transition(cb, _model, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    Transition(cb, _modelTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // Pipelined, the answer is a frame behind, so it is differenced against the proxy that went with
+    // it rather than the one the encode has since overwritten.
+    const bool sent = s.pipelined && _targetValid && _proxyTarget.image;
+
+    // Walk the running pair toward the pair that arrived, instead of replacing it.
+    //
+    // The two are blended by the same fraction on purpose. The composition works from their
+    // difference, and lerp(m0,m1,a) - lerp(p0,p1,a) is lerp(m0-p0, m1-p1, a) -- so blending the two
+    // terms separately blends the edit, without the composition shader knowing anything about it.
+    // The frame under the edit is untouched and still the current one, so this ramps the edit; it
+    // does not smear the picture.
+    //
+    // Only on the pipelined path. Composing in front of the frame, the answer belongs to the proxy
+    // the encode has just written and a fraction of an older one is not a softer version of it, it is
+    // the wrong picture.
+    Image* answer = &_modelTarget;
+    Image* source = sent ? (_workTarget.image ? &_workTarget : &_proxyTarget)
+                         : (_work.image ? &_work : &_proxy);
+    if (sent && _crossfade) {
+        // Taken whole the first time: there is nothing behind it yet to come from.
+        const float alpha = _settled ? std::min(std::max(s.settleRate, 0.0f), 1.0f) : 1.0f;
+
+        Transition(cb, _proxyTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Transition(cb, _proxySent, VK_IMAGE_LAYOUT_GENERAL);
+        if (!_crossfade->Dispatch(cb, _proxyTarget.view, _proxySent.view, _width, _height, alpha))
+            return false;
+
+        Transition(cb, _model, VK_IMAGE_LAYOUT_GENERAL);
+        if (!_crossfade->Dispatch(cb, _modelTarget.view, _model.view, _modelW, _modelH, alpha))
+            return false;
+
+        if (_workTarget.image && _workSent.image) {
+            Transition(cb, _workTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            Transition(cb, _workSent, VK_IMAGE_LAYOUT_GENERAL);
+            if (!_crossfade->Dispatch(cb, _workTarget.view, _workSent.view, _modelW, _modelH, alpha))
+                return false;
+        }
+
+        _settled = true;
+        answer = &_model;
+        source = _workSent.image ? &_workSent : &_proxySent;
+    } else {
+        // Not ramping this frame, so the pair behind the ramp is stale. Say so, or turning the
+        // pipelined path back on would start by blending toward a picture from before it was off.
+        _settled = false;
+    }
 
     // When the model worked above the frame its answer is averaged back to native first, and the
     // composition then sees a native proxy against a native answer -- which is what it should see,
     // because from its point of view the model effectively ran at the frame's own resolution.
-    Image* answer = &_model;
-    // Pipelined, the answer is a frame behind, so it is differenced against the proxy that went with
-    // it rather than the one the encode has since overwritten.
-    const bool sent = s.pipelined && _sentValid && _proxySent.image;
-    Image* source = sent ? (_workSent.image ? &_workSent : &_proxySent)
-                         : (_work.image ? &_work : &_proxy);
     if (_superSample) {
+        Transition(cb, *answer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         Transition(cb, _modelNative, VK_IMAGE_LAYOUT_GENERAL);
-        if (!_superDown->Dispatch(cb, _model.view, _modelNative.view, _modelW, _modelH, _width, _height))
+        if (!_superDown->Dispatch(cb, answer->view, _modelNative.view, _modelW, _modelH, _width, _height))
             return false;
         Transition(cb, _modelNative, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        source = sent ? (_crossfade ? &_proxySent : &_proxyTarget) : &_proxy;
         answer = &_modelNative;
-        source = sent ? &_proxySent : &_proxy;
     }
+    Transition(cb, *answer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     Transition(cb, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     Transition(cb, _keep, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

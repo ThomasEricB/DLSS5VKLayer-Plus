@@ -30,10 +30,11 @@
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
+// v10: settlePercent, the rate the pipelined edit walks toward a new answer.
 // v8: two sides grew the header at once -- compositionBypass and rebuildSettleMs upstream, pipeline
 // here -- so neither side's number describes this layout.
 // v9: a third region for the motion field, so the header, the file size and the offsets all moved.
-static constexpr uint32_t kShmVersion = 9;
+static constexpr uint32_t kShmVersion = 10;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
@@ -398,6 +399,27 @@ struct ShmHeader {
     // settles and chain the remaining builds back to back. It is time rather than frames because a
     // frame-counted wait crawls on a 30 fps game and races on a 144 fps one.
     std::atomic<uint32_t> rebuildSettleMs;
+
+    // How fast the running pair walks toward a newly arrived answer, in hundredths.
+    //
+    // Pipelined, an answer lands every few frames and the edit it implies changes all at once when it
+    // does. The frame under it is current, so nothing smears -- but the *edit* stepping between two
+    // values on one frame and then holding for several is exactly what reads as a flicker, and the
+    // faster the game runs the more often it steps. This walks the answer and the proxy it was
+    // computed from toward the new pair by the same fraction each frame, which -- because the edit is
+    // their difference, and a difference of two blends is the blend of the two differences -- walks
+    // the edit itself. The step becomes a ramp.
+    //
+    // 100 means take the new answer whole the moment it lands, which is the old behaviour. 0 freezes
+    // the edit at the first answer.
+    //
+    // It is not free: successive edits sit on different geometry, so where they disagree the blend
+    // cancels them and the edit comes out weaker as well as smoother. Measured on a spinning vkcube
+    // -- which turns far faster than a camera does, so this is the pessimistic end -- the step in the
+    // edit between frames and the edit's own strength go: 100 -> 100% strength, 75 -> 84%, 60 -> 77%,
+    // 40 -> 63%, 20 -> 51%, against a step of 0.0046, 0.0034, 0.0030, 0.0021, 0.0019. The default is
+    // 60 because below it the step stops improving much and only the strength keeps falling.
+    std::atomic<uint32_t> settlePercent;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -413,7 +435,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1904, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1908, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -502,6 +524,7 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->mvecQuality.store(kMVecBalanced);
     h->compositionBypass.store(1);
     h->rebuildSettleMs.store(250);
+    h->settlePercent.store(60);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);

@@ -54,6 +54,8 @@ const Setting kSettings[] = {
       "ms to settle before rebuilding a pass after a model setting changes" },
     { "pipeline", &ShmHeader::pipeline, false,
       "run the model alongside the frame instead of waiting for it, 0 or 1" },
+    { "settle", &ShmHeader::settlePercent, false,
+      "how fast the pipelined edit walks toward a new answer, 0-100 (100 = take it whole)" },
     { "mvec", &ShmHeader::mvecEnabled, false, "estimate motion vectors from the frames, 0 or 1" },
     { "mvecquality", &ShmHeader::mvecQuality, false, "0 fast, 1 balanced, 2 quality" },
     { "mvecunits", &ShmHeader::mvecScaleMode, false, "0 normalised, 1 pixels, 2 uv 0..1" },
