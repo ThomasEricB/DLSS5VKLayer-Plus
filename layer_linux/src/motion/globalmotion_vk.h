@@ -68,11 +68,20 @@ class GlobalMotionVk {
     // The composition reads the result, so it needs it in the right layout first.
     void BarrierResultForRead(VkCommandBuffer cb);
 
-    // Copies the one-by-one result to host memory so it can be logged. Diagnostic only: it is what
-    // says what the displacement and the confidence actually are, rather than what they were assumed
-    // to be, and a gate set from an assumed scale is how the last three attempts went wrong.
+    // Copies the one-by-one result to host memory so it can be logged.
+    //
+    // Diagnostic, and it has to be honest, because it was not. The old version copied into a single
+    // buffer, read it with no synchronisation at all, and reported whatever happened to be there --
+    // which with three frames in flight was a value of unknown age, sometimes the same one twice. It
+    // reported a smooth series through several changes that the frames themselves showed were not
+    // smooth, and two rounds of tuning were done against it before that was noticed.
+    //
+    // Now: a ring deep enough that a slot is only read once the work that wrote it must have finished,
+    // and every estimate carries the frame it was computed on, so a reading states its own age and a
+    // repeat is visible as a repeat instead of passing for a new sample.
     void RecordReadback(VkCommandBuffer cb);
-    bool ReadLast(float out[4]) const;
+    // Returns false when nothing trustworthy is available yet. `age` is in frames.
+    bool ReadLast(float out[4], uint32_t* frameOut, uint32_t* age) const;
 
   private:
 
@@ -105,10 +114,16 @@ class GlobalMotionVk {
 
     // Two levels. The coarse one finds the displacement at all; the fine one pins it down to about a
     // pixel, which is what fine detail needs to stay correlated.
-    Img _now[2]{}, _then[2]{}, _result[2]{}, _state{};
-    VkBuffer _readBuf = VK_NULL_HANDLE;
-    VkDeviceMemory _readMem = VK_NULL_HANDLE;
-    void* _readMap = nullptr;
+    Img _now[2]{}, _then[2]{}, _result[2]{};
+    // One deeper than the layer's command-buffer ring, so the slot being read was recorded by work
+    // that has necessarily completed: by the time frame F+3 begins, the layer has waited on the fence
+    // for the slot frame F used.
+    static constexpr uint32_t kReadSlots = 4;
+    static constexpr uint32_t kReadLag = 3;
+    VkBuffer _readBuf[kReadSlots]{};
+    VkDeviceMemory _readMem[kReadSlots]{};
+    void* _readMap[kReadSlots]{};
+    uint64_t _frameNo = 0;
     VkBuffer _costBuf = VK_NULL_HANDLE;
     VkDeviceMemory _costMem = VK_NULL_HANDLE;
 

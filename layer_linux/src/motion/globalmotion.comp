@@ -102,12 +102,13 @@ void main() {
 // pixels of the full frame. A single workgroup: there are only a few hundred candidates.
 layout(binding = 0) uniform Params {
     int radius; float scaleX; float scaleY; int useBase;
-    int reset; float alpha; float rejectPx; int track;
+    // Which frame this estimate belongs to, carried out with it so a reading taken later can say how
+    // old it is instead of being assumed fresh.
+    uint frameNo; uint pad0; uint pad1; uint pad2;
 } pc;
 layout(std430, binding = 1) readonly buffer Cost { float cost[]; };
 layout(rgba32f, binding = 3) uniform readonly image2D uBase;
 // The tracker's memory: xy is how fast the displacement was growing, z says whether it holds anything.
-layout(rgba32f, binding = 4) uniform image2D uState;
 // A one-by-one image rather than a buffer, on purpose. The composition already samples a motion
 // field; a field that is a single texel returns the same vector at every pixel, which is precisely a
 // global translation -- so this drops into the existing shader without touching a single binding.
@@ -194,15 +195,12 @@ void main() {
     vec2 measured = vec2(base.x + (float(bx - pc.radius) + dx) * pc.scaleX,
                         base.y + (float(by - pc.radius) + dy) * pc.scaleY);
 
-    // No temporal smoothing. It was tried twice and is worse both times.
-    //
-    // The constant-velocity form is underdamped: with the blend and the velocity gain used, the
-    // system matrix has complex eigenvalues of magnitude 0.74, so every disturbance decays as an
-    // oscillation rather than settling. That is a tremble by construction, and it is not fixable by
-    // choosing the constants more carefully without solving the real problem, which is that the
-    // measurement itself must not jump. Fixing the refinement above is that.
-    imageStore(uState, ivec2(0, 0), vec4(0.0, 0.0, 0.0, 0.0));
-    imageStore(uResult, ivec2(0, 0), vec4(measured, confidence, 1.0));
+    // No temporal smoothing here. It was tried twice and lost twice: a constant-velocity filter with
+    // the gains used is underdamped -- complex eigenvalues of magnitude 0.74 -- so every disturbance
+    // decays as an oscillation rather than settling, which is a tremble by construction. Smoothing is
+    // the wrong answer to a measurement that jumps; not jumping is the right one, and that is what the
+    // conditioning above and the gradient solve afterwards are for.
+    imageStore(uResult, ivec2(0, 0), vec4(measured, confidence, float(pc.frameNo)));
 }
 #elif defined(PASS_LK)
 // Gradient refinement of the residual, which is what makes the estimate smooth.

@@ -987,10 +987,21 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
                 // read the confidence has to be calibrated against real values.
                 if (TimeEnabled()) {
                     float v[4] = {};
-                    if (_globalMotion->ReadLast(v)) {
+                    uint32_t at = 0, age = 0;
+                    // Every reading names the frame it was computed on, so consecutive lines are
+                    // consecutive frames rather than whatever the buffer happened to hold. A gap in
+                    // the numbering is a dropped reading and says so, instead of quietly repeating a
+                    // value and passing it off as a new sample -- which is what the old readback did,
+                    // and what made a series look smooth while the frames themselves were not.
+                    if (_globalMotion->ReadLast(v, &at, &age)) {
+                        static uint32_t last = 0;
                         static int n = 0;
-                        if (++n % (TimeInterval() * 4) == 0)
-                            Log("[gm] displacement %.1f, %.1f px, confidence %.3f", v[0], v[1], v[2]);
+                        if (++n % TimeInterval() == 0) {
+                            const uint32_t gap = last ? at - last : 1u;
+                            Log("[gm] frame %u (+%u, read %u later): %.2f, %.2f px, confidence %.3f%s",
+                                at, gap, age, v[0], v[1], v[2], gap == 1u ? "" : "  <-- readings lost");
+                        }
+                        last = at;
                     }
                     _globalMotion->RecordReadback(cb);
                 }
