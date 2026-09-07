@@ -145,6 +145,28 @@ struct ShmMap {
     VkBuffer motionBuf = VK_NULL_HANDLE;
     uint8_t* motionPixels = nullptr;
     uint32_t motionSeqSeen = 0;
+
+    // How old, in presented frames, the answer being composed actually is.
+    //
+    // Instrumented because the whole pipelined design rests on the edit being "one frame behind" and
+    // that was an assumption, never a measurement. The reprojection corrects a single frame-interval
+    // of motion, so if an answer is really several frames old the correction is a fraction of the
+    // displacement and the edit lands short of its own content -- which is a ghost, and one no
+    // threshold can gate away because the edit is genuinely misplaced rather than merely doubtful.
+    uint64_t frames = 0;
+    uint64_t publishedAtFrame = 0;
+    uint64_t prevPublishedAtFrame = 0;
+    // How much of one round trip of motion the stale edit actually has to be moved by.
+    //
+    // The helper estimates flow between the two frames it saw, which are one round trip apart, so the
+    // field describes exactly one round trip of motion -- but the *previous* one, and the answer being
+    // composed is not necessarily a round trip old. Age was measured at 16 frames on average and 27 at
+    // worst, so a field applied whole under- or over-corrects by whatever that frame's gap happens to
+    // be. This is the ratio that makes the correction the right length.
+    float reprojScale = 1.0f;
+    uint64_t ageSum = 0;
+    uint32_t ageCount = 0;
+    uint32_t ageMax = 0;
     size_t importedBytes = 0;
     bool zeroCopy = false;
     bool dead = false;
@@ -428,9 +450,31 @@ static bool ShmInputFree(ShmMap& s) {
 }
 
 // Take delivery of an answer that has already arrived. Never blocks.
+// How many presented frames passed between the request going out and its answer being taken up.
+static void ShmNoteAge(ShmMap& s) {
+    const uint64_t age = s.frames - s.publishedAtFrame;
+    const uint64_t interval = s.publishedAtFrame - s.prevPublishedAtFrame;
+    if (interval > 0 && age > 0) {
+        // Bounded: a first frame, a resize or a hitch can make either number nonsense, and a wild
+        // scale would fling the edit somewhere arbitrary rather than merely leave it where it was.
+        const float r = float(double(age) / double(interval));
+        s.reprojScale = r < 0.25f ? 0.25f : (r > 3.0f ? 3.0f : r);
+    }
+    s.ageSum += age;
+    s.ageMax = age > s.ageMax ? uint32_t(age) : s.ageMax;
+    if (++s.ageCount >= 300) {
+        Log("[pipe] answers are %.1f frames old on average, worst %u; reprojection scaled by %.2f",
+            double(s.ageSum) / double(s.ageCount), s.ageMax, s.reprojScale);
+        s.ageSum = 0;
+        s.ageCount = 0;
+        s.ageMax = 0;
+    }
+}
+
 static bool ShmCollect(ShmMap& s, size_t bytes, void* modelOut) {
     if (!ShmAnswerReady(s)) return false;
     const bool ok = s.hdr->seq_ok.load() >= s.pendingReq;
+    ShmNoteAge(s);
     s.pendingReq = 0;
     if (!ok) return false;
     s.everAnswered = true;
@@ -450,6 +494,8 @@ static bool ShmPublish(ShmMap& s, uint32_t w, uint32_t h, const void* proxy) {
     const uint32_t req = s.hdr->seq_req.load() + 1;
     s.hdr->seq_req.store(req);
     s.pendingReq = req;
+    s.prevPublishedAtFrame = s.publishedAtFrame;
+    s.publishedAtFrame = s.frames;
     return true;
 }
 
@@ -1359,6 +1405,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         // copy on its side every frame, so it is not asked for when nothing will read it.
         if (dc->shm.hdr) dc->shm.hdr->wantMotion.store(1);
 
+        dc->shm.frames++;
         const bool haveAnswer = ShmCollect(dc->shm, modelBytes, sc.comp->ModelPixels());
         // Free to send only when the helper has finished with the last request *and* the last send
         // has actually been handed over. The publish is deferred by a frame now, and recording a
@@ -1398,6 +1445,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
 
         // Composed before the encode's proxy is claimed as "sent", so the pair kept aside is still
         // the one this answer was computed from.
+        sc.comp->SetReprojScale(dc->shm.reprojScale);
         if (willCompose && !sc.comp->RecordCompose(cb, swapchainImage, fs, haveAnswer)) {
             dc->vkEndCommandBuffer(cb);
             return false;

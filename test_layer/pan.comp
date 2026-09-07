@@ -1,0 +1,58 @@
+#version 450
+// The scene the ghost reproducer draws.
+//
+// Everything here is chosen to make a misplaced edit visible rather than to look nice: large flat
+// dark areas, because that is where a stale edit shows and where local contrast is too low to hide
+// one; hard-edged bright panels, because a displaced copy of an edge is the artifact itself; and a
+// fine noise floor, so a pass that is working has real detail to enhance.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba16f) uniform writeonly image2D outImage;
+layout(push_constant) uniform PC { vec2 offset; uvec2 size; } pc;
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+float noise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x),
+               mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
+}
+
+float fbm(vec2 p) {
+    float a = 0.5, s = 0.0;
+    for (int i = 0; i < 5; i++) { s += a * noise(p); p *= 2.0; a *= 0.5; }
+    return s;
+}
+
+void main() {
+    ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+    if (id.x >= int(pc.size.x) || id.y >= int(pc.size.y)) return;
+
+    // World coordinates. The offset is what pans, so every pixel of the picture translates together
+    // -- which is the first-person camera case, and the case vkcube's spinning cube never produces.
+    vec2 w = vec2(id) + pc.offset;
+
+    // A dark floor with a little large-scale variation.
+    float lum = 0.015 + 0.020 * fbm(w * 0.004);
+
+    // Bright panels on a coarse grid, with hard edges.
+    vec2 cell = floor(w / 160.0);
+    vec2 inCell = fract(w / 160.0);
+    if (hash(cell) > 0.55) {
+        vec2 d = abs(inCell - 0.5);
+        if (max(d.x, d.y) < 0.34) {
+            lum = 0.35 + 0.25 * hash(cell + 7.0);
+            // fine texture on the panel, so there is something for the model to enhance
+            lum *= 0.85 + 0.30 * fbm(w * 0.35);
+        }
+    }
+
+    // A thin bright rail every so often: a long high-contrast edge, the easiest ghost to see.
+    if (abs(fract(w.y / 420.0) - 0.5) < 0.006) lum = 0.9;
+
+    // Fine grain everywhere, so a working pass has detail to act on even on the floor.
+    lum *= 0.92 + 0.16 * fbm(w * 1.7);
+
+    vec3 c = vec3(lum) * vec3(0.95, 1.0, 1.06);
+    imageStore(outImage, id, vec4(c, 1.0));
+}

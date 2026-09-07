@@ -51,5 +51,7 @@ DLSSNR_PIN(UseGameExposure, 84);
 DLSSNR_PIN(ExposurePreMul, 88);
 DLSSNR_PIN(Pipelined, 92);
 DLSSNR_PIN(ReprojectEdit, 96);
+DLSSNR_PIN(GhostSlack, 100);
+DLSSNR_PIN(EditBlurUv, 104);
 
 #undef DLSSNR_PIN

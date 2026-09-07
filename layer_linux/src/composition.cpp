@@ -87,6 +87,25 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
         }();
         if (forced >= 0) s.settleRate = float(forced > 100 ? 100 : forced) / 100.0f;
     }
+    {
+        s.ghostSlack = float(h->ghostSlackPercent.load()) / 100.0f;
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_GHOST_SLACK");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.ghostSlack = float(forced) / 100.0f;
+        if (!std::isfinite(s.ghostSlack) || s.ghostSlack < 0.0f) s.ghostSlack = 0.5f;
+    }
+    {
+        s.editBlur = float(h->editBlurMilli.load()) / 1000.0f;
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_EDIT_BLUR");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.editBlur = float(forced) / 1000.0f;
+        if (!std::isfinite(s.editBlur) || s.editBlur < 0.0f) s.editBlur = 0.0f;
+        if (s.editBlur > 0.25f) s.editBlur = 0.25f;
+    }
 
     s.whitePointManual = BitsToFloat(h->whitePointBits.load());
     s.whitePointScale = BitsToFloat(h->whitePointScaleBits.load());
@@ -586,6 +605,8 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.CompareSwap = s.compareSwap;
     c.ReversibleMode = s.reversibleMode;
     c.ApplyModel = s.applyModel;
+    c.GhostSlack = s.ghostSlack;
+    c.EditBlurUv = s.editBlur;
 
     // The model's answer IS the frame. The raw-answer debug path returns the model's picture ahead of
     // every step of the composition -- no ratio, no guard, no blend, no compare -- and it returns
@@ -943,8 +964,33 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     if (reproject) {
         // The field is in pixels of the frame, which is what the estimate produces, and covers the
         // whole frame.
-        res.MvScaleX = 1.0f;
-        res.MvScaleY = 1.0f;
+        //
+        // DLSSNR_REPROJ_SCALE multiplies it, for finding out what the field actually means. The
+        // reprojection is meant to put a stale edit back under its own content and measurement says
+        // it is barely doing so, which leaves sign and magnitude as the things to establish rather
+        // than assume -- and the only honest way to establish them is to sweep and see which value
+        // makes the edit line up.
+        // The field is one round trip of motion; the edit needs however much of a round trip has
+        // actually passed. DLSSNR_REPROJ_SCALE overrides it, which is how the sign and magnitude were
+        // established in the first place -- a sweep found +1 roughly doubles the edit's agreement
+        // with the frame against 0, and that -1 and +-4 are all worse, so the field's direction and
+        // units are right and only its length was wrong.
+        static const float forced = [] {
+            const char* v = getenv("DLSSNR_REPROJ_SCALE");
+            return v && *v ? float(atof(v)) : -1.0f;
+        }();
+        // Fixed at one round trip by default. The measured age/interval ratio is available through
+        // DLSSNR_REPROJ_DYNAMIC, and is off because it did not earn its place: it improved how the
+        // edit's energy is distributed but made its agreement with the frame worse, which is what a
+        // correction that jitters from answer to answer does. One request is in flight at a time, so
+        // age and interval are the same thing on average anyway.
+        static const bool dynamic = [] {
+            const char* v = getenv("DLSSNR_REPROJ_DYNAMIC");
+            return v && v[0] == '1';
+        }();
+        const float reprojScale = forced >= 0.0f ? forced : (dynamic ? _reprojScale : 1.0f);
+        res.MvScaleX = reprojScale;
+        res.MvScaleY = reprojScale;
         res.GuideWidth = _motionW;
         res.GuideHeight = _motionH;
         Transition(cb, _motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

@@ -193,6 +193,15 @@ struct alignas(256) DlssNrConstants
     // Set when Motion holds a field mapping this frame back to the one the answer belongs to, so the
     // stale pair can be sampled where this pixel was rather than where it is.
     uint32_t ReprojectEdit;
+
+    // How far past its own neighbourhood's brightness a composed pixel may land, as a fraction, on
+    // the pipelined path. 0 pins every pixel inside the range its neighbours already span; larger
+    // values let the pass move further and let more of a stale edit through with it.
+    float GhostSlack;
+
+    // The radius, in uv, that splits a stale edit into the part that can ghost and the part that
+    // cannot. 0 disables the split and applies the edit whole, which is what it did before.
+    float EditBlurUv;
 };
 
 class DlssNr_Common

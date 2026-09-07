@@ -31,6 +31,8 @@ cbuffer Params : register(b0)
     float gExposurePreMul; // preExposure * trim, so the live white point is gExposurePreMul / exposure
     uint  gPipelined;      // 1 when the answer is for an earlier frame than the one being written
     uint  gReprojectEdit;  // 1 when gMotion holds a field that maps this frame back to that one
+    float gGhostSlack;     // how far past its neighbours' brightness a pipelined pixel may land
+    float gEditBlurUv;     // radius, in uv, that splits the stale edit into what may ghost and what cannot
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -454,6 +456,22 @@ float3 HybridDecode(float3 y)
     return y * (HybridCurveInv(m) / m);
 }
 
+// Encode a frame colour exactly the way the proxy the model was shown was encoded.
+//
+// Spelled once because it is the reference the staleness tests are made against: re-encoding *this*
+// frame and comparing gives what the stale proxy would look like if nothing had changed, and any test
+// that uses a different curve is comparing two things that were never the same to begin with.
+float3 EncodeLikeProxy(float3 c)
+{
+    if (gPassthrough != 0)
+        return saturate(c);
+    if (gReversibleMode == 0)
+        return saturate(SoftKnee(c));
+    if (gReversibleMode >= 3)
+        return HybridEncode(c);
+    return NeutwoEncode(c);
+}
+
 // Scale a residual so the result cannot leave the unit cube, without changing its direction.
 //
 // The model's edit is carried up from a smaller raster and laid on the frame's own proxy, so nothing
@@ -816,18 +834,83 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // merely noisy samples the pair at scattered nearby places, and a smeared edit laid over
     // everything looks like melted paint. A wrong sample now fails this test and costs nothing but
     // the enhancement.
+    // The luminance this pixel's own neighbourhood spans, filled in below and used at the very end to
+    // bound what the pass may hand back. Left inverted when nothing fills it, which is how the bound
+    // knows it has no opinion.
+    float nbLumaMin = 1e30;
+    float nbLumaMax = -1e30;
+
     if (gPipelined != 0 && gApplyModel != 0)
     {
-        const float3 nowProxy = gPassthrough != 0
-                                    ? saturate(original)
-                                    : (gReversibleMode == 0   ? saturate(SoftKnee(original))
-                                       : gReversibleMode >= 3 ? HybridEncode(original)
-                                                              : NeutwoEncode(original));
-        // One tolerance over the triple: a per-channel test would pass a pixel that changed hue.
-        const float mismatch = length(proxy - nowProxy);
-        const float kAgree = 0.06;   // indistinguishable: keep all of it
-        const float kDiffer = 0.20;  // plainly not the same pixel: keep none
-        editValid *= saturate((kDiffer - mismatch) / (kDiffer - kAgree));
+        // Neighbourhood variance clipping, which is how temporal antialiasing has rejected stale
+        // history since Salvi's 2016 talk, and it is here for the same reason: a fixed tolerance is
+        // the wrong shape for this test.
+        //
+        // The tolerance a stale sample deserves is not a constant, it is the local contrast. A
+        // difference of 0.1 is invisible on busy texture and glaring on a flat dark floor -- and the
+        // floor is exactly where a misplaced edit was showing, because the old test compared against
+        // an absolute 0.06/0.20 and let roughly a fifth of a full structural edit through on ground
+        // that had no structure of its own to hide it. Measured on a panning scene: 32% of the edit's
+        // energy was landing on the flattest third of the frame against 13% with no staleness at all.
+        //
+        // So take the first and second moments of *this* frame over the 3x3 neighbourhood, encoded
+        // the way the proxy was, and require the stale proxy to be a colour that neighbourhood could
+        // have produced. Where the frame is flat sigma collapses and nothing stale survives; where it
+        // is detailed sigma is wide and a real edit passes untouched. The test costs nine encodes and
+        // no texture fetches beyond the ones the neighbourhood needs.
+        float3 m1 = float3(0.0, 0.0, 0.0);
+        float3 m2 = float3(0.0, 0.0, 0.0);
+        const int2 last = int2(int(gWidth) - 1, int(gHeight) - 1);
+        [unroll]
+        for (int oy = -1; oy <= 1; ++oy)
+        {
+            [unroll]
+            for (int ox = -1; ox <= 1; ++ox)
+            {
+                const int2 at = clamp(int2(id.xy) + int2(ox, oy), int2(0, 0), last);
+                const float3 here = gOriginal.Load(int3(at, 0)).rgb / normScale;
+                const float3 enc = EncodeLikeProxy(here);
+                m1 += enc;
+                m2 += enc * enc;
+
+                // Kept for the bound at the end of the pass, which needs the frame's own range and
+                // not the encoded one. Free here: the neighbourhood is already being read.
+                const float l = dot(here, kLuma);
+                nbLumaMin = min(nbLumaMin, l);
+                nbLumaMax = max(nbLumaMax, l);
+            }
+        }
+        const float3 mu = m1 / 9.0;
+        const float3 sigma = sqrt(max(m2 / 9.0 - mu * mu, float3(0.0, 0.0, 0.0)));
+
+        // How far outside the neighbourhood's own spread a stale sample may sit. The floor keeps a
+        // perfectly flat region from rejecting its own quantisation noise -- without it an 8-bit
+        // proxy fails its own test on any smooth gradient.
+        // Deliberately loose. This gate is no longer what stops a ghost -- the neighbourhood bound at
+        // the end of the pass is, and that one cannot be argued with -- so its job is only to catch
+        // the gross case where the stale pixel is plainly other content. Tightening it instead was
+        // measured and rejected: at 1.25 sigma it removed 69% of the edit landing on flat ground and
+        // exactly 69% of the edit landing on real detail, which is not a fix, it is a volume knob.
+        // Tied to the same control as the bound at the end of the pass, so there is one number
+        // describing how much staleness this path tolerates rather than two that can disagree. At the
+        // default it is 2.5 standard deviations; at 0 it is one, which rejects almost any stale
+        // sample; large values open it far enough that nothing is rejected and the pass behaves as it
+        // did before any of this existed, which is what makes the effect measurable.
+        const float kGamma = 1.0 + 3.0 * max(gGhostSlack, 0.0);
+        const float kFloor = 4.0 / 255.0;
+        const float3 tol = kGamma * sigma + kFloor;
+
+        // proxySample is the encoded stale picture, which is what the moments above are in. Comparing
+        // the decoded one against them would be comparing two different curves.
+        const float3 outside = max(max(proxySample.rgb - (mu + tol), (mu - tol) - proxySample.rgb),
+                                   float3(0.0, 0.0, 0.0));
+
+        // One scalar over the triple: a per-channel gate would pass a pixel that only changed hue.
+        // Ramped rather than switched, so the rejection does not draw an edge of its own.
+        // Ramped over twice the tolerance, so a sample just outside the box is faded rather than
+        // dropped and the rejection never draws an edge of its own.
+        const float excess = length(outside) / max(2.0 * length(tol), 1e-5);
+        editValid *= saturate(1.0 - excess);
     }
 
     // Apply the model. Off outputs the frame as the upscaler produced it (clean) while the pass keeps
@@ -852,6 +935,51 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     }
 
     float3 edit = model - proxy;
+
+    // Split the stale edit by spatial frequency, and treat the two halves completely differently.
+    //
+    // This is the answer to the thing every threshold in this shader failed to fix. The answer being
+    // composed is not one frame old, it is sixteen -- measured in the layer, not assumed; the comment
+    // that said "one frame behind" was an assumption nobody had checked. At 100 fps that is 160 ms,
+    // and during an ordinary turn the picture moves something like a hundred pixels in that time. The
+    // reprojection corrects a single frame-interval of that, so most of the displacement survives.
+    //
+    // What matters is that the displacement does not affect the edit evenly. Fine detail -- an edge,
+    // a texture -- moved a hundred pixels is a second copy of itself somewhere it does not belong,
+    // and that is exactly the ghost. Broad tone and colour moved a hundred pixels is very nearly the
+    // same picture, because it barely varies over that distance, and it cannot ghost however stale it
+    // is. So the low frequencies are safe to apply always, and only the high frequencies need the
+    // content to have held still.
+    //
+    // The gate below already measures whether this pixel's content held still. Applying it to the
+    // high half alone means a moving scene still gets the model's tone and colour verdict at no frame
+    // cost, and a still one gets the detail as well -- which is also how seeing works, since fine
+    // detail is not resolvable during a fast turn anyway.
+    float3 editLow = edit;
+    if (gPipelined != 0 && gEditBlurUv > 0.0)
+    {
+        // Nine taps on a ring plus the centre. Not a good blur; a sufficient one. What is wanted is
+        // only that everything the displacement could misregister is gone from this half, and a tap
+        // pattern this wide removes it whether or not the falloff is exactly Gaussian.
+        const float r = gEditBlurUv;
+        float3 sum = edit;
+        float w = 1.0;
+        [unroll]
+        for (int k = 0; k < 8; ++k)
+        {
+            const float a = 6.2831853 * (float(k) / 8.0);
+            const float2 off = float2(cos(a), sin(a)) * r;
+            const float2 uv = saturate(editUv + off);
+            const float3 p2 = gPassthrough != 0 ? gSource.SampleLevel(gLinear, uv, 0).rgb
+                                                : SrgbToLinear(gSource.SampleLevel(gLinear, uv, 0).rgb);
+            const float3 m2 = gPassthrough != 0 ? gModel.SampleLevel(gLinear, uv, 0).rgb
+                                                : SrgbToLinear(gModel.SampleLevel(gLinear, uv, 0).rgb);
+            sum += m2 - p2;
+            w += 1.0;
+        }
+        editLow = sum / w;
+    }
+    const float3 editHigh = edit - editLow;
 
     // Coring was tried here and removed: the per-frame churn's amplitude overlaps the real detail's,
     // so an amplitude threshold cannot separate them -- it only relocated the noise to the threshold.
@@ -984,8 +1112,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // Saturated like the blend in the branch below. Detail strength above 1 is carried further
         // down as a power on the luminance ratio, so scaling the edit by it here as well spends it
         // twice.
-        upgraded = max(original + edit * saturate(gTransferStrength) * editValid,
-                       float3(0.0, 0.0, 0.0));
+        // The low half lands whatever the gate thinks -- it cannot ghost. The high half is the part
+        // that can, so it lands only in proportion to the content having held still.
+        const float3 applied = (gEditBlurUv > 0.0) ? (editLow + editHigh * editValid)
+                                                   : (edit * editValid);
+        upgraded = max(original + applied * saturate(gTransferStrength), float3(0.0, 0.0, 0.0));
 
         // What bounds the sum. An addition says nothing about where the result lands, so the model's
         // verdict is read as a ratio on the pair it came from and the sum is held near it.
@@ -1157,6 +1288,59 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         result = gPassthrough != 0 ? modelDirect : NeutwoDecode(modelDirect);
     else if (gReversibleMode == 4)
         result = gPassthrough != 0 ? modelDirect : HybridDecode(modelDirect);
+
+    // The bound of last resort, and the only one that does not depend on a judgement being right.
+    //
+    // Everything above decides how much of a stale edit to trust. This decides nothing: it states
+    // that a composed pixel has to be a brightness this pixel's own neighbourhood could account for,
+    // widened by the guard the user set. A ghost is precisely a value that neighbourhood cannot
+    // account for -- a bright edge laid on flat dark floor is bright because it belongs to somewhere
+    // else -- so bounding to the neighbourhood is not a heuristic about ghosts, it is the definition
+    // of one made unrepresentable.
+    //
+    // Only on the pipelined path, because that is the only path where the edit can belong to another
+    // frame. Composing in front of the frame the model saw exactly these pixels and has every right
+    // to exceed their neighbourhood.
+    //
+    // One scalar taken from luminance and applied to the whole triple, as every other bound in this
+    // shader is: a per-channel clamp moves hue.
+    if (gPipelined != 0 && gApplyModel != 0 && gReversibleMode != 2 && gReversibleMode != 4 &&
+        nbLumaMax >= nbLumaMin && !showOriginal)
+    {
+        // The box is the neighbourhood's own range, widened a little and not by the highlight guard.
+        //
+        // Widening by the guard was tried first and it is far too loose to do anything: at the
+        // default guard of 2 a flat dark floor still admits twice its own brightness, which is a
+        // ghost you can see. The right width is a fraction of the local range plus a small absolute
+        // allowance -- enough that sharpening, which moves a pixel toward its own neighbours' extremes
+        // and never past them by much, passes untouched, and not enough for content from elsewhere.
+        //
+        // This is why sharpening survives and a ghost does not, and it is worth being explicit about:
+        // enhancing detail means moving a pixel toward the local minimum or maximum, so a legitimate
+        // edit is inside this box almost by construction. A stale edge laid on flat ground is outside
+        // it by multiples.
+        // Widened as a fraction of the neighbourhood's own brightness, not by an absolute amount.
+        //
+        // This distinction is the difference between a bound that works and one that guts the pass.
+        // An absolute widening was tried first: on flat ground the neighbourhood spans almost nothing,
+        // so the box closes to a hair and clips the pass's ordinary broad lift along with the ghost.
+        // Measured, it removed 68% of the edit everywhere to remove 70% of it on flat ground -- again
+        // a volume knob rather than a fix.
+        //
+        // A proportional box separates the two properly, because the two failures differ in scale and
+        // not in position. A gentle overall lift is a small multiple of whatever is already there and
+        // passes wherever it is applied. A stale bright edge laid on dark floor is many multiples of
+        // what is there -- that is exactly why it is visible -- and is caught however dark the floor.
+        const float slack = max(gGhostSlack, 0.0);
+        const float hi = nbLumaMax * (1.0 + slack) + 0.01;
+        const float lo = nbLumaMin / (1.0 + slack) - 0.01;
+        const float rl = dot(result, kLuma);
+
+        if (rl > hi)
+            result *= hi / max(rl, 1e-6);
+        else if (rl < lo && rl > 1e-6)
+            result *= lo / rl;
+    }
 
     // Back out of the normalised space the composition worked in.
     result *= normScale;

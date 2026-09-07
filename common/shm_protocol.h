@@ -30,11 +30,13 @@
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
+// v12: editBlurMilli, the frequency split that keeps a stale edit from ghosting.
+// v11: ghostSlackPercent, the neighbourhood bound that stops a stale edit showing as a ghost.
 // v10: settlePercent, the rate the pipelined edit walks toward a new answer.
 // v8: two sides grew the header at once -- compositionBypass and rebuildSettleMs upstream, pipeline
 // here -- so neither side's number describes this layout.
 // v9: a third region for the motion field, so the header, the file size and the offsets all moved.
-static constexpr uint32_t kShmVersion = 10;
+static constexpr uint32_t kShmVersion = 12;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 4;
@@ -420,6 +422,34 @@ struct ShmHeader {
     // 40 -> 63%, 20 -> 51%, against a step of 0.0046, 0.0034, 0.0030, 0.0021, 0.0019. The default is
     // 60 because below it the step stops improving much and only the strength keeps falling.
     std::atomic<uint32_t> settlePercent;
+
+    // How far past its own neighbourhood's brightness the pipelined path may put a pixel, in
+    // hundredths. This is what stops a stale edit from showing as a second copy of the scene.
+    //
+    // The pipelined path applies an edit computed on an earlier frame. Wherever the picture moved in
+    // between, that edit belongs to other content, and no amount of reprojection makes it belong
+    // here -- a flow estimate can be wrong and a disocclusion has no right answer at all. So the pass
+    // does not try to decide whether the edit is correct. It bounds the result: a composed pixel has
+    // to be a brightness the pixel's own neighbours already span, times this much. A ghost is
+    // precisely a value the neighbourhood cannot account for, so bounding to the neighbourhood makes
+    // one unrepresentable rather than merely unlikely.
+    //
+    // Proportional rather than absolute on purpose: an overall lift is a small multiple of what is
+    // already there and passes anywhere, while a stale highlight on dark ground is many multiples of
+    // it and is caught however dark the ground is. 50 is the default; 0 pins every pixel inside its
+    // neighbours' range exactly, and large values approach having no bound at all.
+    std::atomic<uint32_t> ghostSlackPercent;
+
+    // The radius that splits a stale edit into the half that can ghost and the half that cannot, in
+    // thousandths of the frame's width. 0 turns the split off and applies the edit whole.
+    //
+    // Sized from what the pipelined path actually costs, which was measured rather than assumed: an
+    // answer is about sixteen presented frames old, so during an ordinary turn its edit is displaced
+    // by something like a hundred pixels by the time it is applied. Detail displaced that far is a
+    // second copy of itself; broad tone displaced that far is the same tone. So detail waits for the
+    // content to have held still and tone does not, and this is the line between them. 40 -- four
+    // percent of the width -- is roughly that hundred pixels on a 2560-wide frame.
+    std::atomic<uint32_t> editBlurMilli;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -435,7 +465,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1908, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1916, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -524,7 +554,9 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->mvecQuality.store(kMVecBalanced);
     h->compositionBypass.store(1);
     h->rebuildSettleMs.store(250);
-    h->settlePercent.store(60);
+    h->settlePercent.store(100);
+    h->ghostSlackPercent.store(50);
+    h->editBlurMilli.store(40);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);

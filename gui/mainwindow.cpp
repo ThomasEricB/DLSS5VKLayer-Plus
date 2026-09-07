@@ -692,13 +692,30 @@ QWidget* MainWindow::buildSettings() {
                         "shows as a slight lag in the enhancement during fast motion, not as a lagging "
                         "picture. Measured at 720p: 116 fps waiting against 489 fps alongside, with "
                         "875 fps for the game on its own.");
+        binder->AddInt(f, "Ghost bound (%)", &ShmHeader::ghostSlackPercent, 0, 400,
+                       "Only used when the model runs alongside the frame, and the main thing "
+                       "stopping a stale edit from showing as a faint second copy of the scene.\n\n"
+                       "The edit was computed on an earlier frame, so wherever the picture moved it "
+                       "belongs to different content -- and no motion estimate fixes that, because a "
+                       "disocclusion has no correct answer. So the pass does not guess whether the "
+                       "edit is right: it requires the finished pixel to be a brightness the pixel's "
+                       "own neighbours already span, times this much. A ghost is exactly a value the "
+                       "neighbourhood cannot account for.\n\n"
+                       "0 pins every pixel inside its neighbours' range and is the strictest setting. "
+                       "50 is the default. Raise it if the enhancement feels muted; lower it if you "
+                       "can see a second copy of edges during fast movement.",
+                       ShmBinder::Live);
         binder->AddInt(f, "Settle the edit (%)", &ShmHeader::settlePercent, 0, 100,
                        "Only used when the model runs alongside the frame. An answer arrives every "
                        "few frames, so without this the edit changes all at once on the frame it "
                        "lands and then holds -- which is what reads as a flicker, and the faster the "
                        "game runs the more often it steps.\n\nThis is how much of the way toward a "
                        "new answer the edit moves each frame. 100 takes it whole the moment it "
-                       "arrives, which is the old behaviour.\n\nLower is smoother, and also weaker: "
+                       "arrives, and the default, because measurement did not support lowering it: "
+                       "on a panning scene 60% cut the edit's agreement with the current frame by a "
+                       "third and removed two thirds of the enhancement on real detail, which reads "
+                       "as more ghosting and less of everything else. Left here as a control rather "
+                       "than removed.\n\nLower is smoother, and also weaker: "
                        "two answers taken a few frames apart sit on slightly different geometry, so "
                        "blending them cancels part of the edit as well as spreading it. On a "
                        "worst-case measurement 75 keeps 84% of the edit's strength, 60 keeps 77%, 40 "

@@ -1012,6 +1012,9 @@ struct NeuralState {
     std::vector<uint8_t> prevLuma;
     uint32_t lumaW = 0, lumaH = 0;
     uint32_t sceneCutStreak = 0;
+    // A running level for the frame-to-frame difference this scene normally shows, so a cut can be
+    // judged against the scene's own motion instead of against a constant. Negative until seeded.
+    float cutBaseline = -1.0f;
     uint32_t lastResetLogged = 0xFFFFFFFFu;
     bool mvecResetPending = false;
     bool pendingMvClear = false;  // scene cut: zero MVec inside the prep cmd
@@ -2035,6 +2038,7 @@ static int ReactivateMotionVectors(NeuralState& ns, uint32_t w, uint32_t h, uint
     ns.mvecResetPending = true;
     ns.prevLuma.clear();
     ns.lumaW = ns.lumaH = 0;
+    ns.cutBaseline = -1.0f;
     ns.sceneCutStreak = 0;
     ns.lastResetLogged = 0xFFFFFFFFu;
     if (!SetupOpticalFlow(ns.vk, ns, w, h, quality)) {
@@ -2067,6 +2071,7 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
         ns.prevLuma.assign(n, 0);
         ns.lumaW = gw; ns.lumaH = gh;
         ns.sceneCutStreak = 0;
+        ns.cutBaseline = -1.0f;
     }
 
     uint64_t sum = 0;
@@ -2087,10 +2092,41 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
     }
     if (sizeChanged) return false;
     int mean = int(sum / n);
-    if (mean >= threshold) ++ns.sceneCutStreak;
-    else ns.sceneCutStreak = 0;
-    bool cut = ns.sceneCutStreak >= 2;
-    if (cut) Log("[mvec] scene cut detected mean=%d threshold=%d streak=%u", mean, threshold, ns.sceneCutStreak);
+
+    // A cut is a frame that does not follow from the last one. It is not "a big difference", and the
+    // distinction matters because the two frames compared here are not adjacent.
+    //
+    // On the pipelined path the helper sees one frame per round trip, and a round trip was measured
+    // at about sixteen presented frames. Sixteen frames of an ordinary turn moves the picture roughly
+    // a hundred pixels, and a hundred pixels of pan produces a mean luma difference in the high
+    // fifties -- over the fixed threshold of 55, on every single frame. The detector then declared a
+    // cut about four times a second through steady panning, and a cut clears the motion field and
+    // resets the model's history. So the one mechanism meant to put a stale edit back under its own
+    // content was being handed a field of zeros exactly when the camera was moving, which is exactly
+    // when it was needed. 135 cuts were logged in one thirty-second pan.
+    //
+    // So compare against what this scene has recently been doing rather than against a constant. A
+    // fast pan settles into a high but steady baseline and never trips; a real cut is several times
+    // whatever the baseline is and still does. The absolute threshold is kept as a floor so a cut in
+    // an almost-static scene, where the baseline is near zero, is not judged against nothing.
+    bool cut = false;
+    if (ns.cutBaseline < 0.0f) {
+        ns.cutBaseline = float(mean);
+    } else {
+        const float floorLevel = float(threshold) * 0.35f;
+        const float baseline = ns.cutBaseline < floorLevel ? floorLevel : ns.cutBaseline;
+        const bool over = float(mean) >= baseline * 2.5f && mean >= threshold / 2;
+        if (over) ++ns.sceneCutStreak;
+        else ns.sceneCutStreak = 0;
+        cut = ns.sceneCutStreak >= 2;
+
+        // The baseline follows the scene, but not into a cut: letting a cut raise it would leave the
+        // detector deaf for the next few frames, which is when a second cut is most likely.
+        if (!over) ns.cutBaseline += (float(mean) - ns.cutBaseline) * 0.1f;
+    }
+    if (cut)
+        Log("[mvec] scene cut detected mean=%d baseline=%.1f streak=%u", mean, ns.cutBaseline,
+            ns.sceneCutStreak);
     return cut;
 }
 

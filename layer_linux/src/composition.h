@@ -68,6 +68,12 @@ struct FrameSettings {
     // 1 is the old take-it-whole behaviour. Only consulted on the pipelined path.
     float settleRate = 0.4f;
 
+    // How far past its neighbours' brightness a pipelined pixel may land. See ghostSlackPercent.
+    float ghostSlack = 0.5f;
+
+    // Radius splitting the stale edit's safe half from the half that can ghost, in uv.
+    float editBlur = 0.04f;
+
     static FrameSettings Read(const ShmHeader* h);
 };
 
@@ -124,6 +130,10 @@ class Composition {
     // when it arrives. Recorded straight after the encode, in the same command buffer.
     bool RecordKeepSent(VkCommandBuffer cb);
     bool HasSentProxy() const { return _targetValid; }
+
+    // How many round trips of motion the stale edit has to be moved by. The layer measures it; see
+    // ShmMap::reprojScale.
+    void SetReprojScale(float r) { _reprojScale = r; }
 
     // The answer for the proxy in flight has arrived, so that proxy becomes the matched one. A swap
     // of handles rather than a copy -- the surfaces are identical in every respect but their
@@ -273,6 +283,7 @@ class Composition {
     // would show whatever the allocation happened to contain.
     bool _settled = false;
     bool _targetValid = false;
+    float _reprojScale = 1.0f;
     bool _flightValid = false;
 
     // The motion field for the answer being held, uploaded from the helper's shared region. Says
