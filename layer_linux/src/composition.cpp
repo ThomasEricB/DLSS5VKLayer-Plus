@@ -601,7 +601,7 @@ void Composition::BarrierBeforeExternalRead(VkCommandBuffer cb) const {
 }
 
 bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s) {
-    return RecordGrab(cb, swapchainImage, s) && RecordEncode(cb, s);
+    return RecordGrab(cb, swapchainImage, s) && RecordEncode(cb, s) && RecordSend(cb, s);
 }
 
 // Take this frame's untouched pixels, and nothing else.
@@ -695,6 +695,28 @@ bool Composition::RecordEncode(VkCommandBuffer cb, const FrameSettings& s) {
     }
 
     // What the model is actually handed: the full-resolution proxy, or a reduction of it.
+    return true;
+}
+
+// Hand the encoded raster to the helper.
+//
+// Separate from the encode because the two are allowed on different frames. The encode has to run on
+// every frame -- it is what makes the keep, and the keep is the frame the composition lays its edit
+// onto, so an unencoded frame presents the *previous* picture. The send may not: it writes the region
+// the helper reads, and may only run once the helper has finished with the last one.
+//
+// Conflating them is what made a model slower than the game look like a slower game. At a working
+// scale of 200% the model takes several frames, so most frames could not send -- and skipped the
+// encode with it, presenting the same picture until one could. Full frame rate, a third of the
+// pictures.
+bool Composition::RecordSend(VkCommandBuffer cb, const FrameSettings& s) {
+    if (!_usable) return false;
+
+    // The working raster is built here rather than in the encode, and that is the difference between
+    // supersampling being usable and not. At 200% it is four times the frame's pixels, and building
+    // it every frame would put the enlargement on the critical path of frames that are not going to
+    // send anything anyway. The encode stays frame-sized and cheap; this scales with the working
+    // scale, and only runs at the rate the helper can actually consume.
     Image* source = &_proxy;
     if (_work.image) {
         Transition(cb, _proxy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -717,6 +739,7 @@ bool Composition::RecordEncode(VkCommandBuffer cb, const FrameSettings& s) {
         }
         source = &_work;
     }
+
 
     Transition(cb, *source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 

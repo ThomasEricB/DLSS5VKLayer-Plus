@@ -111,6 +111,10 @@ class Composition {
     bool RecordGrab(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
     bool RecordEncode(VkCommandBuffer cb, const FrameSettings& s);
 
+    // The encode's result on its way to the helper. Split from the encode because a pipelined frame
+    // encodes every time and sends only when the helper is ready for another.
+    bool RecordSend(VkCommandBuffer cb, const FrameSettings& s);
+
     // Keep a copy of what this frame is about to send, so the answer can be differenced against it
     // when it arrives. Recorded straight after the encode, in the same command buffer.
     bool RecordKeepSent(VkCommandBuffer cb);

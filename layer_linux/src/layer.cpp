@@ -557,6 +557,57 @@ struct SwapchainState {
     std::unique_ptr<dlssnr::Composition> comp;
 };
 
+// Frame pacing, which is not the same question as frame cost.
+//
+// A pass that costs 1 ms on average and 40 ms once a second reports a fine average and feels like a
+// slideshow, because what anyone sees is the spread between presents rather than their mean. So this
+// keeps the distribution: the interval the game actually achieved, and how long the present hook held
+// it up, both as percentiles over a window.
+struct Pacing {
+    static constexpr size_t kWindow = 1024;
+    double interval[kWindow] = {};
+    double hook[kWindow] = {};
+    double fence[kWindow] = {};
+    size_t n = 0;
+    double lastPresent = 0.0;
+
+    void Add(double intervalMs, double hookMs, double fenceMs) {
+        const size_t i = n % kWindow;
+        interval[i] = intervalMs;
+        hook[i] = hookMs;
+        fence[i] = fenceMs;
+        ++n;
+    }
+
+    static double Pct(double* v, size_t count, double p) {
+        if (!count) return 0.0;
+        std::vector<double> c(v, v + count);
+        std::sort(c.begin(), c.end());
+        size_t idx = size_t(p * (count - 1) + 0.5);
+        return c[idx];
+    }
+
+    void Report() {
+        const size_t count = n < kWindow ? n : kWindow;
+        if (count < 16) return;
+        // The number that matches the complaint: how often a frame took more than twice the usual.
+        // A max alone can be one hitch in a thousand; this says whether it is one or a hundred.
+        const double p50 = Pct(interval, count, 0.50);
+        size_t hitches = 0;
+        for (size_t i = 0; i < count; ++i)
+            if (interval[i] > p50 * 2.0) ++hitches;
+        Log("[pace] %zu of %zu frames took over twice the usual interval", hitches, count);
+        Log("[pace] over %zu frames -- present interval p50=%.2f p95=%.2f p99=%.2f max=%.2f ms; "
+            "hook p50=%.2f p95=%.2f p99=%.2f max=%.2f ms; fence wait p50=%.2f p99=%.2f max=%.2f ms",
+            count,
+            Pct(interval, count, 0.50), Pct(interval, count, 0.95), Pct(interval, count, 0.99),
+            Pct(interval, count, 1.0),
+            Pct(hook, count, 0.50), Pct(hook, count, 0.95), Pct(hook, count, 0.99),
+            Pct(hook, count, 1.0),
+            Pct(fence, count, 0.50), Pct(fence, count, 0.99), Pct(fence, count, 1.0));
+    }
+};
+
 struct DeviceChain {
     InstanceChain* instance = nullptr;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -583,6 +634,8 @@ struct DeviceChain {
     ShmMap shm;
     uint64_t framesComposed = 0;
     uint64_t framesPassedThrough = 0;
+    double fenceWaitMs = 0.0;   // this frame's total, reset by the present hook
+    Pacing pace;
 };
 
 static std::unordered_map<VkInstance, InstanceChain> g_instances;
@@ -1156,8 +1209,10 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
         if (si.waitSemaphoreCount && consumedWaits) *consumedWaits = true;
         if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence), "vkQueueSubmit")) return false;
+        const double tFence = NowMs();
         if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
             return false;
+        dc->fenceWaitMs += NowMs() - tFence;
         dc->vkResetFences(d, 1, &sc.fence);
         return true;
     };
@@ -1187,15 +1242,11 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         if (haveAnswer) sc.comp->MarkModelFrame();
         const bool willCompose = sc.comp->HasModelFrame() && sc.comp->HasSentProxy();
         if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
-        if (!mayPublish && !willCompose) {
-            // Nothing to do this frame, but the game's render-complete semaphores were handed to this
-            // submit and something has to wait on them. Presenting without a wait leaves them
-            // signalled, and the next frame signals them again -- which is a real hazard, not a
-            // diagnostic: the present engine would be reading an image the game may still be drawing.
-            return runLeg();
-        }
-        if (mayPublish && (!sc.comp->RecordGrab(cb, swapchainImage, fs) ||
-                           !sc.comp->RecordEncode(cb, fs))) {
+        // Grabbed and encoded every frame, whether or not the helper is ready for another request.
+        // The encode makes the keep, and the keep is the frame the composition lays its edit onto --
+        // skip it and the pass presents the previous picture, which at full frame rate reads as a
+        // game running at a fraction of the rate it reports. Only the send is gated.
+        if (!sc.comp->RecordGrab(cb, swapchainImage, fs) || !sc.comp->RecordEncode(cb, fs)) {
             dc->vkEndCommandBuffer(cb);
             return false;
         }
@@ -1205,7 +1256,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             dc->vkEndCommandBuffer(cb);
             return false;
         }
-        if (mayPublish && !sc.comp->RecordKeepSent(cb)) {
+        if (mayPublish && (!sc.comp->RecordSend(cb, fs) || !sc.comp->RecordKeepSent(cb))) {
             dc->vkEndCommandBuffer(cb);
             return false;
         }
@@ -1340,6 +1391,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             }
             if (!sc.ready || dc->shm.dead) continue;
             const uint32_t waitCount = waitsConsumed ? 0u : pPresentInfo->waitSemaphoreCount;
+            const double tHookStart = NowMs();
+            dc->fenceWaitMs = 0.0;
             bool consumed = false;
             const bool composed = ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]],
                                                  waitCount, pPresentInfo->pWaitSemaphores, &consumed);
@@ -1347,6 +1400,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             // still claiming them would leave the present with nothing to wait on, and the game's
             // render-complete semaphore signalled with no one to clear it.
             waitsConsumed = waitsConsumed || consumed;
+
+            // What the hook cost this frame, and how far apart the presents actually landed.
+            const double now = NowMs();
+            const double gap = dc->pace.lastPresent > 0.0 ? now - dc->pace.lastPresent : 0.0;
+            dc->pace.lastPresent = now;
+            if (gap > 0.0) dc->pace.Add(gap, now - tHookStart, dc->fenceWaitMs);
+            if (TimeEnabled() && dc->pace.n && dc->pace.n % (TimeInterval() * 4) == 0) dc->pace.Report();
+
             if (!composed) ++dc->framesPassedThrough;
             if (VerboseEnabled()) {
                 Log("[present] swapchain=%p image=%u seq=%u composed=%d",
