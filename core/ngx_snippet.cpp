@@ -490,9 +490,12 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
         pass, (uint32_t)createResult, seh, (void*)s.features[pass], width, height, ms);
     if (!NVSDK_NGX_SUCCEED(createResult) || !s.features[pass]) {
         s.features[pass] = nullptr;
-        // Only the first pass failing is fatal; a later one failing simply caps the chain, which is
-        // what a memory ceiling looks like and is not a reason to lose the pass altogether.
-        if (pass == 0) s.disabled = true;
+        // Only the first pass failing leaves the feature unusable; a later one failing simply caps
+        // the chain, which is what a memory ceiling looks like and is not a reason to lose the pass
+        // altogether. Even pass 0 is not fatal to the *snippet*: it loaded and initialised, and it
+        // may well accept a different raster, so the caller is told this size was refused rather than
+        // that the model is gone.
+        if (pass == 0) s.createFailed = true;
         return false;
     }
     s.featureW = width;

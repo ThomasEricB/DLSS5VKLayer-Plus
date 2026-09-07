@@ -38,6 +38,17 @@ struct NgxSnippet {
     bool ready = false;     // snippet init + CreateFeature(18) succeeded
     bool disabled = false;  // latched failure -> pass-through forever
 
+    // A CreateFeature that failed for this particular size, as opposed to a snippet that cannot work
+    // at all.
+    //
+    // These were the same flag, and treating them the same is how one bad size took the feature down
+    // for good: the model refused a 5120x2014 raster (a window manager had made the window an odd
+    // height), the helper latched `disabled`, set the shared quit flag and exited -- and the quit flag
+    // outlives the process, so every later session found the feature dead and only re-initialising the
+    // whole header brought it back. A size the model will not take is a reason to try a different
+    // size, not a reason to stop.
+    bool createFailed = false;
+
     // Captured from NVSDK_NGX_VULKAN_GetFeatureRequirements (bit 0 = HDR path).
     unsigned int featureFlags = 0;
     bool hdrCapable = false;

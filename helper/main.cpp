@@ -124,6 +124,10 @@ static bool ShmOpen(ShmMap& s) {
     // concludes nobody is there at exactly the moment the helper is working hardest, which is how a
     // running helper came to be ignored.
     s.hdr->helperState.store(kHelperStarting);
+    // A previous helper's failure explanation is not this helper's. Left in place it is shown in the
+    // interface beside a perfectly healthy process, which is how "the model would not initialise"
+    // came to be on screen while the model was running.
+    ShmStoreString(s.hdr->helperReasonSeq, s.hdr->helperReason, kReasonBytes, "");
     s.hdr->controlSeq.fetch_add(1);
     s.hdr->heartbeat.fetch_add(1);
     Log("[helper] shm attached: %ls", winPath.c_str());
@@ -1011,6 +1015,11 @@ struct NeuralState {
     uint32_t appliedMvecScaleMode = 0xFFFFFFFFu;
     std::vector<uint8_t> prevLuma;
     uint32_t lumaW = 0, lumaH = 0;
+    // A raster the model refused, so it is not retried in a tight loop. Cleared by any size that
+    // works, so a window resize away from a bad size recovers on its own.
+    uint32_t refusedW = 0, refusedH = 0;
+    double refusedRetryMs = 0.0;
+
     uint32_t sceneCutStreak = 0;
     // A running level for the frame-to-frame difference this scene normally shows, so a cut can be
     // judged against the scene's own motion instead of against a constant. Negative until seeded.
@@ -2205,6 +2214,11 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     if (ns.ready && ns.w == w && ns.h == h) return true;
     if (ns.ngx.disabled) return false;
 
+    // A size the model has already refused is not retried every frame. Rebuilding costs on the order
+    // of a hundred milliseconds and fails just as fast, so hammering it turns a refused raster into a
+    // stalled game. Any other size is tried immediately, which is what makes a window resize recover.
+    if (w == ns.refusedW && h == ns.refusedH && NowMs() < ns.refusedRetryMs) return false;
+
     if (ns.ngx.snippet) NgxReleaseAllPasses(ns.ngx, ns.vk.device);
     DestroyOpticalFlow(ns.vk, ns.flow);
     DestroyImage2D(ns.vk, ns.colorIn);
@@ -2268,6 +2282,26 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     if (!BeginCmd(ns.vk.cmdCreate)) return false;
     bool ok = NgxLoadAndInit(ns.ngx, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h, ns.vk.cmdCreate, first);
     if (!SubmitAndWait(ns.vk, ns.vk.cmdCreate) || !ok) {
+        // Two different failures wearing one face, until now.
+        //
+        // If the snippet itself is unusable -- the DLL missing, init refusing -- there is nothing to
+        // retry and the helper says so. But if it merely refused *this raster*, the model is fine and
+        // another size will very likely work. Conflating the two is what let a single odd window size
+        // put the feature away permanently: the helper latched, raised the shared quit flag, and that
+        // flag outlived the process, so every later run found the feature dead until the whole header
+        // was re-initialised by hand.
+        if (ns.ngx.createFailed && !ns.ngx.disabled) {
+            ns.ngx.createFailed = false;
+            ns.refusedW = w;
+            ns.refusedH = h;
+            ns.refusedRetryMs = NowMs() + 2000.0;
+            Log("[helper] the model refused %ux%u; keeping the feature and waiting for another size", w, h);
+            ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                           "the model would not accept this frame size; try a different resolution "
+                           "or model resolution");
+            PublishStatus(shm, ns, kHelperRunning);
+            return false;
+        }
         Log("[helper] snippet init/create failed at %ux%u", w, h);
         ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
                        "the model would not initialise; see the helper log");
@@ -2275,6 +2309,10 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
         PublishStatus(shm, ns, kHelperModelFailed);
         return false;
     }
+
+    // This size works, so nothing is being refused any more.
+    ns.refusedW = ns.refusedH = 0;
+    ns.refusedRetryMs = 0.0;
 
     ns.tuning[0] = first;
     ns.lastSeenTuning[0] = first;
