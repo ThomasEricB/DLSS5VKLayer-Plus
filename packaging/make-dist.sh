@@ -3,6 +3,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# What to produce: tarballs only, RPMs only, or both. The RPMs install the staged
+# tarball as their payload, so "rpm" still stages (and leaves behind) the tar.gz.
+MODE="${1:-both}"
+case "$MODE" in
+    tar|rpm|both) ;;
+    *) echo "usage: $0 [tar|rpm|both]" >&2; exit 1 ;;
+esac
+
 VERSION="${DLSSNR_VERSION:-0.2.5}"
 RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
 RELEASE="${RELEASE:-1}"
@@ -97,9 +105,16 @@ build_rpm() {
 stage_variant public dlssnr
 stage_variant personal dlssnr-personal
 
-build_rpm packaging/dlssnr.spec
-build_rpm packaging/dlssnr-personal.spec
+if [ "$MODE" != "tar" ]; then
+    build_rpm packaging/dlssnr.spec
+    build_rpm packaging/dlssnr-personal.spec
+fi
 
 echo
 echo "artifacts:"
-ls -1 "$DIST"/dlssnr-*.tar.gz "$DIST"/dlssnr-*.rpm 2>/dev/null || true
+if [ "$MODE" != "rpm" ]; then
+    ls -1 "$DIST"/dlssnr-*.tar.gz 2>/dev/null || true
+fi
+if [ "$MODE" != "tar" ]; then
+    ls -1 "$DIST"/dlssnr-*.rpm 2>/dev/null || true
+fi

@@ -29,14 +29,16 @@ if [ "$MODE" = "system" ]; then
     exit 1
   fi
   rm -rf /usr/lib64/dlssnr
-  rm -f /usr/bin/dlssnr-helper /usr/bin/dlssnr-gui /usr/bin/dlssnr-runner-probe
+  rm -f /usr/bin/dlssnr-helper /usr/bin/dlssnr-gui /usr/bin/dlssnr-runner-probe /usr/bin/dlssnr-shmctl
   rm -f /usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.json
+  rm -f /usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.*.json
   rm -f /usr/share/applications/dlssnr.desktop
   rm -rf /usr/share/doc/dlssnr
 else
+  user_manifest_dir="$HOME/.local/share/vulkan/implicit_layer.d"
   rm -rf "$HOME/.local/lib/dlssnr"
-  rm -f "$HOME/.local/bin/dlssnr-helper" "$HOME/.local/bin/dlssnr-gui" "$HOME/.local/bin/dlssnr-runner-probe"
-  rm -f "$HOME/.local/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.json"
+  rm -f "$HOME/.local/bin/dlssnr-helper" "$HOME/.local/bin/dlssnr-gui" "$HOME/.local/bin/dlssnr-runner-probe" "$HOME/.local/bin/dlssnr-shmctl"
+  rm -f "$user_manifest_dir"/VK_LAYER_NV_dlssnr.json "$user_manifest_dir"/VK_LAYER_NV_dlssnr.*.json
   rm -f "$HOME/.local/share/applications/dlssnr.desktop"
   rm -rf "$HOME/.local/share/doc/dlssnr"
 fi

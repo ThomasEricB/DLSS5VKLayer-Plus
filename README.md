@@ -66,27 +66,56 @@ The personal package variant includes these DLLs. Only redistribute the personal
 
 ## Install From RPM
 
+The RPMs are the packaged builds under `dist/`, produced by [Packaging](#packaging). Install with
+`dnf` so the dependencies (Qt 6, the Vulkan loader) come with it:
+
 Public package:
 
 ```bash
-sudo rpm -Uvh dist/dlssnr-0.2.5-1.fc44.x86_64.rpm
+sudo dnf install ./dist/dlssnr-0.2.5-2.fc44.x86_64.rpm
 ```
 
 Personal package:
 
 ```bash
-sudo rpm -Uvh dist/dlssnr-personal-0.2.5-1.fc44.x86_64.rpm
+sudo dnf install ./dist/dlssnr-personal-0.2.5-2.fc44.x86_64.rpm
 ```
 
 `wine` is a recommended package, not a hard dependency, so Proton-only users are not forced to install host Wine.
 
+### Updating an RPM Install
+
+Stop the helper first if it is running, then upgrade in place -- user config, state and the managed
+prefix survive the update:
+
+```bash
+dlssnr-helper stop
+sudo dnf upgrade ./dist/dlssnr-0.2.5-2.fc44.x86_64.rpm
+```
+
+(`rpm -Uvh ./dist/dlssnr-0.2.5-2.fc44.x86_64.rpm` does the same job on systems without `dnf`.)
+Relaunch any game that was presenting through the layer so it picks up the new layer library.
+
+The two variants carry the same files and conflict with each other, so switching between them is a
+swap, not an install:
+
+```bash
+sudo dnf swap dlssnr dlssnr-personal      # or the other way round
+```
+
 ## Install From Tarball
+
+The tarball runs on any x86_64 glibc distro -- Fedora, openSUSE, Debian and friends, and Arch and
+CachyOS. Since `0.2.5-2` the GUI binary reaches Qt's meta-object data symbols through the GOT, so it
+loads against both the default-visibility Qt (Fedora) and the protected-visibility Qt (Arch/CachyOS);
+older tarballs die at exec on Arch-based systems with
+`GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS`.
 
 Extract the tarball:
 
 ```bash
-tar -xzf dist/dlssnr-0.2.5-1-linux-x86_64.tar.gz
-cd dlssnr-0.2.5-1-linux-x86_64
+tar -xzf dist/dlssnr-0.2.5-2-linux-x86_64.tar.gz
+cd dlssnr-0.2.5-2-linux-x86_64
 ```
 
 User install, no root required:
@@ -102,6 +131,25 @@ sudo ./install.sh --system
 ```
 
 For user installs, make sure `~/.local/bin` is in your `PATH`.
+
+### Updating a Tarball Install
+
+`install.sh` overwrites the files it owns in place, so an update is just the new tarball installed
+over the old one -- user config, state and the managed prefix are not touched:
+
+```bash
+dlssnr-helper stop
+tar -xzf dist/dlssnr-0.2.5-2-linux-x86_64.tar.gz
+cd dlssnr-0.2.5-2-linux-x86_64
+./install.sh --user        # or: sudo ./install.sh --system
+```
+
+Relaunch any game that was presenting through the layer so it picks up the new layer library.
+
+Stick to one install mode and one packaging format. The `--user` and `--system` trees and the tarball
+and the RPM all own the same layer manifest, and the loader reads whichever it finds first -- if you
+switched modes or came from the RPM, remove the other copy first (`sudo ./uninstall.sh --system`, or
+`sudo dnf remove dlssnr`).
 
 ## First Run
 
@@ -252,23 +300,45 @@ Fallback:
 Install build dependencies:
 
 - `gcc-c++`
-- `mingw64-gcc-c++`
-- `qt6-qtbase-devel`
-- `vulkan-loader-devel` or equivalent Vulkan headers, though Vulkan headers are vendored
+- `mingw64-gcc-c++` for the Windows helper
+- `qt6-qtbase-devel` for the GUI (provides `qmake6`)
+- `clang` -- the GUI is linked with `clang++` plus `-Wl,-z,nocopyreloc` so its binary loads on
+  distros whose Qt exports the meta-object data symbols with protected visibility (Arch/CachyOS).
+  Without clang the GUI still builds with g++, but then it only loads on default-visibility Qt.
+- `rpm-build` if you want the RPMs
+- optional: a 32-bit multilib toolchain (`glibc-devel.i686` + `libstdc++-devel.i686`) for the
+  32-bit layer; it is skipped with a notice when absent
 
-Build:
+Vulkan headers are vendored, so no Vulkan devel package is needed.
+
+Build only:
 
 ```bash
 ./build.sh
 ```
 
+A plain build also installs the layer manifest into `~/.local/share` so locally launched games pick
+it up; set `DLSSNR_SKIP_MANIFEST_INSTALL=1` to skip that.
+
+Build and package in one step:
+
+```bash
+./build.sh --tar     # + the .tar.gz tarballs (public + personal)
+./build.sh --rpm     # + the RPMs (public + personal)
+./build.sh --dist    # + both
+```
+
 Outputs:
 
 ```text
-build/layer/libVkLayer_NV_dlssnr.so
-build/dlssnr_helper.exe
-build/runner_probe
-build/gui/dlssnr_gui
+build/layer/libVkLayer_NV_dlssnr.so     64-bit layer
+build/layer32/libVkLayer_NV_dlssnr.so   32-bit layer (when a multilib toolchain is present)
+build/dlssnr_helper.exe                 Windows NGX helper
+build/smoke.exe                         smoke-test program
+build/runner_probe                      runner discovery probe
+build/dlssnr-shmctl                     shared-memory settings CLI
+build/gui/dlssnr_gui                    Qt GUI
+build/binder_test                       GUI binder regression test (run it offscreen)
 ```
 
 ## GUI Settings
@@ -399,15 +469,44 @@ light, not code.
 
 ## Packaging
 
-Build public and personal tarballs plus RPMs:
+Everything lands in `dist/`. The tarballs are staged from `build/` (running `make-dist.sh` builds
+first if the artifacts are missing), and the RPMs install the staged tarball as their payload, so an
+RPM build also leaves the tar.gz behind.
 
 ```bash
-./packaging/make-dist.sh
+./packaging/make-dist.sh          # tarballs + RPMs (same as ./build.sh --dist)
+./packaging/make-dist.sh tar      # tarballs only
+./packaging/make-dist.sh rpm      # RPMs only
 ```
 
-Artifacts are written to `dist/`.
+Both variants are always staged: `dlssnr` (public, no NVIDIA DLLs) and `dlssnr-personal` (bundles the
+DLLs from `binaries/`). The public package does not include NVIDIA DLLs. The personal package does --
+only redistribute it if you have the rights to do so.
 
-The public package does not include NVIDIA DLLs. The personal package does.
+Artifacts:
+
+```text
+dist/dlssnr-<version>-<release>-linux-x86_64.tar.gz
+dist/dlssnr-personal-<version>-<release>-linux-x86_64.tar.gz
+dist/dlssnr-<version>-<release>.fcXX.x86_64.rpm
+dist/dlssnr-personal-<version>-<release>.fcXX.x86_64.rpm
+```
+
+### Making a Release
+
+1. Bump `Version:` in both specs and the `DLSSNR_VERSION` default in `packaging/make-dist.sh`.
+2. Bump `%global pkg_release` in **both** specs together. The tarball name is read from
+   `dlssnr.spec` and both specs unpack that same tarball, so the two releases must match.
+   `DLSSNR_VERSION` / `DLSSNR_RELEASE` env-var overrides are available for throwaway builds.
+3. Add a `%changelog` entry to both specs.
+4. Build everything and package it:
+
+   ```bash
+   ./build.sh --dist
+   ```
+
+   The GUI is relinked automatically when the chosen compiler or linker flags change, so no stale
+   g++-built binary can slip into a tarball.
 
 ## Uninstall
 
@@ -423,7 +522,8 @@ or:
 sudo dnf remove dlssnr-personal
 ```
 
-Tarball user install:
+Tarball installs -- the scripts ship inside the tarball, so run them from the extracted tree (the
+same tree you installed from; an update's tree removes the files fine too):
 
 ```bash
 ./uninstall.sh --user
@@ -435,7 +535,9 @@ Tarball system install:
 sudo ./uninstall.sh --system
 ```
 
-Add `--purge` to also remove user config, state, runtime data, and the managed prefix.
+Both modes remove the binaries, the desktop entry and the per-architecture layer manifests
+(`VK_LAYER_NV_dlssnr.*.json`), so the loader stops looking for the layer. Add `--purge` to also
+remove user config, state, runtime data, and the managed prefix.
 
 ## Troubleshooting
 
