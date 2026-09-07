@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="${DLSSNR_VERSION:-0.2.2}"
+VERSION="${DLSSNR_VERSION:-0.2.5}"
 RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
 RELEASE="${RELEASE:-1}"
 DIST="dist"
@@ -46,6 +46,7 @@ stage_variant() {
   cp "$BUILD/gui/dlssnr_gui" "$root/usr/bin/dlssnr-gui"
   cp dlssnr-helper "$root/usr/bin/dlssnr-helper"
   ln -sf ../lib64/dlssnr/bin/runner_probe "$root/usr/bin/dlssnr-runner-probe"
+  ln -sf ../lib64/dlssnr/bin/dlssnr-shmctl "$root/usr/bin/dlssnr-shmctl"
   cp third_party/dxvk/2.7.1/x64/vulkan-1.dll "$root/usr/lib64/dlssnr/dxvk/2.7.1/"
   cp third_party/dxvk/2.7.1/LICENSE.txt "$root/usr/share/doc/dlssnr/dxvk-license.txt"
   cp packaging/dlssnr.desktop "$root/usr/share/applications/"

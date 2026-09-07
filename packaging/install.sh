@@ -70,8 +70,10 @@ cp -a "$root/usr/share/applications/dlssnr.desktop" "$APP_DIR/dlssnr.desktop"
 
 if [ "$MODE" = "system" ]; then
   ln -sf ../lib64/dlssnr/bin/runner_probe "$BINDIR/dlssnr-runner-probe"
+  ln -sf ../lib64/dlssnr/bin/dlssnr-shmctl "$BINDIR/dlssnr-shmctl"
 else
   ln -sf ../lib/dlssnr/bin/runner_probe "$BINDIR/dlssnr-runner-probe"
+  ln -sf ../lib/dlssnr/bin/dlssnr-shmctl "$BINDIR/dlssnr-shmctl"
 fi
 
 for arch_manifest in "$root"/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.*.json; do

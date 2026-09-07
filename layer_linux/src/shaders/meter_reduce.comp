@@ -1,0 +1,158 @@
+#version 450
+// White-point meter reduction, entirely on the GPU.
+//
+// Replaces the host-side percentile in Composition::ConsumeMeter: the Calibrate
+// dispatch writes the 64x64 tile-peak grid, this pass turns that grid into the
+// same answer the CPU used to compute -- 90th percentile of tile peaks, gated
+// on enough of the frame carrying light, smoothed over a 16-frame history --
+// and resolves it against the manual slider, the scale and the trim. The result
+// never leaves the device: the layer copies the four-byte resolved value
+// straight into the composition pass's constant block.
+//
+// One workgroup, phases separated by barriers. The gates and the carry-forward
+// on rejection mirror ConsumeMeter exactly: a reading is only offered when the
+// top of the range actually appears in the picture, and a rejected frame keeps
+// the previous answer rather than zeroing it.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define kGrid    64
+#define kTiles   (kGrid * kGrid)
+#define kBins    256
+#define kHistory 16
+
+layout(set = 0, binding = 0) uniform sampler2D meterGrid;  // R32_SFLOAT, kGrid x kGrid
+
+layout(set = 0, binding = 1) buffer MeterState {
+    float maxTile;
+    float measured;
+    float resolved;
+    float steadiness;
+    float litFraction;
+    uint  historyCount;
+    uint  pad0;
+    uint  pad1;
+    float history[kHistory];
+} state;
+
+layout(push_constant) uniform Push {
+    float manual;    // the slider
+    float scale;     // what the model should treat as white, times this
+    float trim;      // the measured reading's trim
+    float holdValue; // frozen resolved value while the frame is held
+    uint  source;    // 0 manual, 1 measured
+    uint  hold;      // nonzero: present holdValue
+} pc;
+
+shared uint  hist[kBins];
+shared uint  candCount;
+shared uint  litCount;
+shared float localMax[256];
+shared float sMax;
+
+float TileAt(uint i) {
+    ivec2 p = ivec2(int(i % kGrid), int(i / kGrid));
+    return texelFetch(meterGrid, p, 0).r;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+
+    // --- phase A: brightest tile -------------------------------------------------
+    // NaN fails every comparison and infinity is above the bound, so this range
+    // test is the finiteness test -- Vulkan GLSL has no isfinite().
+    float m = 0.0;
+    for (uint i = tid; i < kTiles; i += 256u) {
+        float v = TileAt(i);
+        if (v > m && v < 1e30) m = v;
+    }
+    localMax[tid] = m;
+    barrier();
+    if (tid == 0u) {
+        float b = 0.0;
+        for (uint j = 0u; j < 256u; ++j) b = max(b, localMax[j]);
+        sMax = b;
+    }
+    barrier();
+
+    // --- phase B: histogram of lit tiles, relative to the brightest ---------------
+    hist[tid] = 0u;
+    if (tid == 0u) { candCount = 0u; litCount = 0u; }
+    barrier();
+
+    const float top = sMax;
+    if (top > 0.0) {
+        const float toBin = float(kBins) / top;
+        for (uint i = tid; i < kTiles; i += 256u) {
+            float v = TileAt(i);
+            if (!(v > 1e-6) || v >= 1e30) continue;
+            atomicAdd(candCount, 1u);
+            if (v > top * 0.10) atomicAdd(litCount, 1u);
+            int bin = int(v * toBin);
+            if (bin > kBins - 1) bin = kBins - 1;
+            atomicAdd(hist[bin], 1u);
+        }
+    }
+    barrier();
+
+    // --- phase C: percentile, gates, history, resolve ------------------------------
+    if (tid != 0u) return;
+
+    const uint total = candCount;
+    float candidate = 0.0;
+    if (total >= 16u && top > 0.0) {
+        const uint nth = uint(float(total - 1u) * 0.90);
+        uint before = 0u;
+        for (int b = 0; b < kBins; ++b) {
+            const uint c = hist[b];
+            if (before + c > nth) {
+                const float frac = float(nth - before) / float(c);
+                candidate = (float(b) + frac) * (top / float(kBins));
+                break;
+            }
+            before += c;
+        }
+    }
+
+    const float lit = float(litCount) / float(kTiles);
+
+    // Same rejections as ConsumeMeter: a torn or absurd reading is refused, and a
+    // dark frame has no top of range to measure. A refusal carries the previous
+    // answer forward rather than offering zero.
+    const bool finiteOk = candidate > 0.0 && !(candidate >= 1999.0);
+    const bool accepted = finiteOk && lit > 0.20 && total >= 16u;
+
+    float measured = state.measured;
+    uint count = state.historyCount;
+    if (accepted) {
+        measured = candidate;
+        state.history[count % kHistory] = candidate;
+        ++count;
+    }
+
+    // Steadiness is the spread of recent answers, not their size.
+    float steadiness = state.steadiness;
+    const uint have = min(count, uint(kHistory));
+    if (have >= 8u) {
+        float lo = 1e30, hi = 0.0;
+        for (uint i = 0u; i < have; ++i) {
+            float v = state.history[(count - 1u - i) % kHistory];
+            lo = min(lo, v);
+            hi = max(hi, v);
+        }
+        const float spread = lo > 0.0 ? hi / lo : 2.0;
+        steadiness = clamp(1.0 - (spread - 1.0), 0.0, 1.0);
+    }
+
+    float base = pc.manual;
+    if (pc.source == 1u && measured > 0.0) base = measured * pc.trim;
+    float wp = clamp(base * pc.scale, 1e-4, 2000.0);
+    if (pc.hold != 0u) wp = pc.holdValue;
+
+    state.maxTile = top;
+    state.measured = measured;
+    state.resolved = wp;
+    state.steadiness = steadiness;
+    state.litFraction = lit;
+    state.historyCount = count;
+}
