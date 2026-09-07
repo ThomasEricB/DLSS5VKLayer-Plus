@@ -43,7 +43,9 @@ class GlobalMotionVk {
 
     // Estimates the displacement from `then` to `now` and leaves it in a buffer the composition
     // reads. Both views must be the frame's own size; they are reduced internally.
-    bool Record(VkCommandBuffer cb, VkImageView now, VkImageView then);
+    // `reset` says a new answer has been adopted, so the reference changed and the tracker's
+    // history describes nothing.
+    bool Record(VkCommandBuffer cb, VkImageView now, VkImageView then, bool reset);
 
     // A one-by-one image holding (dx, dy, confidence, 1) in pixels of the frame. Sampled as a motion
     // field by the composition, where a single texel reads as one vector for the whole picture.
@@ -103,7 +105,7 @@ class GlobalMotionVk {
 
     // Two levels. The coarse one finds the displacement at all; the fine one pins it down to about a
     // pixel, which is what fine detail needs to stay correlated.
-    Img _now[2]{}, _then[2]{}, _result[2]{};
+    Img _now[2]{}, _then[2]{}, _result[2]{}, _state{};
     VkBuffer _readBuf = VK_NULL_HANDLE;
     VkDeviceMemory _readMem = VK_NULL_HANDLE;
     void* _readMap = nullptr;

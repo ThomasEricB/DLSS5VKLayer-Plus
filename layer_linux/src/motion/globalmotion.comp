@@ -102,13 +102,16 @@ void main() {
 // pixels of the full frame. A single workgroup: there are only a few hundred candidates.
 layout(binding = 0) uniform Params {
     int radius; float scaleX; float scaleY; int useBase;
+    int reset; float alpha; float rejectPx; int track;
 } pc;
 layout(std430, binding = 1) readonly buffer Cost { float cost[]; };
 layout(rgba32f, binding = 3) uniform readonly image2D uBase;
+// The tracker's memory: xy is how fast the displacement was growing, z says whether it holds anything.
+layout(rgba32f, binding = 4) uniform image2D uState;
 // A one-by-one image rather than a buffer, on purpose. The composition already samples a motion
 // field; a field that is a single texel returns the same vector at every pixel, which is precisely a
 // global translation -- so this drops into the existing shader without touching a single binding.
-layout(rgba32f, binding = 2) uniform writeonly image2D uResult;
+layout(rgba32f, binding = 2) uniform image2D uResult;
 
 float At(int x, int y, int span) {
     x = clamp(x, 0, span - 1);
@@ -173,9 +176,41 @@ void main() {
         vec2 b = imageLoad(uBase, ivec2(0)).xy;
         base = round(b / vec2(pc.scaleX, pc.scaleY)) * vec2(pc.scaleX, pc.scaleY);
     }
-    imageStore(uResult, ivec2(0, 0),
-               vec4(base.x + (float(bx - pc.radius) + dx) * pc.scaleX,
-                    base.y + (float(by - pc.radius) + dy) * pc.scaleY,
-                    confidence, 1.0));
+    vec2 measured = vec2(base.x + (float(bx - pc.radius) + dx) * pc.scaleX,
+                        base.y + (float(by - pc.radius) + dy) * pc.scaleY);
+
+    // Only the finest level is smoothed, and it keeps its own memory. Sharing one state across levels
+    // was tried and was worse than no smoothing at all: the coarse pass runs first with its history
+    // cleared, zeroes the velocity, and leaves the fine pass predicting that the camera has stopped.
+    if (pc.track == 0) {
+        imageStore(uResult, ivec2(0, 0), vec4(measured, confidence, 1.0));
+        return;
+    }
+
+    // Between one answer and the next the reference picture is fixed, so the displacement from it
+    // grows smoothly -- the camera does not jump. The search is independent every frame, though, and
+    // measured against a known 6 pixels a frame it returned -10, 6, 14, 14, -10, 24: right on average
+    // and wrong every frame. That scatter is the judder. It is not a low frame rate, it is a frame
+    // rate whose steps are all different sizes, which the eye reads as one.
+    vec4 state = imageLoad(uState, ivec2(0, 0));
+    vec2 prev = imageLoad(uResult, ivec2(0, 0)).xy;
+    bool haveHistory = state.z > 0.5 && pc.reset == 0;
+
+    vec2 outp = measured;
+    if (haveHistory) {
+        // A constant-velocity prediction, because steady motion is the case that has to look right
+        // and a plain average would lag it.
+        vec2 predicted = prev + state.xy;
+        vec2 err = measured - predicted;
+        // Past this much disagreement the measurement is discarded and the prediction carries the
+        // frame, which is what stops one bad match putting a jolt on screen.
+        outp = dot(err, err) > pc.rejectPx * pc.rejectPx
+                   ? predicted
+                   : mix(predicted, measured, clamp(pc.alpha, 0.0, 1.0));
+    }
+    vec2 newVel = haveHistory ? mix(state.xy, outp - prev, 0.35) : vec2(0.0);
+
+    imageStore(uState, ivec2(0, 0), vec4(newVel, 1.0, 0.0));
+    imageStore(uResult, ivec2(0, 0), vec4(outp, confidence, 1.0));
 }
 #endif

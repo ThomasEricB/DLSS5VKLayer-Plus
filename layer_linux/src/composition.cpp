@@ -981,7 +981,7 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         if (stale) {
             Transition(cb, _proxy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             Transition(cb, *stale, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            globalMotion = _globalMotion->Record(cb, _proxy.view, stale->view);
+            globalMotion = _globalMotion->Record(cb, _proxy.view, stale->view, refreshModel);
             if (globalMotion) {
                 // What the estimate actually said, reported rather than assumed. The gate that will
                 // read the confidence has to be calibrated against real values.

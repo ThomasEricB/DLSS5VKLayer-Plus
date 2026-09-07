@@ -784,24 +784,24 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         const float2 mv = mvSample.xy;
         const float2 back = float2(mv.x * gMvScaleX / max(gGuideWidth, 1u),
                                    mv.y * gMvScaleY / max(gGuideHeight, 1u));
-        // How far to act on the displacement, and how far to act on the edit, are two questions.
+        // How much the estimate is believed, used to decide how much of the *edit* to apply -- and
+        // deliberately not to shorten the warp itself.
         //
-        // A saturated search does not merely understate the motion, it gets it wrong: measured on a
-        // pan too fast for the range, the reported vector had the wrong sign while the confidence
-        // correctly read 0.13. So the warp is scaled by trust -- an estimate this pass does not
-        // believe moves the sample position hardly at all, rather than moving it somewhere wrong --
-        // while the edit itself keeps three quarters of its strength and leans on the per-pixel test
-        // below, which is local and fails safe on its own.
+        // Scaling the warp by this was tried and was a plain mistake. A partly-applied displacement
+        // is not a cautious displacement, it is the wrong one: the picture is left lagging the camera
+        // by whatever fraction was withheld, and since the displacement grows between answers the lag
+        // grows with it. Measured, with the composition bypassed so the warp is the whole output: the
+        // presented picture sat 16 to 104 pixels behind the current camera and crawled at a fraction
+        // of its speed, which is what "responsive, but it looks like twenty frames a second" is. With
+        // the warp applied whole the same measurement reads (0,0), (-8,0), (-4,0) -- on the camera.
         //
-        // Which is roughly the behaviour this path had before any displacement was measured: a little
-        // ghosting on very fast motion. That is the right thing to degrade to. Switching the
-        // enhancement off is not, because the flicker between enhanced and raw is far more visible
-        // than the error it avoids.
+        // A displacement that cannot be trusted should reduce how much is *added* to the frame, which
+        // is what the term below does. Where to sample is a separate question with one right answer.
         const float trust = gMotionConfident != 0 ? smoothstep(0.10, 0.55, mvSample.z) : 1.0;
 
         // A displacement that is not a number would sample the pair at random and fail every test
         // below it, which reads on screen as the effect dropping out.
-        editUv = any(isnan(back)) || any(isinf(back)) ? cmpUv : cmpUv + back * trust;
+        editUv = any(isnan(back)) || any(isinf(back)) ? cmpUv : cmpUv + back;
 
         // How much the displacement is worth trusting, when whoever measured it said.
         //

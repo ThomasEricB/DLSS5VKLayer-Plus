@@ -78,6 +78,7 @@ GlobalMotionVk::GlobalMotionVk(const DeviceTable* vk, const InstanceTable* insta
             !MakeImg(_result[lvl], 1, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
             return;
     }
+    if (!MakeImg(_state, 1, 1, VK_FORMAT_R32G32B32A32_SFLOAT)) return;
 
     const int span = 2 * std::max(_radius[0], _radius[1]) + 1;
     auto makeBuf = [&](VkBuffer* b, VkDeviceMemory* m, VkDeviceSize size) {
@@ -146,8 +147,9 @@ GlobalMotionVk::GlobalMotionVk(const DeviceTable* vk, const InstanceTable* insta
     _pick = std::make_unique<GmPass>(
         "dlssnr-gm-pick", vk, instance, device, physicalDevice, gm_pick_spv, sizeof(gm_pick_spv),
         std::vector<VkDescriptorType>{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
-        4 * sizeof(uint32_t), false);
+                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+        8 * sizeof(uint32_t), false);
 
     _ok = _reduce->CanRender() && _match->CanRender() && _pick->CanRender();
     if (_ok)
@@ -164,6 +166,7 @@ GlobalMotionVk::~GlobalMotionVk() {
         DropImg(_then[lvl]);
         DropImg(_result[lvl]);
     }
+    DropImg(_state);
     if (_readBuf) _vk->vkDestroyBuffer(_device, _readBuf, nullptr);
     if (_readMem) _vk->vkFreeMemory(_device, _readMem, nullptr);
     if (_costBuf) _vk->vkDestroyBuffer(_device, _costBuf, nullptr);
@@ -227,7 +230,7 @@ void GlobalMotionVk::Barrier(VkCommandBuffer cb, Img& img, VkImageLayout to) {
     img.layout = to;
 }
 
-bool GlobalMotionVk::Record(VkCommandBuffer cb, VkImageView now, VkImageView then) {
+bool GlobalMotionVk::Record(VkCommandBuffer cb, VkImageView now, VkImageView then, bool reset) {
     if (!_ok || now == VK_NULL_HANDLE || then == VK_NULL_HANDLE) return false;
 
     const auto write = [&](VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
@@ -309,17 +312,24 @@ bool GlobalMotionVk::Record(VkCommandBuffer cb, VkImageView now, VkImageView the
         flush();
 
         // --- pick the winner, in pixels of the frame ---
-        struct PC { int radius; float scaleX, scaleY; uint32_t useBase; } pc{ radius, cellX, cellY, useBase };
+        struct PC {
+            int radius; float scaleX, scaleY; uint32_t useBase;
+            uint32_t reset; float alpha; float rejectPx; uint32_t track;
+        } pc{ radius, cellX, cellY, useBase,
+              reset ? 1u : 0u, 0.45f, 20.0f, lvl == 1 ? 1u : 0u };
         {
             VkDescriptorBufferInfo ubo{};
             VkDescriptorSet set = _pick->Begin(&pc, sizeof(pc), &ubo);
             VkDescriptorBufferInfo ci{ _costBuf, 0, VK_WHOLE_SIZE };
             VkDescriptorImageInfo ri{ VK_NULL_HANDLE, _result[lvl].view, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo bi{ VK_NULL_HANDLE, base.view, VK_IMAGE_LAYOUT_GENERAL };
+            Barrier(cb, _state, VK_IMAGE_LAYOUT_GENERAL);
+            VkDescriptorImageInfo sti{ VK_NULL_HANDLE, _state.view, VK_IMAGE_LAYOUT_GENERAL };
             write(set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &ubo);
             write(set, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ci);
             write(set, 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ri, nullptr);
             write(set, 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bi, nullptr);
+            write(set, 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sti, nullptr);
             _vk->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _pick->Pipeline());
             _vk->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _pick->Layout(), 0, 1, &set, 0,
                                          nullptr);
