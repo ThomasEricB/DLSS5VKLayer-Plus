@@ -158,7 +158,13 @@ void main() {
     // either side of the coarse answer, and landing on its edge means only that the coarse answer was
     // slightly off -- which is what the fine level is for. Penalising that was measured taking a
     // sixth of the agreement away for nothing.
-    if (pc.useBase == 0 && (bx == 0 || by == 0 || bx == span - 1 || by == span - 1)) confidence *= 0.15;
+    // A clipped match is short, not meaningless. The window edge means the true displacement is
+    // further out, so the vector understates it -- but it still points the right way, and warping by
+    // a vector that is too short beats not warping at all. This used to multiply by 0.15, which after
+    // the composition's knee came to exactly zero: any movement fast enough to leave the search range
+    // switched the whole effect off and showed the game's raw frame. Reducing trust is the point;
+    // annihilating it was a bug.
+    if (pc.useBase == 0 && (bx == 0 || by == 0 || bx == span - 1 || by == span - 1)) confidence *= 0.55;
 
     // The coarse displacement is quantised to this level's cell, which is exactly what the fine
     // search was centred on, so it is added back in whole rather than re-derived.

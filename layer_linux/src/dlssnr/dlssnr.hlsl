@@ -784,17 +784,44 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         const float2 mv = mvSample.xy;
         const float2 back = float2(mv.x * gMvScaleX / max(gGuideWidth, 1u),
                                    mv.y * gMvScaleY / max(gGuideHeight, 1u));
-        editUv = cmpUv + back;
+        // How far to act on the displacement, and how far to act on the edit, are two questions.
+        //
+        // A saturated search does not merely understate the motion, it gets it wrong: measured on a
+        // pan too fast for the range, the reported vector had the wrong sign while the confidence
+        // correctly read 0.13. So the warp is scaled by trust -- an estimate this pass does not
+        // believe moves the sample position hardly at all, rather than moving it somewhere wrong --
+        // while the edit itself keeps three quarters of its strength and leans on the per-pixel test
+        // below, which is local and fails safe on its own.
+        //
+        // Which is roughly the behaviour this path had before any displacement was measured: a little
+        // ghosting on very fast motion. That is the right thing to degrade to. Switching the
+        // enhancement off is not, because the flicker between enhanced and raw is far more visible
+        // than the error it avoids.
+        const float trust = gMotionConfident != 0 ? smoothstep(0.10, 0.55, mvSample.z) : 1.0;
+
+        // A displacement that is not a number would sample the pair at random and fail every test
+        // below it, which reads on screen as the effect dropping out.
+        editUv = any(isnan(back)) || any(isinf(back)) ? cmpUv : cmpUv + back * trust;
 
         // How much the displacement is worth trusting, when whoever measured it said.
         //
         // The layer's estimate reports how sharp its match was, and a shallow match means the picture
         // had nothing to match on, or changed rather than moved, or moved further than the search
-        // could follow. Measured on a steady pan the figure sits between 0.7 and 1.0, so the knee is
-        // set below that: full trust from 0.5, nothing left by 0.15. It is a floor under the estimate
-        // rather than a tuning control -- on the cases it is meant to catch it goes to almost zero.
+        // could follow.
+        //
+        // It never takes the edit below three quarters, and that floor is the whole lesson of this
+        // gate. It was written to fade to nothing, calibrated against a test scene with texture in
+        // every pixel where the figure never dropped below 0.7. A real game is mostly flat wall and
+        // flat floor, where a global match is legitimately shallow, and a fast turn leaves the search
+        // range entirely -- so on the two commonest things a player does, the multiplier reached zero
+        // and the pass handed back the game's own frame. An enhancement that switches itself off
+        // whenever the player moves is worse than one that is slightly wrong, because the flicker
+        // between enhanced and raw is far more visible than the error it was avoiding.
+        //
+        // So a doubtful estimate now leans on the per-pixel test below -- which is local, and fails
+        // safe on its own -- rather than overriding it.
         if (gMotionConfident != 0)
-            editValid *= smoothstep(0.15, 0.5, mvSample.z);
+            editValid *= lerp(0.75, 1.0, trust);
 
         // Off the edge of the frame the model saw means this content was not in it, so there is no
         // edit for it and the honest answer is the frame's own pixels.
