@@ -432,14 +432,22 @@ inline std::string ShmLoadString(const std::atomic<uint32_t>& seq, const char* s
     return std::string();
 }
 
-inline void ShmInitDefaults(ShmHeader* h) {
-    std::memset(static_cast<void*>(h), 0, sizeof(ShmHeader));
-    h->magic.store(kShmMagic);
-    h->version.store(kShmVersion);
-    h->helperState.store(kHelperStopped);
-    h->format.store(1);
-    h->passes.store(1);
+// Every user-facing setting, and nothing else.
+//
+// Split out of ShmInitDefaults so the two cannot drift. Initialising a fresh mapping and resetting a
+// live one now write the same values from the same place; written twice, one of them would quietly
+// forget a field the other remembered, and the forgotten one is always the setting someone is
+// looking at when they wonder why reset did not reset it.
+//
+// Nothing here touches identity, the transport or the status channel -- resetting a live mapping
+// must not disturb the sequence numbers a running helper is answering, nor claim the model is up.
+// captureRequest is likewise absent: it is a one-shot ask, not a setting.
+inline void ShmDefaultSettings(ShmHeader* h) {
     h->enabled.store(1);
+    h->passes.store(1);
+    h->unlockPasses.store(0);
+    h->preset.store(0);
+    h->style.store(0);
     h->autoMask.store(1);
     h->intensityBits.store(FloatToBits(1.0f));
     h->localToneBits.store(FloatToBits(1.0f));
@@ -451,15 +459,19 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->colourStrengthBits.store(FloatToBits(1.0f));
     h->maxRatioBits.store(FloatToBits(2.0f));
     h->transfer.store(1);
+    h->debugView.store(0);
     h->debugScaleBits.store(FloatToBits(1.0f));
     h->whitePointBits.store(FloatToBits(1.0f));
     h->whitePointScaleBits.store(FloatToBits(1.0f));
-    h->whitePointTrimBits.store(FloatToBits(1.0f));
     h->whitePointSource.store(kWhitePointManual);
+    h->whitePointTrimBits.store(FloatToBits(1.0f));
     h->workingScaleBits.store(FloatToBits(1.0f));
+    h->compareMode.store(0);
     h->compareSplitBits.store(FloatToBits(0.5f));
     h->compareZoomBits.store(FloatToBits(1.0f));
+    h->compareSwap.store(0);
     h->colourMode.store(kColourAuto);
+    h->toggleKey.store(0);
     h->reversibleMode.store(kReversibleKnee);
     h->applyModel.store(1);
     h->holdFrame.store(0);
@@ -469,7 +481,6 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->mvecEnabled.store(1);
     h->mvecScaleMode.store(kMVecPixels);
     h->mvecQuality.store(kMVecBalanced);
-    h->seq_ok.store(0);
     h->compositionBypass.store(1);
     h->rebuildSettleMs.store(250);
 
@@ -486,6 +497,26 @@ inline void ShmInitDefaults(ShmHeader* h) {
         h->pass[i].preset.store(0);
         h->pass[i].autoMask.store(1);
     }
+}
+
+// Put a live mapping's settings back to those defaults, leaving the transport alone, and tell the
+// other two processes to look again: controlSeq for what the layer reads every frame, tuningSeq for
+// what the helper latches when it builds a feature.
+inline void ShmResetSettings(ShmHeader* h) {
+    if (!h) return;
+    ShmDefaultSettings(h);
+    h->controlSeq.fetch_add(1);
+    h->tuningSeq.fetch_add(1);
+}
+
+inline void ShmInitDefaults(ShmHeader* h) {
+    std::memset(static_cast<void*>(h), 0, sizeof(ShmHeader));
+    h->magic.store(kShmMagic);
+    h->version.store(kShmVersion);
+    h->helperState.store(kHelperStopped);
+    h->format.store(1);
+    h->seq_ok.store(0);
+    ShmDefaultSettings(h);
 }
 
 inline uint32_t ShmPassCeiling(const ShmHeader* h) {

@@ -203,17 +203,22 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     gearBtn->setToolTip("Settings");
     gearBtn->setPopupMode(QToolButton::InstantPopup);
     auto* gearMenu = new QMenu(gearBtn);
-    gearMenu->addAction("Reset all settings...", this, &MainWindow::resetAllSettings);
-    gearMenu->addSeparator();
     gearMenu->addAction("Open helper log", this, [this] {
         QDesktopServices::openUrl(QUrl::fromLocalFile(logPath));
     });
     gearBtn->setMenu(gearMenu);
+    resetBtn = new QPushButton("Reset to defaults", this);
+    resetBtn->setToolTip("Put every setting back where it started -- the model's own controls, the "
+                         "composition, motion, colour and every per-pass override. Asks first.\n\n"
+                         "Only the settings: a running helper keeps running and the game keeps being "
+                         "composed, they simply start doing it with the defaults.");
     auto* bottom = new QHBoxLayout;
+    bottom->addWidget(resetBtn);
     bottom->addStretch(1);
     bottom->addWidget(gearBtn);
     root->addLayout(bottom);
 
+    connect(resetBtn, &QPushButton::clicked, this, &MainWindow::resetAllSettings);
     connect(startBtn, &QPushButton::clicked, this, &MainWindow::startHelper);
     connect(stopBtn, &QPushButton::clicked, this, &MainWindow::stopHelper);
     connect(runnerCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::applyRunnerSelection);
@@ -436,9 +441,10 @@ void MainWindow::resetAllSettings() {
                               "features from the defaults.") != QMessageBox::Yes)
         return;
     if (!hdr) return;
-    ShmInitDefaults(hdr);
-    hdr->controlSeq.fetch_add(1);
-    hdr->tuningSeq.fetch_add(1);
+    // Settings only. ShmInitDefaults memsets the whole header, which on a live mapping also resets
+    // the sequence numbers a running helper is answering and declares the helper stopped -- so
+    // resetting settings mid-session used to take the session down with them.
+    ShmResetSettings(hdr);
     if (keyCombo) keyCombo->setCurrentIndex(0);
     if (binder) binder->Reload();
     updateCompositionVisibility();

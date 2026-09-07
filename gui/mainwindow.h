@@ -76,6 +76,7 @@ private:
     QPushButton* passBtn = nullptr;
     QPushButton* captureBtn = nullptr;
     QPushButton* browseRunnerBtn = nullptr;
+    QPushButton* resetBtn = nullptr;
     QToolButton* gearBtn = nullptr;
     QComboBox* runnerCombo = nullptr;
     QComboBox* keyCombo = nullptr;

@@ -80,7 +80,10 @@ void Usage() {
                  "  status          print the header, one 'key=value' per line\n"
                  "  quit            ask the helper and the layer to stand down\n"
                  "  resume          clear the quit flag and nudge the readers\n"
-                 "  reset           re-initialise the whole header to defaults\n"
+                 "  reset           put every setting back to its default, leaving a running\n"
+                 "                  helper and its sequence numbers alone\n"
+                 "  reinit          re-initialise the whole header, transport included. For a\n"
+                 "                  stale or corrupt mapping; takes a live session down with it\n"
                  "  capture <n>     write n matched before/after frames\n"
                  "  toggle <key>    flip a setting between 0 and 1\n"
                  "  set <key> <v>   change one setting\n"
@@ -187,6 +190,7 @@ int main(int argc, char** argv) {
     const char* cmd = argv[2];
 
     const bool create = std::strcmp(cmd, "resume") == 0 || std::strcmp(cmd, "reset") == 0 ||
+                        std::strcmp(cmd, "reinit") == 0 ||
                         std::strcmp(cmd, "set") == 0 || std::strcmp(cmd, "capture") == 0 ||
                         std::strcmp(cmd, "toggle") == 0;
 
@@ -211,6 +215,11 @@ int main(int argc, char** argv) {
         h->quit.store(0);
         h->controlSeq.fetch_add(1);
     } else if (std::strcmp(cmd, "reset") == 0) {
+        // Settings only. This used to re-initialise the whole header, which on a live mapping also
+        // reset the sequence numbers a running helper was answering and declared the helper stopped.
+        if (!Initialised(h)) ShmInitDefaults(h);
+        else ShmResetSettings(h);
+    } else if (std::strcmp(cmd, "reinit") == 0) {
         ShmInitDefaults(h);
     } else if (std::strcmp(cmd, "settings") == 0) {
         if (!Initialised(h)) ShmInitDefaults(h);
