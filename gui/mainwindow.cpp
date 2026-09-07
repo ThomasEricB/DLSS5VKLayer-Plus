@@ -615,6 +615,17 @@ void MainWindow::updateCompositionVisibility() {
     if (!compositionForm) return;
     const bool bypass = hdr && hdr->compositionBypass.load() != 0;
     for (QWidget* w : compositionRows) compositionForm->setRowVisible(w, !bypass);
+
+    // Running alongside and bypassing the composition do not combine, and the interface has to say
+    // so. It did not: the box stayed ticked and looked live while the layer quietly ignored it, so
+    // the pass ran in front of every frame -- measured at 42 fps against 547 -- with nothing on
+    // screen to explain why. A control that lies about whether it is doing anything is worse than one
+    // that is switched off.
+    if (pipelineCheck) {
+        pipelineCheck->setEnabled(!bypass);
+        pipelineCheck->setText(bypass ? "Run the model alongside the frame (needs the composition)"
+                                      : "Run the model alongside the frame");
+    }
 }
 
 // The settings, on tabs.
@@ -682,7 +693,7 @@ QWidget* MainWindow::buildSettings() {
     }
     {
         auto* f = group(col, "Cost");
-        binder->AddBool(f, "Run the model alongside the frame", &ShmHeader::pipeline,
+        pipelineCheck = binder->AddBool(f, "Run the model alongside the frame", &ShmHeader::pipeline,
                         "The single biggest lever on frame rate. Off, the game waits for the model "
                         "on every frame, so the model's time adds to the game's instead of "
                         "overlapping it -- which is why the pass can cost more than the game does. "

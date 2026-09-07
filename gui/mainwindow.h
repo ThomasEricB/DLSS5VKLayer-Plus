@@ -84,6 +84,7 @@ private:
     QLabel* statusLabel = nullptr;
     QSpinBox* captureFrames = nullptr;
     QCheckBox* bypassCheck = nullptr;
+    QCheckBox* pipelineCheck = nullptr;
     QFormLayout* compositionForm = nullptr;
     QVector<QWidget*> compositionRows;
     bool helperRunning = false;
