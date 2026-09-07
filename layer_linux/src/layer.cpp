@@ -535,7 +535,7 @@ struct InstanceChain {
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkGetDeviceQueue2) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) \
     X(vkGetSwapchainImagesKHR) X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkCreateCommandPool) \
     X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
-    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
+    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkGetFenceStatus) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) \
     X(vkFreeMemory) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) \
     X(vkMapMemory) X(vkUnmapMemory) X(vkCreateBuffer) X(vkDestroyBuffer) \
@@ -546,11 +546,32 @@ struct SwapchainState {
     std::vector<VkImage> images;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
-    VkFence fence = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
-    VkCommandBuffer cb = VK_NULL_HANDLE;
     bool ready = false;
     bool passThrough = false;
+
+    // A ring, so the present hook never has to wait for the work it just submitted.
+    //
+    // Waiting was almost the entire cost of the hook -- at 200% the hook measured 1.76 ms of which
+    // 1.67 ms was the fence -- and the cost is the smaller half of the harm. Blocking inside
+    // vkQueuePresentKHR stops the game's render thread until this pass's GPU work is done, so the
+    // game cannot queue the next frame while this one finishes and its own work cannot start until
+    // ours ends. The frame rate barely moves and every frame arrives late, which is the shape of
+    // "reports a hundred and feels like twenty".
+    //
+    // Three slots: one being recorded, one in flight, one spare. The only wait left is on a slot
+    // three frames old, which has long since finished.
+    static constexpr uint32_t kSlots = 3;
+    VkCommandBuffer cb[kSlots] = {};
+    VkFence fence[kSlots] = {};
+    bool submitted[kSlots] = {};
+    uint32_t slot = 0;
+
+    // The send recorded into a slot, published once that slot's GPU work has actually landed. The
+    // helper reads those pages the moment it sees the sequence number, so the publish cannot happen
+    // before the copy into them has completed -- but it need not happen on the same frame.
+    uint32_t pendingSlot = kSlots;
+    uint32_t pendingW = 0, pendingH = 0;
 
     // The pass. Owns every surface it needs, including the two host-visible buffers the round trip
     // reads and writes, which is why there are no staging buffers left here.
@@ -965,7 +986,8 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
         for (auto& kv : dc->swapchains) {
             SwapchainState& sc = kv.second;
             sc.comp.reset();
-            if (sc.fence) dc->vkDestroyFence(device, sc.fence, nullptr);
+            for (VkFence f : sc.fence)
+                if (f) dc->vkDestroyFence(device, f, nullptr);
             if (sc.pool) dc->vkDestroyCommandPool(device, sc.pool, nullptr);
         }
         dc->swapchains.clear();
@@ -1074,7 +1096,8 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(VkDevice device,
         lk.lock();
         SwapchainState& sc = it->second;
         sc.comp.reset();
-        if (sc.fence) dc->vkDestroyFence(device, sc.fence, nullptr);
+        for (VkFence f : sc.fence)
+            if (f) dc->vkDestroyFence(device, f, nullptr);
         if (sc.pool) dc->vkDestroyCommandPool(device, sc.pool, nullptr);
         dc->swapchains.erase(it);
     }
@@ -1111,14 +1134,17 @@ static bool CreateResources(DeviceChain* dc, SwapchainState& sc, uint32_t family
     cpci.queueFamilyIndex = family;
     if (dc->vkCreateCommandPool(d, &cpci, nullptr, &sc.pool) != VK_SUCCESS) return false;
     VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    cbai.commandPool = sc.pool; cbai.commandBufferCount = 1;
-    if (dc->vkAllocateCommandBuffers(d, &cbai, &sc.cb) != VK_SUCCESS) return false;
-    if (!SetLoaderData(dc, sc.cb)) {
-        Log("[layer] vkSetDeviceLoaderData failed for the present command buffer");
-        return false;
-    }
+    cbai.commandPool = sc.pool;
+    cbai.commandBufferCount = SwapchainState::kSlots;
+    if (dc->vkAllocateCommandBuffers(d, &cbai, sc.cb) != VK_SUCCESS) return false;
     VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    if (dc->vkCreateFence(d, &fci, nullptr, &sc.fence) != VK_SUCCESS) return false;
+    for (uint32_t i = 0; i < SwapchainState::kSlots; ++i) {
+        if (!SetLoaderData(dc, sc.cb[i])) {
+            Log("[layer] vkSetDeviceLoaderData failed for the present command buffer");
+            return false;
+        }
+        if (dc->vkCreateFence(d, &fci, nullptr, &sc.fence[i]) != VK_SUCCESS) return false;
+    }
 
     if (!dc->instance) return false;
     sc.comp = std::make_unique<dlssnr::Composition>(&dc->table, &dc->instance->table, d, dc->physical);
@@ -1167,7 +1193,20 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
                            const VkSemaphore* waitSemaphores, bool* consumedWaits) {
     if (!sc.comp) return false;
     VkDevice d = dc->self;
-    VkCommandBuffer cb = sc.cb;
+    // Take the next slot and make sure its previous submission has landed. Three frames back, so in
+    // practice this returns at once; it is a correctness guard, not a stall.
+    const uint32_t slot = sc.slot;
+    sc.slot = (sc.slot + 1) % SwapchainState::kSlots;
+    if (sc.submitted[slot]) {
+        const double tW = NowMs();
+        if (!NoteVk(dc, dc->vkWaitForFences(dc->self, 1, &sc.fence[slot], VK_TRUE, UINT64_MAX),
+                    "vkWaitForFences"))
+            return false;
+        dc->fenceWaitMs += NowMs() - tW;
+        dc->vkResetFences(dc->self, 1, &sc.fence[slot]);
+        sc.submitted[slot] = false;
+    }
+    VkCommandBuffer cb = sc.cb[slot];
     const bool time = TimeEnabled();
     const double t0 = time ? NowMs() : 0.0;
 
@@ -1205,15 +1244,22 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         si.pWaitDstStageMask = nullptr;
     };
 
-    const auto runLeg = [&]() {
+    const auto runLeg = [&](bool waitForIt = true) {
         if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
         if (si.waitSemaphoreCount && consumedWaits) *consumedWaits = true;
-        if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence), "vkQueueSubmit")) return false;
+        if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fence[slot]), "vkQueueSubmit")) return false;
+        sc.submitted[slot] = true;
+        if (!waitForIt) return true;
+
+        // The blocking round trip still has to wait: it hands the proxy over on this frame and needs
+        // the answer before it can compose, so there is nothing to overlap with.
         const double tFence = NowMs();
-        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
+        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fence[slot], VK_TRUE, UINT64_MAX),
+                    "vkWaitForFences"))
             return false;
         dc->fenceWaitMs += NowMs() - tFence;
-        dc->vkResetFences(d, 1, &sc.fence);
+        dc->vkResetFences(d, 1, &sc.fence[slot]);
+        sc.submitted[slot] = false;
         return true;
     };
 
@@ -1238,7 +1284,12 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         // the one kept aside when it was sent.
         const size_t modelBytes = size_t(sc.comp->ModelWidth()) * sc.comp->ModelHeight() * 4;
         const bool haveAnswer = ShmCollect(dc->shm, modelBytes, sc.comp->ModelPixels());
-        const bool mayPublish = ShmInputFree(dc->shm) && !dc->shm.dead;
+        // Free to send only when the helper has finished with the last request *and* the last send
+        // has actually been handed over. The publish is deferred by a frame now, and recording a
+        // second send before the first is published would overwrite the region it is about to be
+        // told to read -- and, on the copying fallback, the staging the publish still reads from.
+        const bool mayPublish = ShmInputFree(dc->shm) && !dc->shm.dead &&
+                                sc.pendingSlot >= SwapchainState::kSlots;
         if (haveAnswer) sc.comp->MarkModelFrame();
         const bool willCompose = sc.comp->HasModelFrame() && sc.comp->HasSentProxy();
         if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
@@ -1260,15 +1311,43 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             dc->vkEndCommandBuffer(cb);
             return false;
         }
-        if (!runLeg()) return false;
+        // Submitted and left to run. Nothing here waits for it: the game returns from present with
+        // this pass's work still on the GPU, which is the whole point -- it can get on with the next
+        // frame while the model works on this one.
+        if (!runLeg(false)) return false;
         dropWaits();
         sc.comp->ConsumeMeter();
-        sc.comp->WriteCapturedFrame();
 
-        // Published only after the fence: the helper reads these pages the moment it sees the
-        // sequence number, and the GPU has to have finished writing them first.
-        if (mayPublish)
-            ShmPublish(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ProxyPixels());
+        // The one thing that does have to wait, and only when it was asked for: a capture reads back
+        // what the copy produced, so it needs the copy to have happened. Debug path, taken on the
+        // handful of frames someone asked to see, never on the ones they are playing.
+        if (sc.comp->CaptureRecorded()) {
+            if (NoteVk(dc, dc->vkWaitForFences(dc->self, 1, &sc.fence[slot], VK_TRUE, UINT64_MAX),
+                       "vkWaitForFences")) {
+                dc->vkResetFences(dc->self, 1, &sc.fence[slot]);
+                sc.submitted[slot] = false;
+            }
+            sc.comp->WriteCapturedFrame();
+        }
+
+        // A send recorded on an earlier frame, published now that its slot has landed. The helper
+        // reads those pages the moment it sees the sequence number, so the copy into them has to have
+        // completed -- but waiting for that here is what stalled the game, and by the next present it
+        // is done anyway. Checked, never waited on: a slot that is not ready yet is published on a
+        // later frame instead.
+        if (sc.pendingSlot < SwapchainState::kSlots) {
+            const uint32_t p = sc.pendingSlot;
+            if (!sc.submitted[p] ||
+                dc->vkGetFenceStatus(dc->self, sc.fence[p]) == VK_SUCCESS) {
+                ShmPublish(dc->shm, sc.pendingW, sc.pendingH, sc.comp->ProxyPixels());
+                sc.pendingSlot = SwapchainState::kSlots;
+            }
+        }
+        if (mayPublish) {
+            sc.pendingSlot = slot;
+            sc.pendingW = sc.comp->ModelWidth();
+            sc.pendingH = sc.comp->ModelHeight();
+        }
 
         if (dc->shm.hdr) {
             ShmStore64(dc->shm.hdr->layerFramesLo, dc->shm.hdr->layerFramesHi, ++dc->framesComposed);

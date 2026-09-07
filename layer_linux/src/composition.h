@@ -120,6 +120,10 @@ class Composition {
     bool RecordKeepSent(VkCommandBuffer cb);
     bool HasSentProxy() const { return _sentValid; }
 
+    // Whether this frame recorded a capture readback. The pipelined path does not wait for its own
+    // submit, so it has to wait for this one before reading what the copy produced.
+    bool CaptureRecorded() const { return _captureRecorded; }
+
     // The two ends of the round trip, when they have to be copied.
     //
     // Both return null once the shared regions have been imported as device memory: the capture leg

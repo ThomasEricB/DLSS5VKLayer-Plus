@@ -44,7 +44,8 @@ namespace dlssnr {
     X(vkEndCommandBuffer)                                                                          \
     X(vkCreateFence)                                                                               \
     X(vkDestroyFence)                                                                              \
-    X(vkWaitForFences)                                                                             \
+    X(vkWaitForFences)                                                                            \
+    X(vkGetFenceStatus)                                                                             \
     X(vkResetFences)                                                                               \
     X(vkCreateSemaphore)                                                                           \
     X(vkDestroySemaphore)                                                                          \
