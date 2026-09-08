@@ -69,6 +69,14 @@ const Setting kSettings[] = {
       "frames between pipelined answers, 0 = as soon as each arrives, 2-64 pins the cadence" },
     { "editblur", &ShmHeader::editBlurMilli, false,
       "radius splitting a stale edit's safe half from the half that ghosts, in thousandths of width" },
+    { "mfg", &ShmHeader::mfgEnabled, false,
+      "generate extra frames between the game's own, 0 or 1" },
+    { "mfgfactor", &ShmHeader::mfgFactor, false,
+      "generated frames per real frame, 1-3" },
+    { "mfgmode", &ShmHeader::mfgMode, false,
+      "0 only under a paced present mode (fifo), 1 under any" },
+    { "mfgwait", &ShmHeader::mfgAcquireWaitUs, false,
+      "microseconds the present may wait for a free image, 0 = never wait (see the header note)" },
     { "mvec", &ShmHeader::mvecEnabled, false, "estimate motion vectors from the frames, 0 or 1" },
     { "mvecquality", &ShmHeader::mvecQuality, false, "0 fast, 1 balanced, 2 quality" },
     { "mvecunits", &ShmHeader::mvecScaleMode, false, "0 normalised, 1 pixels, 2 uv 0..1" },
@@ -189,6 +197,19 @@ void PrintStatus(const ShmHeader* h) {
     std::printf("helper_state=%u\nmodel_up=%u\nhelper_frames=%llu\n", h->helperState.load(),
                 h->modelUp.load(),
                 (unsigned long long) ShmLoad64(h->helperFramesLo, h->helperFramesHi));
+    {
+        const unsigned long long gen =
+            ((unsigned long long)h->mfgGeneratedHi.load() << 32) | h->mfgGeneratedLo.load();
+        const unsigned long long missed =
+            ((unsigned long long)h->mfgMissedHi.load() << 32) | h->mfgMissedLo.load();
+        static const char* kMfgState[] = { "off", "on, not generating", "generating",
+                                           "unavailable on this swapchain",
+                                           "waiting: needs pipeline=1" };
+        const unsigned st = h->mfgState.load();
+        std::printf("mfg_state=%s\nmfg_generated=%llu\nmfg_missed=%llu\nmfg_motion=%.2f,%.2f\n",
+                    kMfgState[st < 5 ? st : 0], gen, missed,
+                    BitsToFloat(h->mfgMotionXBits.load()), BitsToFloat(h->mfgMotionYBits.load()));
+    }
     std::printf("layer_composition_up=%u\nlayer_frames=%llu\nlayer_ms=%.2f\n",
                 h->layerCompositionUp.load(),
                 (unsigned long long) ShmLoad64(h->layerFramesLo, h->layerFramesHi),

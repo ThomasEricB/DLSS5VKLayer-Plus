@@ -38,7 +38,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // decision are carried here. From this branch: the pipelined path's settle, ghost bound, edit split
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 19;
+static constexpr uint32_t kShmVersion = 20;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 // Eight bytes a pixel: the float16 proxy needs them, and the 8-bit path simply uses the first half of
@@ -631,6 +631,52 @@ struct ShmHeader {
     std::atomic<uint32_t> swapchainFormat;      // VkFormat of the game's swapchain, 0 if unknown
     std::atomic<uint32_t> swapchainImageCount;  // how many images it holds
     std::atomic<uint64_t> presentIndex;         // presents the layer has made, monotonic
+
+    // Frame generation, which happens in the layer rather than in the helper.
+    //
+    // It was tried in the helper first, through nvngx_dlssg.dll, and that cannot work here. DLSS-G is
+    // not a thing a layer may call: CreateFeature(11) answers InvalidParameter because the feature is
+    // created from a contract only the *game* can fill -- camera matrices, depth, motion vectors and
+    // a HUD-less colour buffer, none of which exist below a swapchain. The reference project appears
+    // to call DLSS-G and does not: it implements the NGX entry points and receives that contract from
+    // a game that already speaks them, then answers with FSR. It sits upstream of the constraint.
+    //
+    // What a layer does have is the frame it just composed, the frame before it, and a measurement of
+    // how far the picture moved between the two. That is enough to extrapolate: the generated frame is
+    // the presented one carried forward along the measured motion by a fraction of a frame, presented
+    // as an *extra* present on the same swapchain. No real frame is replaced and none is held back, so
+    // it costs no latency -- the opposite of interpolation, which must delay a real frame to have two
+    // to sit between.
+    std::atomic<uint32_t> mfgEnabled;   // 0 off, 1 on
+    std::atomic<uint32_t> mfgFactor;    // generated frames per real frame, 1..3
+    // 0: only where the present mode paces them for us. FIFO displays queued presents one vblank
+    // apart, so a game at half the refresh rate gets even spacing for free and the generated frame
+    // lands exactly in the gap. 1: generate under any present mode, where spacing is the driver's
+    // whim and a generated frame may be shown too early or dropped outright.
+    std::atomic<uint32_t> mfgMode;
+    // What the layer is actually doing: 0 off, 1 on but not yet generating (no motion estimate, or
+    // the present mode is not paced), 2 generating, 3 unavailable on this swapchain.
+    std::atomic<uint32_t> mfgState;
+    std::atomic<uint32_t> mfgGeneratedLo;
+    std::atomic<uint32_t> mfgGeneratedHi;
+    // Gaps that went unfilled because no swapchain image was free. Not an error -- the acquire is
+    // made with a zero timeout precisely so that a busy swapchain costs a generated frame instead of
+    // stalling the game -- but a large number next to a small generated count says the swapchain has
+    // no room to spare and the feature is doing nothing for this game.
+    std::atomic<uint32_t> mfgMissedLo;
+    std::atomic<uint32_t> mfgMissedHi;
+    // The displacement the last generated frame was carried forward by, in pixels, for the display.
+    std::atomic<uint32_t> mfgMotionXBits;
+    std::atomic<uint32_t> mfgMotionYBits;
+    // How long the present hook may wait for a free swapchain image, in microseconds.
+    //
+    // A generated frame needs an image the game did not ask for, and one only becomes free when the
+    // presentation engine finishes with it at a vertical blank. Measured on a 144 Hz display: at 0 the
+    // acquire succeeds about once in three hundred, at 4000 about one time in twenty-five, at 12000
+    // every time. The wait is paid on the game's thread, so it is free only where the game had slack
+    // -- a game already at the refresh rate loses a real frame for every generated one. 0 by default:
+    // no wait and no risk, generating only when an image happens to be free at the moment of asking.
+    std::atomic<uint32_t> mfgAcquireWaitUs;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -646,7 +692,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2056, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2104, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -763,6 +809,20 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->swapchainFormat.store(0);
     h->swapchainImageCount.store(0);
     h->presentIndex.store(0);
+
+    // Off until asked for. A generated frame is an extra present the game did not make, and that is
+    // not something to start doing to somebody's swapchain by default.
+    h->mfgEnabled.store(0);
+    h->mfgFactor.store(1);
+    h->mfgMode.store(0);
+    h->mfgState.store(0);
+    h->mfgGeneratedLo.store(0);
+    h->mfgGeneratedHi.store(0);
+    h->mfgMissedLo.store(0);
+    h->mfgMissedHi.store(0);
+    h->mfgMotionXBits.store(FloatToBits(0.0f));
+    h->mfgMotionYBits.store(FloatToBits(0.0f));
+    h->mfgAcquireWaitUs.store(0);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);

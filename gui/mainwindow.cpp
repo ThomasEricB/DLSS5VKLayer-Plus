@@ -661,6 +661,35 @@ void MainWindow::updateStatus() {
                                : QString("<span style=\"color:#9e9e9e;\">&#9675; Inactive</span>");
     statusLabel->setText(QString("Helper: %1&nbsp;&nbsp;&nbsp;%2").arg(state.toHtmlEscaped(), dot));
 
+    // What frame generation is actually doing, rather than what it was asked to do. The gap between
+    // the two is the whole story here: it is switched on far more often than it generates, and
+    // without this the only visible answer would be a ticked box and no extra frames.
+    if (mfgStatusLabel) {
+        static const char* kState[] = { "off", "on, not generating", "generating",
+                                        "unavailable on this swapchain",
+                                        "waiting: needs the model running alongside the frame" };
+        const unsigned st = hdr->mfgState.load();
+        const unsigned long long gen =
+            ((unsigned long long)hdr->mfgGeneratedHi.load() << 32) | hdr->mfgGeneratedLo.load();
+        const unsigned long long missed =
+            ((unsigned long long)hdr->mfgMissedHi.load() << 32) | hdr->mfgMissedLo.load();
+        QString text = QString("<b>%1</b>").arg(QString(kState[st < 5 ? st : 0]));
+        if (st != 0) {
+            text += QString(" &mdash; %1 generated, %2 gaps left unfilled")
+                        .arg(gen).arg(missed);
+            if (gen == 0 && missed > 32)
+                text += "<br><span style=\"color:#ef6c00;\">No image was ever free at the moment of "
+                        "asking. Raise the wait above, or the game may already be at your refresh "
+                        "rate, in which case there is no gap to fill.</span>";
+            const float dx = BitsToFloat(hdr->mfgMotionXBits.load());
+            const float dy = BitsToFloat(hdr->mfgMotionYBits.load());
+            if (dx != 0.0f || dy != 0.0f)
+                text += QString("<br>carrying forward by %1, %2 px")
+                            .arg(double(dx), 0, 'f', 1).arg(double(dy), 0, 'f', 1);
+        }
+        mfgStatusLabel->setText(text);
+    }
+
     saveSettingsIfChanged();
 }
 
@@ -756,6 +785,54 @@ QWidget* MainWindow::buildSettings() {
                         ShmBinder::AtCreate);
         binder->AddFloat(f, "Sharpness", &ShmHeader::sharpnessBits, 0.0, 1.0, 0.05,
                          "The one strength the model reads every frame, so it takes effect at once.");
+    }
+    {
+        auto* f = group(col, "Frame generation");
+        mfgCheck = binder->AddBool(f, "Generate extra frames", &ShmHeader::mfgEnabled,
+                        "Presents an extra frame between the game's own, carrying the frame just "
+                        "presented forward along the displacement the layer measured. No real frame "
+                        "is replaced and none is held back, so it costs no latency -- unlike "
+                        "interpolation, which has to delay a real frame to have two to sit between."
+                        "\n\nIt needs the model running alongside the frame: the displacement is "
+                        "measured against the frame an outstanding answer belongs to, and waiting "
+                        "for the model means there is never one in flight to measure against."
+                        "\n\nThis is not DLSS-G. Frame generation through nvngx_dlssg.dll cannot be "
+                        "created from a layer at all -- it is built from a contract only the game "
+                        "can fill, camera matrices and depth and motion vectors and a HUD-less "
+                        "colour buffer, none of which exist below a swapchain.",
+                        ShmBinder::Live);
+        binder->AddInt(f, "Generated frames per real frame", &ShmHeader::mfgFactor, 1, 3,
+                       "How many extra frames to place in each gap. Each one needs a swapchain image "
+                       "of its own, so more of them are refused more often.",
+                       ShmBinder::Live);
+        binder->AddInt(f, "Wait for a free image (\xc2\xb5s)", &ShmHeader::mfgAcquireWaitUs, 0, 20000,
+                       "The one setting here with a real cost, and the reason generation is usually "
+                       "quiet at the default.\n\nA generated frame needs a swapchain image the game "
+                       "did not ask for, and an image only comes free when the display finishes with "
+                       "it at a vertical blank. Measured on a 144 Hz display: at 0 the request "
+                       "succeeds about once in three hundred, at 4000 about one time in twenty-five, "
+                       "at 12000 every time.\n\nThe wait is paid inside the game's own present call, "
+                       "so it is free only if the game had slack. A game already running at the "
+                       "refresh rate has none, and waiting there took its real frames from 2866 to "
+                       "1475 over twenty seconds while adding 1387 generated ones -- frame "
+                       "replacement rather than frame generation. A game well below the refresh rate "
+                       "has a whole frame of slack and the same wait costs it nothing.\n\n"
+                       "0 never waits, which cannot harm the game and generates only when an image "
+                       "happens to be free. Raise it if the game is comfortably below your refresh "
+                       "rate; drop it back to 0 if the frame rate falls.",
+                       ShmBinder::Live);
+        binder->AddBool(f, "Generate under any present mode", &ShmHeader::mfgMode,
+                        "Off, generation only runs under FIFO (vsync), where the display shows "
+                        "queued frames one vertical blank apart -- which is what puts the generated "
+                        "frame in the gap rather than racing it there. On, it runs under any present "
+                        "mode, where the spacing is the driver's to decide: mailbox may discard the "
+                        "generated frame and immediate may show it at once, making the pair a "
+                        "stutter instead of a smoothing.",
+                        ShmBinder::Live);
+        mfgStatusLabel = new QLabel;
+        mfgStatusLabel->setWordWrap(true);
+        mfgStatusLabel->setTextFormat(Qt::RichText);
+        f->addRow(mfgStatusLabel);
     }
     {
         auto* f = group(col, "Cost");

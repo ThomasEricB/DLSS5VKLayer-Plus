@@ -2929,6 +2929,20 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
                                             ns.vk.cmdCreate, t);
                 SubmitAndWait(ns.vk, ns.vk.cmdCreate);
                 Log("[mfg] frame generation %s at %ux%u", ns.fgReady ? "ready" : "unavailable", w, h);
+                if (!ns.fgReady) {
+                    // Once, not once a frame.
+                    //
+                    // This retried on every answer, and each attempt allocated a parameter block that
+                    // was never freed -- the addresses walked steadily up the log. It cannot succeed
+                    // on a later try either: CreateFeature(11) answers InvalidParameter because the
+                    // feature is built from a contract only the game can fill, and nothing about the
+                    // hundredth attempt differs from the first.
+                    ns.fg.disabled = true;
+                    Log("[mfg] not asking again: DLSS-G is created from camera matrices, depth, "
+                        "motion vectors and a HUD-less colour buffer that a swapchain-level layer "
+                        "does not have. Frame generation runs in the layer instead; see mfg in the "
+                        "settings.");
+                }
             }
         }
         if (ns.fgReady && ns.fg.features[0] && BeginCmd(ns.vk.cmdEval)) {
