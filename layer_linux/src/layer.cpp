@@ -1312,11 +1312,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImage(VkDevice device, const Vk
     // game made then failed and it died on launch. A probe that reports must never be able to refuse:
     // if there is nothing to call through to, the honest thing is to say so once and stop watching,
     // not to break image creation.
+    // A chain-wide fallback, remembered the first time any device resolves one.
+    //
+    // The pointer below us is a property of the layer chain, not of one device: whatever sits next
+    // dispatches on the device handle it is given, so a pointer learned from one device is the right
+    // one to call for another. That matters because the alternative, when this device is not in the
+    // map, is to fail the call -- and failing vkCreateImage kills the process. A probe must never be
+    // able to refuse. If the map misses, the fallback still creates the image and we simply do not
+    // record that one.
+    static std::atomic<PFN_vkCreateImage> g_anyCreateImage{nullptr};
+
     PFN_vkCreateImage next = dc ? dc->vkCreateImage : nullptr;
     if (!next && dc && dc->next_dpa) next = (PFN_vkCreateImage)dc->next_dpa(device, "vkCreateImage");
-    if (!next) {
+    if (next) {
+        g_anyCreateImage.store(next, std::memory_order_relaxed);
+    } else {
+        next = g_anyCreateImage.load(std::memory_order_relaxed);
         static std::once_flag said;
-        std::call_once(said, [] { Log("[scan] no vkCreateImage to call through to; not watching"); });
+        std::call_once(said, [] { Log("[scan] device not in the map; calling through the chain pointer"); });
+    }
+    if (!next) {
+        // Unreachable in practice: the loader only hands this pointer out for a device we made, so
+        // the fallback is always already set. Kept because the one thing this must never do is
+        // invent a failure, and there is nothing left to call.
+        static std::once_flag none;
+        std::call_once(none, [] { Log("[scan] no vkCreateImage anywhere in the chain; images unhooked"); });
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
@@ -2067,9 +2087,6 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
     if (!std::strcmp(n, "vkDestroyDevice")) return (PFN_vkVoidFunction)Hook_DestroyDevice;
     if (!std::strcmp(n, "vkGetDeviceQueue")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue;
     if (!std::strcmp(n, "vkGetDeviceQueue2")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue2;
-    // Only offered while scanning. An ordinary run never gets this hook in its chain at all, which
-    // is the difference between a probe that is off and a probe that is on and doing nothing.
-    if (ScanEnabled() && !std::strcmp(n, "vkCreateImage")) return (PFN_vkVoidFunction)Hook_CreateImage;
     if (!std::strcmp(n, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction)Hook_CreateSwapchainKHR;
     if (!std::strcmp(n, "vkDestroySwapchainKHR")) return (PFN_vkVoidFunction)Hook_DestroySwapchainKHR;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
@@ -2077,6 +2094,18 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
 }
 
 static PFN_vkVoidFunction LookupDeviceHook(const char* n) {
+    // Only offered while scanning. An ordinary run never gets this hook in its chain at all, which
+    // is the difference between a probe that is off and a probe that is on and doing nothing.
+    //
+    // It belongs on the device side, not the instance side. vkCreateImage is a device function: the
+    // loader builds its device dispatch table from vkGetDeviceProcAddr, and an application resolves
+    // it the same way, so a registration in LookupHook is never in the chain and never runs.
+    //
+    // Worth remembering when this layer is blamed for a game that will not start: if the layer's own
+    // log has no new bytes in it, the layer did not run and nothing in this file can be the cause.
+    // Two such reports turned out to be mangled Steam launch options -- a U+00A0 no-break space, and
+    // a %command% that had lost its closing percent sign -- neither of which reaches Vulkan at all.
+    if (ScanEnabled() && !std::strcmp(n, "vkCreateImage")) return (PFN_vkVoidFunction)Hook_CreateImage;
     if (!std::strcmp(n, "vkDestroyDevice")) return (PFN_vkVoidFunction)Hook_DestroyDevice;
     if (!std::strcmp(n, "vkGetDeviceQueue")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue;
     if (!std::strcmp(n, "vkGetDeviceQueue2")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue2;
