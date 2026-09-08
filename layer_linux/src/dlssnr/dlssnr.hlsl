@@ -1551,6 +1551,29 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     const float hueTrust = gHdrProxy != 0 ? 1.0
                                           : smoothstep(0.0, kQuantFloor, dot(modelDirect, kLuma));
 
+    // What the colour bound is doing, seen directly.
+    //
+    // Green is the model's colour passing whole, red is it being held back, so a fault can be put on
+    // one side or the other of this line without guessing: if a wrong colour shows green here the
+    // bound is not engaging on it and the fault is upstream in `upgraded`; if it shows red then the
+    // bound is engaging and the colour is coming from `lumaOnly`, which is the frame's own hue times
+    // one scalar and therefore a luminance problem rather than a colour one.
+    if (gDebugView == 4)
+    {
+        const float a = saturate(colourAllow);
+        gTarget[id.xy] = float4(float3(1.0 - a, a, 0.0) * WhitePoint(), originalSample.a);
+        return;
+    }
+
+    // The composed colour before the bound is applied, so the two can be compared frame by frame.
+    if (gDebugView == 5)
+    {
+        float3 dbg = upgraded * gDebugScale * (gHdrProxy != 0 ? normScale : 1.0);
+        if (gHdrProxy != 0 && gHdrTransfer != 0) dbg = LinearToPq(dbg);
+        gTarget[id.xy] = float4(max(dbg, 0.0), originalSample.a);
+        return;
+    }
+
     float3 result = lerp(lumaOnly, lumaOnly + colourDev * colourAllow,
                          min(gColourStrength, 1.0) * hueTrust);
 
