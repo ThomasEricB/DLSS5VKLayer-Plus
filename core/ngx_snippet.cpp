@@ -525,7 +525,30 @@ static void ApplyHdrContract(NgxSnippet& s) {
 // find, so the first create attempt named its own requirements -- Width, Height, BackbufferFormat and
 // UseReflexMatrices -- and each round of filling them in reveals the next. That log is why this can
 // be written at all without the DLSS-G headers.
-// Why frame generation declines, found in Streamline's own header.
+// Why frame generation declines. Reflex is not it.
+//
+// The module imports ADVAPI32, KERNEL32, USER32 and VERSION and nothing else. It names Reflex in
+// exactly two places, both parameter keys, and carries no low-latency string, no VK_NV_low_latency2,
+// and not one Reflex NVAPI entry point. It does not check Reflex, because checking Reflex is
+// sl.dlss_g.dll's job and this drives the snippet directly, past it.
+//
+// What the reference project actually does for DLSS-G says where the work happens: it hooks the DXGI
+// factory, creates a *Streamline-proxied* swapchain, declares the feature loaded, and reads the state
+// back through slDLSSGGetState. The interpolation is performed inside that proxied swapchain's
+// Present. The snippet is a component of that arrangement, and MustCallEval is how the arrangement
+// asks it whether this present needs an evaluation.
+//
+// So the answer is a swapchain. There is no present here to hang a generated frame on, no
+// back-buffer index, no frame cadence the snippet can see -- so "no evaluation required" is a
+// correct answer to the question being asked, and it will keep being correct however many parameters
+// are written. All 128 keys the module knows are set and it has not moved.
+//
+// Claiming Reflex was tried and is worse than useless: asserting UseReflexMatrices makes the module
+// demand matrices that do not exist here and CreateFeature fails outright. That is at least proof
+// the key is consumed rather than ignored. DLSSNR_MFG_FAKE_REFLEX=0 stops claiming it.
+
+// Superseded: the earlier note here read Streamline's status enum as though it applied to this path.
+// Those codes are reported by sl.dlss_g.dll, which is exactly the layer being bypassed.
 //
 // The snippet answers its settings callback with MustCallEval=0 -- it is not failing, it is saying
 // no evaluation is required -- and sl_dlss_g.h enumerates the reasons DLSS-G reports for not
@@ -717,7 +740,17 @@ void NgxSetDlssgEval(NgxSnippet& s, bool reset, unsigned int frameIndex) {
     // looking at has no reason to believe the picture has moved, and "no evaluation required" is
     // then correct rather than a refusal.
     ParamSetULL(s.params, "DLSSG.BackbufferFrameID", ++s.fgFrameId, &seh);
-    ParamSetUI(s.params, "DLSSG.ReflexWarp.Available", 0u, &seh);
+    // Claim Reflex, since claiming is the only thing this interface offers.
+    //
+    // The module imports no Streamline or Reflex library and names Reflex in exactly two places, so
+    // there is no runtime to stand up and nothing to impersonate -- only these two values to assert.
+    // DLSSNR_MFG_FAKE_REFLEX=0 says the honest thing instead.
+    static const unsigned int claimReflex = [] {
+        const char* v = getenv("DLSSNR_MFG_FAKE_REFLEX");
+        return (v && v[0] == '0') ? 0u : 1u;
+    }();
+    ParamSetUI(s.params, "DLSSG.ReflexWarp.Available", claimReflex, &seh);
+    ParamSetUI(s.params, "DLSSG.UseReflexMatrices", claimReflex, &seh);
 
     // Read one of them straight back. If a key reports missing after this says it is present, the
     // DLL is reading a different parameter object than the one being written.
