@@ -912,18 +912,39 @@ QWidget* MainWindow::buildSettings() {
                                             0.5,
                                             "The most the pass may brighten or darken a pixel. A "
                                             "detail pass has no business restyling a light source, "
-                                            "whatever the model returns.");
-        compositionRows << binder->AddChoice(f, "Enlargement", &ShmHeader::transfer,
+                                            "whatever the model returns.\n\nOn Classic and Matched "
+                                            "residual this bounds a per-pixel luminance ratio, so "
+                                            "raising it lets more of that ratio's pixel-to-pixel "
+                                            "variation through and detailed surfaces can go patchy. "
+                                            "If you want a high guard without that, set \"How the "
+                                            "answer is applied\" to Native + edit, which adds the "
+                                            "model's difference instead of dividing by the frame and "
+                                            "so has no ratio to amplify.");
+        compositionRows << binder->AddChoice(f, "How the answer is applied", &ShmHeader::transfer,
                                              { "Classic", "Matched residual", "Native + edit" },
-                                             "How a model that worked below the frame's size is "
-                                             "brought back. Matched residual carries only the model's "
-                                             "difference up, so the two pictures being composed are "
-                                             "at the same scale. Native + edit composes nothing at "
-                                             "all: the frame's own pixels are the result and only the "
-                                             "model's difference is added to them, so geometry, text "
-                                             "and edges the model left alone stay at native "
-                                             "sharpness. Only does anything below a working scale "
-                                             "of 1.");
+                                             "How a model that worked at a different size from the "
+                                             "frame is brought back. Active at any working scale "
+                                             "other than 1 -- above it as well as below, since what "
+                                             "matters is only that the model's raster differs from "
+                                             "the frame.\n\nClassic and Matched residual both "
+                                             "rebuild the output by scaling the frame's own pixel by "
+                                             "a per-pixel luminance ratio between the model's answer "
+                                             "and the frame. Where the two agree that ratio is 1 and "
+                                             "nothing happens, which is why flat surfaces are always "
+                                             "clean. On detailed content the model's answer differs "
+                                             "from the frame a great deal from one pixel to the next "
+                                             "-- that difference is the enhancement -- so the ratio "
+                                             "becomes large and varies sharply, and the Highlight "
+                                             "guard below then bounds it. Raising that guard lets "
+                                             "more of the variation through and it shows as patches "
+                                             "of over- and under-bright texture on exactly the "
+                                             "detailed things you were trying to enhance.\n\nNative "
+                                             "+ edit has no ratio at all. The frame's own pixels are "
+                                             "the result and only the model's difference is added to "
+                                             "them, so geometry, text and edges the model left alone "
+                                             "stay at native sharpness -- and there is no per-pixel "
+                                             "division to blow up. Use this one if raising the "
+                                             "Highlight guard makes detailed surfaces go patchy.");
     }
     {
         auto* f = group(col, "Color");
