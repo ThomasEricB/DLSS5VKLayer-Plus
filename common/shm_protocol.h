@@ -38,7 +38,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // decision are carried here. From this branch: the pipelined path's settle, ghost bound, edit split
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 18;
+static constexpr uint32_t kShmVersion = 19;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 // Eight bytes a pixel: the float16 proxy needs them, and the 8-bit path simply uses the first half of
@@ -619,6 +619,18 @@ struct ShmHeader {
     // spatial frequency is the mistake: what the model knows at this scale is how much light belongs
     // here, not which pixel is brighter than its neighbour, and the frame already knows that.
     std::atomic<uint32_t> ratioSmoothPercent;
+
+    // What the game's swapchain actually is, and where in its sequence the layer has got to.
+    //
+    // The helper builds its own device and has never needed to know any of this: the proxy crosses in
+    // a format the encode chose, and the model neither knows nor cares what the game presents in.
+    // Frame generation does care. It is told a backbuffer format and a frame identifier, and until
+    // now both were invented in the helper -- the format hardcoded to R8G8B8A8_UNORM while the game
+    // presents B8G8R8A8_UNORM, which is the same bytes in a different order, and the identifier a
+    // counter of the helper's own answers rather than of the game's presents.
+    std::atomic<uint32_t> swapchainFormat;      // VkFormat of the game's swapchain, 0 if unknown
+    std::atomic<uint32_t> swapchainImageCount;  // how many images it holds
+    std::atomic<uint64_t> presentIndex;         // presents the layer has made, monotonic
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -634,7 +646,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2040, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2056, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -748,6 +760,9 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->motionSmoothPercent.store(100);
     h->colourTrustPercent.store(200);
     h->ratioSmoothPercent.store(100);
+    h->swapchainFormat.store(0);
+    h->swapchainImageCount.store(0);
+    h->presentIndex.store(0);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);

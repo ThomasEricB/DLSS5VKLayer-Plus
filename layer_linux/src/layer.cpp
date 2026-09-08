@@ -1291,6 +1291,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
     sc.passThrough = !SupportedFormat(sc.format) || sc.width > kMaxW || sc.height > kMaxH;
 
     std::lock_guard<std::mutex> lk(dc->lock);
+    // Tell the helper what the game presents in.
+    //
+    // It has never needed to know: the proxy crosses in whatever the encode chose. Frame generation
+    // is the first thing on that side that is told a backbuffer format, and inventing one there meant
+    // claiming R8G8B8A8 while the game presents B8G8R8A8 -- the same bytes in the other order.
+    if (dc->shm.hdr) {
+        dc->shm.hdr->swapchainFormat.store((uint32_t)sc.format);
+        dc->shm.hdr->swapchainImageCount.store(count);
+    }
+
     Log("[layer] swapchain %p %ux%u fmt=%d hdr=%u passThrough=%d%s", (void*)*pSwapchain,
         pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
         (int)pCreateInfo->imageFormat, sc.hdrKind, (int)sc.passThrough,
@@ -1670,6 +1680,9 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         if (dc->shm.hdr) dc->shm.hdr->wantMotion.store(wantField ? 1u : 0u);
 
         dc->shm.frames++;
+        // The game's own present count, which is the sequence frame generation should be told about
+        // rather than a count of the helper's answers.
+        if (dc->shm.hdr) dc->shm.hdr->presentIndex.store(dc->shm.frames);
         // The cadence gate: the *request* goes out only on a frame that is a multiple of the stride.
         //
         // The gate is here rather than on the collect, which is where it was first put and which does

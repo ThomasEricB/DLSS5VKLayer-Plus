@@ -586,8 +586,13 @@ static void ApplyDlssgContract(NgxSnippet& s, uint32_t width, uint32_t height) {
     DWORD seh = 0;
     ParamSetUI(s.params, "DLSSG.Width", width, &seh);
     ParamSetUI(s.params, "DLSSG.Height", height, &seh);
-    // The transport's format. The chain crosses as R8G8B8A8_UNORM, which is VkFormat 37.
-    ParamSetUI(s.params, "DLSSG.BackbufferFormat", 37u, &seh);
+    // The format the game actually presents in, when the layer has said what it is.
+    //
+    // This was hardcoded to 37, R8G8B8A8_UNORM, which is what the transport carries -- but frame
+    // generation is being told about a *backbuffer*, and the game's is B8G8R8A8_UNORM, format 44.
+    // The same bytes in the other order, described wrongly.
+    ParamSetUI(s.params, "DLSSG.BackbufferFormat",
+               s.fgSwapchainFormat ? s.fgSwapchainFormat : 37u, &seh);
     // No Reflex here: there is no game presenting through this device, so there are no camera
     // matrices to hand over and nothing to align them to.
     ParamSetUI(s.params, "DLSSG.UseReflexMatrices", 0u, &seh);
@@ -739,7 +744,10 @@ void NgxSetDlssgEval(NgxSnippet& s, bool reset, unsigned int frameIndex) {
     // most obviously produce the answer it was giving: a model told nothing about which frame it is
     // looking at has no reason to believe the picture has moved, and "no evaluation required" is
     // then correct rather than a refusal.
-    ParamSetULL(s.params, "DLSSG.BackbufferFrameID", ++s.fgFrameId, &seh);
+    // The game's own present count where it is known, rather than a count of the helper's answers.
+    // They are not the same sequence and only one of them is the one being interpolated between.
+    ParamSetULL(s.params, "DLSSG.BackbufferFrameID",
+                s.fgPresentIndex ? s.fgPresentIndex : ++s.fgFrameId, &seh);
     // Claim Reflex, since claiming is the only thing this interface offers.
     //
     // The module imports no Streamline or Reflex library and names Reflex in exactly two places, so

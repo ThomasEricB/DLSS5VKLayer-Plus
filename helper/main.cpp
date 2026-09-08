@@ -2919,6 +2919,8 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
             FillResource(rInterp, ns.fgInterp, true);
             FillResource(rReal, ns.fgReal, true);
             // Reset only on the first answer: after that the history is the point.
+            ns.fg.fgSwapchainFormat = shm.hdr->swapchainFormat.load();
+            ns.fg.fgPresentIndex = shm.hdr->presentIndex.load();
             NgxSetDlssgEval(ns.fg, ns.fgFrames == 0, 1);
             NgxSetDlssgResources(ns.fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, 60u);
             NgxDlssgQuerySettings(ns.fg);

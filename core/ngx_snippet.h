@@ -43,6 +43,10 @@ struct NgxSnippet {
     // Which frame the backbuffer is. Frame generation is told this every evaluate; without it the
     // picture never appears to advance. See DLSSG.BackbufferFrameID.
     unsigned long long fgFrameId = 0;
+    // What the game actually presents in, and where it has got to, carried across from the layer.
+    // Zero means the layer has not said, and the old invented values stand.
+    unsigned int fgSwapchainFormat = 0;
+    unsigned long long fgPresentIndex = 0;
 
     NVSDK_NGX_Handle* features[kMaxPasses] = {};
     uint32_t featureCount = 0;
