@@ -54,7 +54,8 @@ const Setting kSettings[] = {
       "how much of the relighting ratio comes from the neighbourhood, 0-100 (100 default, 0 = per-pixel)" },
 
     { "colourtrust", &ShmHeader::colourTrustPercent, false,
-      "how much of the chroma-agreement gate to apply, 0-100 (0 = take the model's colour everywhere)" },
+      "how far the model may move a pixel's colour from the frame's, in hundredths (200 default, 0 = frame's hue)" },
+
       "how hard the measured displacement is filtered over time, 0-100 (0 = raw, 100 default)" },
       "radius splitting a stale edit's safe half from the half that ghosts, in thousandths of width" },
 

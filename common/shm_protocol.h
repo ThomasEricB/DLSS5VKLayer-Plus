@@ -608,7 +608,8 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->seq_ok.store(0);
     h->compositionBypass.store(1);
     h->rebuildSettleMs.store(250);
-    h->colourTrustPercent.store(100);
+    h->colourTrustPercent.store(200);
+
     h->ratioSmoothPercent.store(100);
 
 
