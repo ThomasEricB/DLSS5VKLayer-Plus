@@ -11,6 +11,7 @@
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDesktopServices>
+#include <QDialog>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QFile>
@@ -30,6 +31,7 @@
 #include <QPushButton>
 #include <QSpinBox>
 #include <QStandardPaths>
+#include <QStyle>
 #include <QTabWidget>
 #include <QTextStream>
 #include <QTimer>
@@ -183,11 +185,12 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     // under, not what the game runs under. The helper is a Windows executable -- it has to be, the
     // model is a Windows DLL -- so it needs Proton or Wine whatever the game is. A native Linux game
     // is unaffected by this setting; the layer inside it is a native library either way.
-    runnerCombo->setToolTip("Proton or Wine for the helper process, which is a Windows executable "
-                            "because the model is a Windows DLL. This is not what the game runs "
-                            "under -- native Linux games work with this set too.");
+    runnerCombo->setToolTip(FormatTip(
+        "Proton or Wine for the helper process, which is a Windows executable\n"
+        "because the model is a Windows DLL.\n"
+        "This is not what the game runs under -- native Linux games work with this set too."));
     runnerPathEdit->setToolTip(runnerCombo->toolTip());
-    runnerForm->addRow("Runner (for the helper)", runnerCombo);
+    runnerForm->addRow("Runner", runnerCombo);
     runnerForm->addRow("Path", runnerPathRow);
     root->addLayout(runnerForm);
 
@@ -220,12 +223,13 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     auto* rebuildLabel = new QLabel("Rebuild spacing (ms)", rebuildRow);
     rebuildSpin = new QSpinBox(rebuildRow);
     rebuildSpin->setRange(0, 5000);
-    rebuildSpin->setToolTip("How long the helper waits after a model setting changes before it "
-                            "rebuilds the pass, and between one rebuild and the next. Rebuilding is "
-                            "expensive, and back-to-back rebuilds have been seen to wedge the model "
-                            "on some drivers. Lower is snappier; 0 rebuilds immediately and chains "
-                            "the rest back to back. Raise it if the model ever stops answering after "
-                            "changing settings.");
+    rebuildSpin->setToolTip(FormatTip(
+        "How long the helper waits after a model setting changes before it rebuilds the pass,\n"
+        "and between one rebuild and the next.\n"
+        "Rebuilding is expensive, and back-to-back rebuilds have been seen to wedge the model\n"
+        "on some drivers.\n"
+        "Lower is snappier; 0 rebuilds immediately and chains the rest back to back.\n"
+        "Raise it if the model ever stops answering after changing settings."));
     rebuildLabel->setToolTip(rebuildSpin->toolTip());
     if (hdr) rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
     rebuildLay->addWidget(rebuildLabel);
@@ -238,6 +242,27 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     gearMenu->addAction("Open helper log", this, [this] {
         QDesktopServices::openUrl(QUrl::fromLocalFile(logPath));
     });
+
+    // The NVIDIA NGX DLLs, tucked into the settings menu rather than crowding the top of the window.
+    // The path shows as a disabled header so the folder the helper reads stays discoverable; it refreshes
+    // after an import. These are NVIDIA's proprietary files and are not shipped, so Import copies the
+    // ones the user already owns into that folder -- exactly as `dlssnr-helper import-binaries` does --
+    // and the helper has to be restarted afterwards to load them.
+    gearMenu->addSeparator();
+    auto* binariesMenu = gearMenu->addMenu("NGX binaries");
+    binariesPathAction = binariesMenu->addAction(effectiveBinariesDir());
+    binariesPathAction->setEnabled(false);
+    binariesPathAction->setToolTip(FormatTip(
+        "Where the NVIDIA NGX DLLs live. The helper loads nvngx_dlssnr.dll from here.\n"
+        "These are NVIDIA's proprietary files and are not shipped with this package -- import your own."));
+    auto* importAction = binariesMenu->addAction("Import binaries...", this, &MainWindow::importBinaries);
+    importAction->setToolTip(FormatTip(
+        "Copy the NVIDIA NGX DLLs from a folder you choose into the binaries folder.\n"
+        "Pick the folder that holds nvngx_dlssnr.dll (and nvngx.dll, nvapi64.dll, sl.*.dll if you have "
+        "them).\n"
+        "Restart the helper afterwards so it loads the new files."));
+    auto* openBinariesAction = binariesMenu->addAction("Open binaries folder", this, &MainWindow::openBinariesFolder);
+    openBinariesAction->setToolTip("Open the folder the helper loads the NGX DLLs from.");
     gearBtn->setMenu(gearMenu);
     connect(rebuildSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
         if (!hdr) return;
@@ -273,6 +298,12 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     connect(statusTimer, &QTimer::timeout, this, &MainWindow::updateStatus);
     statusTimer->start(1000);
     updateStatus();
+
+    // Ask for the NGX DLLs the first thing after the window is up, if they are not there -- but on the
+    // next turn of the event loop, not inline, so the main window paints before a modal dialog covers
+    // it. A fresh install with no nvngx_dlssnr.dll would otherwise open on a helper that can only ever
+    // report "no NGX binaries" with no hint of what to do about it.
+    QTimer::singleShot(0, this, &MainWindow::maybePromptImport);
 }
 
 MainWindow::~MainWindow() {
@@ -327,6 +358,31 @@ QString MainWindow::findHelperCli() const {
 QString MainWindow::configPath() const {
     const QString base = qEnvironmentVariable("XDG_CONFIG_HOME", QDir::homePath() + "/.config");
     return base + "/dlssnr/config.ini";
+}
+
+// Must match DATA_DIR in dlssnr-helper, so the GUI and the CLI import into and read from the same
+// folder -- otherwise the interface would report binaries imported while the helper looked elsewhere.
+QString MainWindow::dataDir() const {
+    const QString base = qEnvironmentVariable("XDG_DATA_HOME", QDir::homePath() + "/.local/share");
+    return base + "/dlssnr";
+}
+
+QString MainWindow::defaultBinariesDir() const {
+    return dataDir() + "/binaries";
+}
+
+// The folder the helper will actually read: whatever the config recorded, or the default when nothing
+// was ever imported. The import always writes into defaultBinariesDir(), so a config path that points
+// elsewhere is only ever a hand-edit or a leftover from the CLI's discovery.
+QString MainWindow::effectiveBinariesDir() const {
+    return binariesPath.isEmpty() ? defaultBinariesDir() : binariesPath;
+}
+
+// nvngx_dlssnr.dll is the one file the helper cannot work without -- neural processing stays disabled
+// without it. nvngx.dll and nvapi64.dll are optional (the parameter allocator falls back, and under
+// Proton DXVK-NVAPI supplies NVAPI), so their absence is not worth a prompt.
+bool MainWindow::binariesMissingNow() const {
+    return !QFile::exists(effectiveBinariesDir() + "/nvngx_dlssnr.dll");
 }
 
 QString MainWindow::defaultShmPath() const {
@@ -595,6 +651,137 @@ void MainWindow::stopHelper() {
     updateStatus();
 }
 
+// The GUI twin of `dlssnr-helper import-binaries`: copy the NVIDIA NGX DLLs the user already owns out
+// of a folder they pick into the one folder the helper reads, then record it. Doing the copy here
+// rather than shelling to the CLI means it works even when the CLI is not on PATH, and lets the result
+// be reported per file instead of a single line on stdout. The helper reads the folder only at launch,
+// so a running helper has to be restarted to see a fresh import.
+void MainWindow::importBinaries() {
+    const QString current = effectiveBinariesDir();
+    const QString startDir = QDir(current).exists() ? current : QDir::homePath();
+    const QString src = QFileDialog::getExistingDirectory(
+        this, "Select the folder holding the NVIDIA NGX DLLs", startDir);
+    if (src.isEmpty()) return;
+
+    const QString dest = defaultBinariesDir();
+    if (!QDir().mkpath(dest)) {
+        QMessageBox::warning(this, "DLSS5VKLayer",
+                             FormatTip("Could not create the binaries folder:\n" + dest));
+        return;
+    }
+
+    // The same set the CLI copies. nvngx_dlssnr.dll is the only one the helper insists on; nvngx.dll
+    // and nvapi64.dll serve the core/NVAPI path, sl.*.dll a Streamline route this build does not use,
+    // and *.license.txt is NVIDIA's EULA carried along for redistribution.
+    static const QStringList patterns = {
+        "nvngx_dlssnr.dll", "nvngx.dll", "nvapi64.dll", "sl.*.dll", "*.license.txt"
+    };
+    QDir srcDir(src);
+    QStringList copied, failed;
+    for (const QString& pat : patterns) {
+        const QStringList hits = srcDir.entryList(QStringList() << pat, QDir::Files, QDir::Name);
+        for (const QString& name : hits) {
+            const QString target = dest + "/" + name;
+            if (QFile::exists(target)) QFile::remove(target);
+            if (QFile::copy(src + "/" + name, target)) copied << name;
+            else failed << name;
+        }
+    }
+
+    if (copied.isEmpty()) {
+        QMessageBox::warning(this, "DLSS5VKLayer",
+                             FormatTip("No NVIDIA NGX DLLs were found in:\n" + src +
+                                       "\n\nPick the folder that actually contains nvngx_dlssnr.dll."));
+        return;
+    }
+
+    binariesPath = dest;
+    if (binariesPathAction) binariesPathAction->setText(dest);
+    saveConfig();
+
+    const bool hasSnippet = QFile::exists(dest + "/nvngx_dlssnr.dll");
+    QString detail = "Imported into:\n" + dest + "\n\n" + copied.join("\n");
+    if (!failed.isEmpty()) detail += "\n\nCould not copy:\n" + failed.join("\n");
+    if (!hasSnippet)
+        detail += "\n\nnvngx_dlssnr.dll was not among them -- neural processing stays disabled.";
+    else if (helperRunning)
+        detail += "\n\nThe helper is running; restart it to load the new files.";
+    else
+        detail += "\n\nStart the helper to use them.";
+
+    if (failed.isEmpty() && hasSnippet)
+        QMessageBox::information(this, "DLSS5VKLayer", FormatTip(detail));
+    else
+        QMessageBox::warning(this, "DLSS5VKLayer", FormatTip(detail));
+}
+
+void MainWindow::openBinariesFolder() {
+    const QString dir = effectiveBinariesDir();
+    QDir().mkpath(dir);  // opening a folder that does not exist yet just fails; create it first
+    QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
+}
+
+// The first-run nudge. With no nvngx_dlssnr.dll the helper can only report "no NGX binaries", which is
+// a dead end nothing on the status line explains to someone who has never imported the DLLs. Offer to
+// fix it the moment the window is up. It comes back every launch while the snippet is missing -- there
+// is deliberately no "don't ask again", because the state that triggers it is one the user can resolve.
+void MainWindow::maybePromptImport() {
+    if (!binariesMissingNow()) return;
+    const QString dir = effectiveBinariesDir();
+
+    // A hand-built dialog rather than a QMessageBox: QMessageBox lays its buttons out by role per the
+    // active style, which kept scattering them. A plain dialog with an explicit button row pins the
+    // KDE / FreeDesktop convention -- dismiss on the far left, affirmative actions grouped on the right,
+    // the primary one (Import) as the default focus on the far right -- and lets "Open folder" leave the
+    // window up while "Import" and "Later" close it.
+    QDialog dlg(this);
+    dlg.setWindowTitle("NVIDIA NGX binaries not found");
+    dlg.resize(520, 230);  // a comfortable default; the wrapped text and buttons sit inside this
+
+    auto* root = new QVBoxLayout(&dlg);
+    root->setContentsMargins(12, 12, 12, 12);
+    auto* top = new QHBoxLayout;
+    auto* icon = new QLabel(&dlg);
+    icon->setPixmap(dlg.style()->standardIcon(QStyle::SP_MessageBoxWarning).pixmap(48, 48));
+    top->addWidget(icon, 0, Qt::AlignTop);
+    auto* textCol = new QVBoxLayout;
+    auto* headline = new QLabel(
+        "The neural model's DLL (nvngx_dlssnr.dll) is not in the binaries folder, so neural processing "
+        "stays off and games present their own frames.", &dlg);
+    headline->setWordWrap(true);
+    auto* detail = new QLabel(FormatTip(
+        "Import it from a folder you own, or open the folder to place the files yourself:\n" + dir +
+        "\n\nThese are NVIDIA's proprietary files and are not shipped with this package."), &dlg);
+    detail->setWordWrap(true);
+    detail->setTextFormat(Qt::RichText);
+    textCol->addWidget(headline);
+    textCol->addWidget(detail);
+    top->addLayout(textCol, 1);
+    root->addLayout(top);
+
+    auto* btnRow = new QHBoxLayout;
+    auto* importBtn = new QPushButton("Import...", &dlg);
+    auto* openBtn = new QPushButton("Open folder", &dlg);
+    auto* laterBtn = new QPushButton("Later", &dlg);
+    // [ Later ]                [ Open folder ] [ Import... ]
+    btnRow->addWidget(laterBtn);   // dismiss, alone on the far side
+    btnRow->addStretch(1);
+    btnRow->addWidget(openBtn);    // affirmative group, right
+    btnRow->addWidget(importBtn);  // primary, far right
+    root->addSpacing(16);          // breathing room between the text and the buttons
+    root->addLayout(btnRow);
+    importBtn->setDefault(true);
+    importBtn->setAutoDefault(true);
+
+    connect(importBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    connect(laterBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+    // "Open folder" opens the file manager and leaves the prompt up -- it resolves nothing on its own.
+    connect(openBtn, &QPushButton::clicked, this, [this] { openBinariesFolder(); });
+
+    // Import closes the prompt, then runs the import (which reports its own outcome).
+    if (dlg.exec() == QDialog::Accepted) importBinaries();
+}
+
 void MainWindow::updateStatus() {
     if (binder) binder->Reload();
     // The menu spinbox is not a bound control, so the poll keeps it honest the same way the binder
@@ -728,19 +915,22 @@ QWidget* MainWindow::buildSettings() {
     }
     {
         auto* f = group(col, "Cost");
-        binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
+binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "How many times the model runs over one frame, each pass shown the last one's "
-                       "answer. Every pass is another full run of the model and another feature "
-                       "holding its own history, so the cost is close to linear.",
+                       "answer.\n"
+                       "Every pass is another full run of the model and another feature holding its "
+                       "own history, so the cost is close to linear.",
                        ShmBinder::AtCreate);
         binder->AddBool(f, "Lift the pass limit", &ShmHeader::unlockPasses,
-                        QString("Raises the ceiling from %1 to %2. Past a few passes the model is "
-                                "enhancing its own output, which is outside what it was trained for.")
-                            .arg(kDefaultMaxPasses)
-                            .arg(kMaxPasses));
+                         QString("Raises the ceiling from %1 to %2.\n"
+                                 "Past a few passes the model is enhancing its own output, which is "
+                                 "outside what it was trained for.")
+                             .arg(kDefaultMaxPasses)
+                             .arg(kMaxPasses));
         binder->AddPercent(f, "Model resolution", &ShmHeader::workingScaleBits, 25, 200,
                            "What fraction of the frame the model works at. The frame itself is never "
-                           "reduced. Below 100% also cuts what crosses shared memory, quadratically. "
+                           "reduced.\n"
+                           "Below 100% also cuts what crosses shared memory, quadratically.\n"
                            "Above 100% the model supersamples, which on this transport is expensive: "
                            "at 200% on a 4K frame it is 132 MB each way, every frame.");
         binder->AddChoice(f, "Down-leg filter", &ShmHeader::scalingDownscaler,
@@ -756,17 +946,19 @@ QWidget* MainWindow::buildSettings() {
     {
         auto* f = group(col, "Motion");
         binder->AddBool(f, "Estimate motion vectors", &ShmHeader::mvecEnabled,
-                        "The model reasons about what moved between frames. A layer at present time "
-                        "has no motion vectors from the engine, so they are estimated on the GPU's "
-                        "optical-flow engine from the two frames the helper already has. Off hands "
-                        "the model a zero field, which is what it used to get.");
+                        "The model reasons about what moved between frames.\n"
+                        "A layer at present time has no motion vectors from the engine, so they are "
+                        "estimated on the GPU's optical-flow engine from the two frames the helper "
+                        "already has.\n"
+                        "Off hands the model a zero field, which is what it used to get.");
         binder->AddChoice(f, "Motion quality", &ShmHeader::mvecQuality,
                           { "Fast", "Balanced", "Quality" },
                           "How much of the frame's budget the flow estimate may take.");
         binder->AddChoice(f, "Motion units", &ShmHeader::mvecScaleMode,
                           { "Normalised", "Pixels", "UV 0..1" },
-                          "What the numbers in the field mean to the model. Pixels is what the "
-                          "estimate produces; the others are for matching a model that expects them.");
+                          "What the numbers in the field mean to the model.\n"
+                          "Pixels is what the estimate produces; the others are for matching a model "
+                          "that expects them.");
     }
 
     scrollTab("Composition", &col);
@@ -779,52 +971,55 @@ QWidget* MainWindow::buildSettings() {
         compositionForm = f;
         bypassCheck = binder->AddBool(
             f, "Enabled", &ShmHeader::compositionBypass,
-            "Off: the model's raw answer is presented as the frame. On: the answer is blended onto "
-            "the frame under the limits below, which are hidden while this is off.",
+            "Off: the model's raw answer is presented as the frame.\n"
+            "On: the answer is blended onto the frame under the limits below, which are hidden while "
+            "this is off.",
             ShmBinder::Live, /*invert=*/true);
         connect(bypassCheck, &QCheckBox::toggled, this, [this] { updateCompositionVisibility(); });
         compositionRows << binder->AddFloat(f, "Detail strength", &ShmHeader::transferStrengthBits,
                                             0.0, 4.0, 0.05,
-                                            "How much of the model's edit reaches the frame. At zero "
-                                            "the frame is bit-identical to the game's own.");
+                                            "How much of the model's edit reaches the frame.\n"
+                                            "At zero the frame is bit-identical to the game's own.");
         compositionRows << binder->AddFloat(f, "Color strength", &ShmHeader::colourStrengthBits,
                                             0.0, 4.0, 0.05,
-                                            "How much of the model's color comes with its light. At "
-                                            "zero the frame keeps the game's hue exactly.");
+                                            "How much of the model's color comes with its light.\n"
+                                            "At zero the frame keeps the game's hue exactly.");
         compositionRows << binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.0, 30.0,
                                             0.5,
-                                            "The most the pass may brighten or darken a pixel. A "
-                                            "detail pass has no business restyling a light source, "
+                                            "The most the pass may brighten or darken a pixel.\n"
+                                            "A detail pass has no business restyling a light source, "
                                             "whatever the model returns.");
         compositionRows << binder->AddChoice(f, "Enlargement", &ShmHeader::transfer,
                                              { "Classic", "Matched residual", "Native + edit" },
                                              "How a model that worked below the frame's size is "
-                                             "brought back. Matched residual carries only the model's "
-                                             "difference up, so the two pictures being composed are "
-                                             "at the same scale. Native + edit composes nothing at "
-                                             "all: the frame's own pixels are the result and only the "
-                                             "model's difference is added to them, so geometry, text "
-                                             "and edges the model left alone stay at native "
-                                             "sharpness. Only does anything below a working scale "
-                                             "of 1.");
+                                             "brought back.\n"
+                                             "Matched residual carries only the model's difference up, "
+                                             "so the two pictures being composed are at the same "
+                                             "scale.\n"
+                                             "Native + edit composes nothing at all: the frame's own "
+                                             "pixels are the result and only the model's difference is "
+                                             "added to them, so geometry, text and edges the model "
+                                             "left alone stay at native sharpness.\n"
+                                             "Only does anything below a working scale of 1.");
     }
     {
         auto* f = group(col, "Color");
         binder->AddChoice(f, "HDR input", &ShmHeader::hdrMode,
                           { "Auto", "Off", "Force float16" },
-                          "Let the model see the frame's real light instead of a tone-mapped copy. "
+                          "Let the model see the frame's real light instead of a tone-mapped copy.\n"
                           "Auto turns it on when the swapchain is HDR -- a float swapchain, or 10-bit "
                           "with a PQ colour space -- and the proxy then crosses as float16 carrying "
-                          "linear light, PQ-decoded first when the swapchain carries PQ. Off keeps "
-                          "the 8-bit proxy whatever the game presents. Force feeds the float proxy "
-                          "to an SDR swapchain too, which is an A/B tool rather than a preference. "
+                          "linear light, PQ-decoded first when the swapchain carries PQ.\n"
+                          "Off keeps the 8-bit proxy whatever the game presents.\n"
+                          "Force feeds the float proxy to an SDR swapchain too, which is an A/B tool "
+                          "rather than a preference.\n"
                           "The model has the last word: if it refuses float input the pass falls back "
                           "to 8-bit on its own.");
         binder->AddChoice(f, "Frame holds", &ShmHeader::colourMode,
                           { "Auto", "A finished picture", "Linear light" },
                           "Whether the swapchain carries a frame the game already tone mapped or "
-                          "open-ended light. Auto decides from the format and is right for almost "
-                          "every game.");
+                          "open-ended light.\n"
+                          "Auto decides from the format and is right for almost every game.");
         binder->AddChoice(f, "White point from", &ShmHeader::whitePointSource,
                           { "The slider below", "Measured off the frame" },
                           "Only meaningful on a linear frame; a finished picture has no white point "
@@ -847,13 +1042,14 @@ QWidget* MainWindow::buildSettings() {
                         "unchanged and only the picture differs.");
         binder->AddBool(f, "Hold frame", &ShmHeader::holdFrame,
                         "Freeze the frame the pass works on, so changing a setting re-runs the model "
-                        "and the composition on the same picture. The only clean way to compare two "
-                        "settings.");
+                        "and the composition on the same picture.\n"
+                        "The only clean way to compare two settings.");
         binder->AddChoice(f, "Proxy", &ShmHeader::reversibleMode,
                           { "Soft knee", "Neutwo", "Neutwo, replace", "Hybrid", "Hybrid, replace" },
                           "Which picture the model is shown, and whether its answer is composed onto "
-                          "the frame or substituted for it. Soft knee is the default and the two "
-                          "replace modes are known to flash on bright lights.");
+                          "the frame or substituted for it.\n"
+                          "Soft knee is the default and the two replace modes are known to flash on "
+                          "bright lights.");
         binder->AddChoice(f, "Debug view", &ShmHeader::debugView,
                           { "Off", "The picture the model saw", "Its raw answer", "What it changed" },
                           "The last one is amplified and centred on grey, so both directions of the "
@@ -861,9 +1057,11 @@ QWidget* MainWindow::buildSettings() {
         binder->AddFloat(f, "Debug scale", &ShmHeader::debugScaleBits, 0.01, 100.0, 0.1,
                          "What the debug views are multiplied by on their way out.");
         binder->AddChoice(f, "Compare", &ShmHeader::compareMode, { "Off", "Side by side", "Wipe" },
-                          "Shows the pass against itself. The wipe cuts one frame and resamples "
-                          "nothing, so it is the one to play with. Works with composition off too: "
-                          "the model's raw answer is then shown against the frame.");
+                          "Shows the pass against itself.\n"
+                          "The wipe cuts one frame and resamples nothing, so it is the one to play "
+                          "with.\n"
+                          "Works with composition off too: the model's raw answer is then shown "
+                          "against the frame.");
         binder->AddFloat(f, "Split", &ShmHeader::compareSplitBits, 0.0, 1.0, 0.01, "");
         binder->AddFloat(f, "Zoom", &ShmHeader::compareZoomBits, 1.0, 2.0, 0.05,
                          "Side by side only. 1 fits the whole frame and accepts the bars; 2 fills the "
@@ -889,9 +1087,10 @@ QWidget* MainWindow::buildSettings() {
             const int idx = keyCombo->findData(hdr->toggleKey.load());
             keyCombo->setCurrentIndex(idx >= 0 ? idx : 0);
         }
-        keyCombo->setToolTip("Toggles the pass in game. Read by the layer, which works on an X11 or "
-                             "XWayland session and anywhere you are in the 'input' group. It cannot "
-                             "work for a game presenting through winewayland.");
+        keyCombo->setToolTip(FormatTip(
+            "Toggles the pass in game. Read by the layer, which works on an X11 or XWayland\n"
+            "session and anywhere you are in the 'input' group.\n"
+            "It cannot work for a game presenting through winewayland."));
         f->addRow("Toggle key", keyCombo);
         connect(keyCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
             if (!hdr) return;
@@ -914,8 +1113,9 @@ QWidget* MainWindow::buildSettings() {
         captureFrames->setRange(1, 64);
         captureFrames->setValue(8);
         captureBtn = new QPushButton("Capture frames", col->parentWidget());
-        captureBtn->setToolTip("Writes that many matched before/after pairs to the state directory. "
-                               "Same frames, same run, one variable.");
+        captureBtn->setToolTip(FormatTip(
+            "Writes that many matched before/after pairs to the state directory.\n"
+            "Same frames, same run, one variable."));
         capRow->addWidget(captureFrames);
         capRow->addWidget(captureBtn);
         f->addRow(capRow);

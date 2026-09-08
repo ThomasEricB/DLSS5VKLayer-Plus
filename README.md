@@ -21,6 +21,7 @@ This project is experimental. It is intended for local testing and research.
   - intensity, tone, structure, skin structure, and sharpness
   - per-pass overrides
   - synthetic motion-vector enable, scale mode, and quality
+  - importing the NVIDIA NGX DLLs (gear menu -> **NGX binaries**)
 - CLI helper manager:
   - runner discovery
   - start/stop/status
@@ -47,20 +48,23 @@ Valve's official Proton releases and Proton Experimental are not targeted as pri
 
 The public package does not include NVIDIA proprietary NGX DLLs.
 
-You must provide the required DLLs yourself, for example:
+Only `nvngx_dlssnr.dll` is required -- neural processing stays off without it. The rest are optional and
+depend on the runner:
 
-- `nvngx_dlssnr.dll`
-- `nvngx.dll`
-- `nvapi64.dll`
-- `sl.*.dll`
+- `nvngx_dlssnr.dll` -- required (the model itself)
+- `nvngx.dll`, `nvapi64.dll` -- used by the core/NVAPI path; optional under Proton, where DXVK-NVAPI
+  already supplies NVAPI (the helper skips the vendored `nvapi64.dll` there)
+- `sl.*.dll` -- Streamline DLLs; not loaded by this build
 
-Import them with:
+Import them with the CLI:
 
 ```bash
 dlssnr-helper import-binaries /path/to/dlls
 ```
 
-or use the GUI import flow if available.
+or from the GUI: gear menu -> **NGX binaries** -> **Import binaries...**. On first launch the GUI also
+prompts to import when `nvngx_dlssnr.dll` is missing. Either way the files are copied into
+`$XDG_DATA_HOME/dlssnr/binaries`; restart the helper afterwards to load them.
 
 The personal package variant includes these DLLs. Only redistribute the personal variant if you have the rights to do so.
 
@@ -72,13 +76,13 @@ The RPMs are the packaged builds under `dist/`, produced by [Packaging](#packagi
 Public package:
 
 ```bash
-sudo dnf install ./dist/dlssnr-0.2.5-3.fc44.x86_64.rpm
+sudo dnf install ./dist/dlssnr-0.2.5-4.fc44.x86_64.rpm
 ```
 
 Personal package:
 
 ```bash
-sudo dnf install ./dist/dlssnr-personal-0.2.5-3.fc44.x86_64.rpm
+sudo dnf install ./dist/dlssnr-personal-0.2.5-4.fc44.x86_64.rpm
 ```
 
 `wine` is a recommended package, not a hard dependency, so Proton-only users are not forced to install host Wine.
@@ -95,10 +99,10 @@ prefix survive the update:
 
 ```bash
 dlssnr-helper stop
-sudo dnf upgrade ./dist/dlssnr-0.2.5-3.fc44.x86_64.rpm
+sudo dnf upgrade ./dist/dlssnr-0.2.5-4.fc44.x86_64.rpm
 ```
 
-(`rpm -Uvh ./dist/dlssnr-0.2.5-3.fc44.x86_64.rpm` does the same job on systems without `dnf`.)
+(`rpm -Uvh ./dist/dlssnr-0.2.5-4.fc44.x86_64.rpm` does the same job on systems without `dnf`.)
 Relaunch any game that was presenting through the layer so it picks up the new layer library.
 
 The two variants carry the same files and conflict with each other, so switching between them is a
@@ -119,8 +123,8 @@ older tarballs die at exec on Arch-based systems with
 Extract the tarball:
 
 ```bash
-tar -xzf dist/dlssnr-0.2.5-3-linux-x86_64.tar.gz
-cd dlssnr-0.2.5-3-linux-x86_64
+tar -xzf dist/dlssnr-0.2.5-4-linux-x86_64.tar.gz
+cd dlssnr-0.2.5-4-linux-x86_64
 ```
 
 User install, no root required:
@@ -148,8 +152,8 @@ over the old one -- user config, state and the managed prefix are not touched:
 
 ```bash
 dlssnr-helper stop
-tar -xzf dist/dlssnr-0.2.5-3-linux-x86_64.tar.gz
-cd dlssnr-0.2.5-3-linux-x86_64
+tar -xzf dist/dlssnr-0.2.5-4-linux-x86_64.tar.gz
+cd dlssnr-0.2.5-4-linux-x86_64
 ./install.sh --user        # or: sudo ./install.sh --system
 ```
 
@@ -379,6 +383,11 @@ The Passes dialog overrides settings for one pass at a time, field by field: eac
 checkbox, and a field left unchecked follows the global value rather than restating it.
 
 Settings are written to shared memory and take effect on the next processed frame. Closing the GUI requests a helper stop, so the helper does not need to be stopped manually.
+
+The gear menu (bottom right) also holds **NGX binaries**: import the NVIDIA DLLs into
+`$XDG_DATA_HOME/dlssnr/binaries`, or open that folder to place them yourself. On first launch, if
+`nvngx_dlssnr.dll` is not there, the GUI prompts to import it -- otherwise the helper can only report
+"no NGX binaries" and games keep presenting their own frames.
 
 ## Synthetic Motion Vectors
 

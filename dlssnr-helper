@@ -560,6 +560,10 @@ cmd_start() {
   fi
   if [ "$runner_type" = "proton" ]; then
     export PROTON_ENABLE_NVAPI=1
+    # DXVK-NVAPI (bundled by Proton-CachyOS/GE and friends, switched on by PROTON_ENABLE_NVAPI above)
+    # already answers NVAPI inside the prefix. Loading the vendored nvapi64.dll on top of it faults in
+    # its DllMain, so tell the helper to leave NVAPI to the runner. See core/ngx_snippet.cpp.
+    export DLSSNR_SKIP_NVAPI=1
     export STEAM_COMPAT_DATA_PATH="$PREFIX_DIR"
     local steam_root
     steam_root="$(detect_steam_root || true)"

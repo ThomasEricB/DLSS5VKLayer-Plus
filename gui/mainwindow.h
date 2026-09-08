@@ -17,6 +17,7 @@ class QTabWidget;
 class QComboBox;
 class QLineEdit;
 class QFormLayout;
+class QAction;
 class ShmBinder;
 
 class MainWindow : public QWidget {
@@ -32,11 +33,18 @@ private slots:
     void startHelper();
     void stopHelper();
     void updateStatus();
+    void importBinaries();
+    void openBinariesFolder();
 
 private:
     QString findProjectDir() const;
     QString findHelperCli() const;
     QString configPath() const;
+    QString dataDir() const;
+    QString defaultBinariesDir() const;
+    QString effectiveBinariesDir() const;
+    bool binariesMissingNow() const;
+    void maybePromptImport();
     QString defaultShmPath() const;
     QString defaultLogPath() const;
     QString pidFilePath() const;
@@ -80,6 +88,7 @@ private:
     QComboBox* runnerCombo = nullptr;
     QComboBox* keyCombo = nullptr;
     QLineEdit* runnerPathEdit = nullptr;
+    QAction* binariesPathAction = nullptr;
     QLabel* statusLabel = nullptr;
     QSpinBox* captureFrames = nullptr;
     QCheckBox* bypassCheck = nullptr;
