@@ -18,6 +18,7 @@
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1259,6 +1260,73 @@ static uint32_t DetectHdrKind(VkFormat f, VkColorSpaceKHR cs) {
     return kHdrNone;
 }
 
+// Finding the game's depth buffer.
+//
+// A layer is not confined to the present hook -- it sees every call the game makes, including the
+// ones that create and use render targets. That is how the reference project finds a HUD-less colour
+// buffer in games that do not tag one: track resource creation and identify the right target by what
+// it looks like. The same is available here, and saying otherwise was wrong.
+//
+// This is the first step of that: watch every image the game creates and report the depth ones. If
+// the depth buffer a scene is rendered with turns out to be identifiable and stable -- one image, at
+// the swapchain's size, created once and reused -- then fetching it is a matter of copying it at the
+// right moment. If instead there are thirty of them at every size, the heuristic has to be much
+// cleverer and that is worth knowing before writing it.
+//
+// Reporting only. Nothing is copied and nothing is kept. DLSSNR_SCAN=1.
+static bool ScanEnabled() {
+    static const bool v = [] {
+        const char* e = getenv("DLSSNR_SCAN");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+static bool IsDepthFormat(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImage(VkDevice device, const VkImageCreateInfo* ci,
+                                                       const VkAllocationCallbacks* alloc,
+                                                       VkImage* out) {
+    DeviceChain* dc = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMutex);
+        auto it = g_devices.find(device);
+        if (it != g_devices.end()) dc = it->second;
+    }
+    PFN_vkCreateImage next = nullptr;
+    if (dc && dc->next_dpa) next = (PFN_vkCreateImage)dc->next_dpa(device, "vkCreateImage");
+    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+
+    const VkResult r = next(device, ci, alloc, out);
+    if (r == VK_SUCCESS && ci && ScanEnabled() && IsDepthFormat(ci->format)) {
+        // Counted per shape rather than logged per image: a game makes thousands and the useful
+        // question is which shapes exist, not how many times each was made.
+        static std::mutex m;
+        static std::map<uint64_t, uint32_t> seen;
+        const uint64_t key = (uint64_t(ci->extent.width) << 40) ^ (uint64_t(ci->extent.height) << 16) ^
+                             uint64_t(ci->format);
+        std::lock_guard<std::mutex> lk(m);
+        const uint32_t n = ++seen[key];
+        if (n == 1 || n == 10 || n == 100 || n == 1000)
+            Log("[scan] depth image %ux%u fmt=%d samples=%d usage=%#x tiling=%d  (seen %u)",
+                ci->extent.width, ci->extent.height, (int)ci->format, (int)ci->samples,
+                (unsigned)ci->usage, (int)ci->tiling, n);
+    }
+    return r;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
     VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
     const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain) {
@@ -1988,6 +2056,7 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
     if (!std::strcmp(n, "vkDestroyDevice")) return (PFN_vkVoidFunction)Hook_DestroyDevice;
     if (!std::strcmp(n, "vkGetDeviceQueue")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue;
     if (!std::strcmp(n, "vkGetDeviceQueue2")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue2;
+    if (!std::strcmp(n, "vkCreateImage")) return (PFN_vkVoidFunction)Hook_CreateImage;
     if (!std::strcmp(n, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction)Hook_CreateSwapchainKHR;
     if (!std::strcmp(n, "vkDestroySwapchainKHR")) return (PFN_vkVoidFunction)Hook_DestroySwapchainKHR;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
