@@ -1169,6 +1169,9 @@ struct NeuralState {
     // a pass must read the previous pass's answer while writing its own: with a single surface the
     // model would be reading and writing the same image.
     GpuImage colorIn{}, workA{}, workB{}, mv{}, depth{};
+    // Where the chain lands before it leaves. The passes run at higher precision than the
+    // transport, so the last one is brought down to the transport's format here, once.
+    GpuImage colorOut{};
     // Phase 5: set every frame the imported proxy covers this raster, so the upload reads the
     // layer's exported memory instead of the shared-memory region.
     bool proxyActive = false;
@@ -2230,6 +2233,7 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     if (ns.ngx.snippet) NgxReleaseAllPasses(ns.ngx, ns.vk.device);
     DestroyOpticalFlow(ns.vk, ns.flow);
     DestroyImage2D(ns.vk, ns.colorIn);
+    DestroyImage2D(ns.vk, ns.colorOut);
     DestroyImage2D(ns.vk, ns.workA);
     DestroyImage2D(ns.vk, ns.workB);
     DestroyImage2D(ns.vk, ns.mv);
@@ -2238,10 +2242,26 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     std::memset(ns.passDirty, 0, sizeof(ns.passDirty));
 
     const VkFormat chainFmt = ns.hdrBuilt ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+
+    // The passes run between these two at sixteen bits, not eight.
+    //
+    // BindPass ping-pongs workA and workB, so with more than one pass the picture is written and read
+    // back once per pass. At eight bits that is a fresh rounding of all three channels every time,
+    // and the three round independently -- so a smooth surface picks up a small hue error that the
+    // next pass cannot tell from detail and therefore enhances. Three passes compounds it into
+    // coloured speckle, which is why the fault appears at two passes and above and never at one, why
+    // it sits on flat ground rather than edges, and why it moves colour without moving brightness.
+    //
+    // Sixteen-bit unorm, not float: the same [0,1] range and the same interpretation, so nothing
+    // downstream has to be told about it, and the model is handed the same numbers it always was with
+    // eight times the room between them. The transport stays eight-bit; the chain is brought down to
+    // it once, at the end, instead of once per pass.
+    const VkFormat workFmt = ns.hdrBuilt ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R16G16B16A16_UNORM;
     ns.ngx.hdrActive = ns.hdrBuilt != 0;
     if (!CreateImage2D(ns.vk, chainFmt, w, h, ns.colorIn) ||
-        !CreateImage2D(ns.vk, chainFmt, w, h, ns.workA) ||
-        !CreateImage2D(ns.vk, chainFmt, w, h, ns.workB) ||
+        !CreateImage2D(ns.vk, chainFmt, w, h, ns.colorOut) ||
+        !CreateImage2D(ns.vk, workFmt, w, h, ns.workA) ||
+        !CreateImage2D(ns.vk, workFmt, w, h, ns.workB) ||
         !CreateImage2D(ns.vk, VK_FORMAT_R16G16_SFLOAT, w, h, ns.mv) ||
         !CreateImage2D(ns.vk, VK_FORMAT_R32_SFLOAT, w, h, ns.depth)) {
         Log("[helper] image creation failed at %ux%u", w, h);
@@ -2746,6 +2766,33 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     const double tEval = time ? NowMs() : 0.0;
 
     if (!last) return false;
+
+    // Down to the transport's format, once, now that the passes are finished.
+    //
+    // A blit rather than a copy, because the chain is sixteen bits and the transport is eight and
+    // vkCmdCopyImage cannot convert. Skipped entirely when the two already match -- one pass on the
+    // HDR path, or any build where the work format equals the chain format -- so that case is
+    // byte-identical to before and pays nothing.
+    if (last->format != ns.colorOut.format) {
+        if (!BeginCmd(ns.vk.cmdEval)) return false;
+        VkAccessFlags srcA; VkPipelineStageFlags srcS;
+        SrcAccessForLayout(last->layout, &srcA, &srcS);
+        TransitionImage(ns.vk, ns.vk.cmdEval, *last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, srcA,
+                        VK_ACCESS_TRANSFER_READ_BIT, srcS, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        TransitionImage(ns.vk, ns.vk.cmdEval, ns.colorOut, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkImageBlit bl{};
+        bl.srcSubresource = { last->aspect(), 0, 0, 1 };
+        bl.dstSubresource = { ns.colorOut.aspect(), 0, 0, 1 };
+        bl.srcOffsets[1] = { int32_t(w), int32_t(h), 1 };
+        bl.dstOffsets[1] = { int32_t(w), int32_t(h), 1 };
+        vkCmdBlitImage(ns.vk.cmdEval, last->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       ns.colorOut.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl,
+                       VK_FILTER_NEAREST);
+        if (!SubmitAndWait(ns.vk, ns.vk.cmdEval)) return false;
+        last = &ns.colorOut;
+    }
 
     // Phase 5: the answer goes back the way the proxy came -- a copy into exportable memory,
     // released to FOREIGN. The shared-memory write stops exactly when the layer's flag says it is
