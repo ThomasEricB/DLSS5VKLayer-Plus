@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 3
+%global pkg_release 4
 
 Name:           dlssnr-personal
 Version:        0.2.5
@@ -80,6 +80,17 @@ fi
 /sbin/ldconfig || :
 
 %changelog
+* Tue Sep 08 2026 DLSS5VKLayer - 0.2.5-4
+- Helper: the nvapi64.dll load is now exception-guarded and skipped when the runner already supplies
+  NVAPI (the launcher sets DLSSNR_SKIP_NVAPI for Proton, where DXVK-NVAPI answers NVAPI). Forcing the
+  vendored nvapi64.dll on top of DXVK-NVAPI faulted inside its DllMain with no guard around it, which
+  took the whole helper down before nvngx.dll was ever reached; a bad nvapi64 now degrades to "no
+  NVAPI" instead. The nvngx.dll core load is guarded for the same reason.
+- GUI: import the NVIDIA NGX DLLs from the interface instead of the CLI. A "NGX binaries" submenu in
+  the gear menu imports (copy nvngx_dlssnr.dll/nvngx.dll/nvapi64.dll/sl.*.dll/*.license.txt into the
+  data dir) and opens the target folder; the GUI prompts on startup when nvngx_dlssnr.dll is missing.
+- GUI: long tooltips are now multi-line rather than one unbroken line.
+
 * Mon Sep 07 2026 DLSS5VKLayer - 0.2.5-3
 - Install ~/.config/environment.d/dlssnr.conf (per user) pinning
   VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present", so the layer orders correctly alongside
