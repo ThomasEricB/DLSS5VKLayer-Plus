@@ -710,6 +710,15 @@ void NgxSetDlssgEval(NgxSnippet& s, bool reset, unsigned int frameIndex) {
     // Which of the generated frames this evaluate is producing, counted from one.
     ParamSetUI(s.params, "DLSSG.MultiFrameIndex", frameIndex, &seh);
 
+    // Which frame the backbuffer holds, advanced once per evaluate.
+    //
+    // One of only three keys the DLL knows that nothing here was setting, and the one that would
+    // most obviously produce the answer it was giving: a model told nothing about which frame it is
+    // looking at has no reason to believe the picture has moved, and "no evaluation required" is
+    // then correct rather than a refusal.
+    ParamSetULL(s.params, "DLSSG.BackbufferFrameID", ++s.fgFrameId, &seh);
+    ParamSetUI(s.params, "DLSSG.ReflexWarp.Available", 0u, &seh);
+
     // Read one of them straight back. If a key reports missing after this says it is present, the
     // DLL is reading a different parameter object than the one being written.
     {
@@ -1044,11 +1053,10 @@ void NgxDlssgQuerySettings(NgxSnippet& s) {
     unsigned int must = 0;
     DWORD seh2 = 0;
     ParamGetUI(s.params, "DLSSG.MustCallEval", &must, &seh2);
-    static unsigned int lastLogged = 0xFFFFFFFFu;
-    if (must != lastLogged) {
-        lastLogged = must;
-        Log("[mfg] settings callback -> %#x seh=%#x, MustCallEval=%u", (uint32_t)r, seh, must);
-    }
+    static unsigned int n = 0;
+    if ((n++ % 60) == 0)
+        Log("[mfg] settings callback -> %#x seh=%#x, MustCallEval=%u (frameId=%llu)",
+            (uint32_t)r, seh, must, (unsigned long long)s.fgFrameId);
 }
 
 bool NgxEvaluatePass(NgxSnippet& s, uint32_t pass, VkCommandBuffer recordingCmd) {

@@ -40,6 +40,10 @@ struct NgxSnippet {
     // A feature carries its own temporal history, and the passes are meant to be a chain of distinct
     // models over one frame rather than the same model shown its own output. Sharing a handle meant
     // every pass in a frame wrote into one history, which is not what "run the model N times" means.
+    // Which frame the backbuffer is. Frame generation is told this every evaluate; without it the
+    // picture never appears to advance. See DLSSG.BackbufferFrameID.
+    unsigned long long fgFrameId = 0;
+
     NVSDK_NGX_Handle* features[kMaxPasses] = {};
     uint32_t featureCount = 0;
     uint32_t featureW = 0, featureH = 0;
