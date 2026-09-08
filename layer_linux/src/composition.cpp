@@ -166,7 +166,10 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
 
     // Native + edit is mode 2; the clamp used to stop at 1 and silently killed it.
     if (s.transfer > 2) s.transfer = 2;
-    if (s.debugView > 3) s.debugView = 0;
+    // 4 and 5 are the two views of the colour bound. This clamp is why they did nothing when they
+    // were added: the shader grew the cases and the validation did not, so the GUI offered them, the
+    // header carried them, and the layer quietly rewrote them to 0 on the way past.
+    if (s.debugView > 5) s.debugView = 0;
     if (s.compareMode > 2) s.compareMode = 0;
     if (s.reversibleMode >= kReversibleModeCount) s.reversibleMode = kReversibleKnee;
     return s;
