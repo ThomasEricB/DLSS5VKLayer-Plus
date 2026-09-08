@@ -1305,9 +1305,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImage(VkDevice device, const Vk
         auto it = g_devices.find(device);
         if (it != g_devices.end()) dc = it->second;
     }
-    PFN_vkCreateImage next = nullptr;
-    if (dc && dc->next_dpa) next = (PFN_vkCreateImage)dc->next_dpa(device, "vkCreateImage");
-    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
+    // The cached pointer, resolved once at device creation like every other entry point here.
+    //
+    // The first version of this resolved it through the loader on every call and, when the device
+    // lookup missed, returned VK_ERROR_INITIALIZATION_FAILED -- an error it invented. Every image the
+    // game made then failed and it died on launch. A probe that reports must never be able to refuse:
+    // if there is nothing to call through to, the honest thing is to say so once and stop watching,
+    // not to break image creation.
+    PFN_vkCreateImage next = dc ? dc->vkCreateImage : nullptr;
+    if (!next && dc && dc->next_dpa) next = (PFN_vkCreateImage)dc->next_dpa(device, "vkCreateImage");
+    if (!next) {
+        static std::once_flag said;
+        std::call_once(said, [] { Log("[scan] no vkCreateImage to call through to; not watching"); });
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
 
     const VkResult r = next(device, ci, alloc, out);
     if (r == VK_SUCCESS && ci && ScanEnabled() && IsDepthFormat(ci->format)) {
@@ -2056,7 +2067,9 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
     if (!std::strcmp(n, "vkDestroyDevice")) return (PFN_vkVoidFunction)Hook_DestroyDevice;
     if (!std::strcmp(n, "vkGetDeviceQueue")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue;
     if (!std::strcmp(n, "vkGetDeviceQueue2")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue2;
-    if (!std::strcmp(n, "vkCreateImage")) return (PFN_vkVoidFunction)Hook_CreateImage;
+    // Only offered while scanning. An ordinary run never gets this hook in its chain at all, which
+    // is the difference between a probe that is off and a probe that is on and doing nothing.
+    if (ScanEnabled() && !std::strcmp(n, "vkCreateImage")) return (PFN_vkVoidFunction)Hook_CreateImage;
     if (!std::strcmp(n, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction)Hook_CreateSwapchainKHR;
     if (!std::strcmp(n, "vkDestroySwapchainKHR")) return (PFN_vkVoidFunction)Hook_DestroySwapchainKHR;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
