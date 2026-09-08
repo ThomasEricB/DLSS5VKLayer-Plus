@@ -1450,7 +1450,10 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         sc.comp->WriteCapturedFrame();
     }
 
-    const dlssnr::FrameSettings fs = dlssnr::FrameSettings::Read(dc->shm.hdr);
+    // Not const: running alongside the frame overrides the composition bypass below, and the
+    // override has to be the one every later reader sees rather than a second variable they might
+    // forget to consult.
+    dlssnr::FrameSettings fs = dlssnr::FrameSettings::Read(dc->shm.hdr);
 
     // The HDR decision, made once per frame before anything is sized or encoded.
     //
@@ -1627,9 +1630,19 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     //
     // Still refused when there is no estimate to warp with, because then the original objection
     // stands exactly as it did.
+    //
+    // The two are now exclusive the other way round: running alongside the frame implies bypassing
+    // the composition, and the composition is not offered while it is on. Composing a stale answer
+    // means the composition's every judgement -- the luminance ratio, the highlight guard, the chroma
+    // agreement -- is made between the current frame and a picture of an older one, and those
+    // judgements are what decide how much of the model reaches the screen. They are hard enough to
+    // get right on a matched pair. The GUI hides the composition controls and states why; this is
+    // what makes that true rather than merely displayed, because the header can also be written by
+    // the CLI and by a settings file.
     const bool canWarpBypass = sc.comp && sc.comp->HasGlobalMotion();
-    const bool pipelined = fs.pipelined && (!fs.compositionBypass || canWarpBypass);
-    if (fs.pipelined && fs.compositionBypass && !canWarpBypass) {
+    if (fs.pipelined) fs.compositionBypass = true;
+    const bool pipelined = fs.pipelined && canWarpBypass;
+    if (fs.pipelined && !canWarpBypass) {
         static std::once_flag said;
         std::call_once(said, [] {
             Log("[layer] the composition is bypassed and there is no motion estimate to reproject the "

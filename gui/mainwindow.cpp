@@ -667,15 +667,30 @@ void MainWindow::updateStatus() {
 void MainWindow::updateCompositionVisibility() {
     if (!compositionForm) return;
     const bool bypass = hdr && hdr->compositionBypass.load() != 0;
+    const bool alongside = hdr && hdr->pipeline.load() != 0;
     for (QWidget* w : compositionRows) compositionForm->setRowVisible(w, !bypass);
 
-    // These two used to be mutually exclusive, and the box stayed ticked while the layer ignored it,
-    // which is a control that lies. They combine now -- with the composition bypassed the model's
-    // answer is reprojected to the current camera every frame rather than presented where it was --
-    // so the box works either way and only its description changes.
+    // Running alongside the frame implies bypassing the composition, and the layer enforces it. So
+    // the box is not merely described differently here, it is taken away: composing a stale answer
+    // makes every judgement the composition exists to make -- the luminance ratio, the highlight
+    // guard, the chroma agreement -- a comparison between the current frame and a picture of an older
+    // one.
+    //
+    // Turning it off is what re-offers the composition, which is why the two controls say so to each
+    // other rather than one silently winning. A control the layer overrides is a control that lies,
+    // and this file has had one of those before.
+    if (bypassCheck) {
+        bypassCheck->setEnabled(!alongside);
+        bypassCheck->setToolTip(alongside
+            ? "Not available while the model runs alongside the frame. The answer is then for an "
+              "earlier frame, and the composition's limits would be judged against a picture that is "
+              "no longer on screen. Turn that off to compose again."
+            : "Off: the model's raw answer is presented as the frame. On: the answer is blended onto "
+              "the frame under the limits below, which are hidden while this is off.");
+    }
     if (pipelineCheck)
-        pipelineCheck->setText(bypass ? "Run the model alongside the frame (answer is reprojected)"
-                                      : "Run the model alongside the frame");
+        pipelineCheck->setText(alongside ? "Run the model alongside the frame (composition off)"
+                                         : "Run the model alongside the frame");
 }
 
 // The settings, on tabs.
@@ -753,7 +768,20 @@ QWidget* MainWindow::buildSettings() {
                         "is always the current one and only what is added to it is behind, so it "
                         "shows as a slight lag in the enhancement during fast motion, not as a lagging "
                         "picture. Measured at 720p: 116 fps waiting against 489 fps alongside, with "
-                        "875 fps for the game on its own.");
+                        "875 fps for the game on its own.\n\nTurning this on switches the "
+                        "composition off: the answer is then for an earlier frame, and the "
+                        "composition would be judging it against a picture no longer on screen.");
+        // Ticking this bypasses the composition here as well as in the layer. The layer enforces it
+        // either way, so without this the box would sit ticked describing something that is not
+        // happening -- the state the composition checkbox itself was in before it was fixed.
+        connect(pipelineCheck, &QCheckBox::toggled, this, [this](bool on) {
+            if (on && hdr) hdr->compositionBypass.store(1);
+            if (on && bypassCheck) {
+                QSignalBlocker block(bypassCheck);
+                bypassCheck->setChecked(false);  // inverted: "Enabled" off means bypassed
+            }
+            updateCompositionVisibility();
+        });
         binder->AddInt(f, "Ghost bound (%)", &ShmHeader::ghostSlackPercent, 0, 400,
                        "Only used when the model runs alongside the frame, and the main thing "
                        "stopping a stale edit from showing as a faint second copy of the scene.\n\n"
