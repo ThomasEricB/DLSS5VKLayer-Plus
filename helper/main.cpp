@@ -2335,6 +2335,23 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
         Log("[mfg] probe result: init+create %s (disabled=%d createFailed=%d handle=%p)",
             fgOk ? "SUCCEEDED" : "failed", int(fg.disabled), int(fg.createFailed),
             (void*)fg.features[0]);
+
+        // Evaluate once, so the snippet names the resources it wants.
+        //
+        // Nothing sensible is bound yet -- the resource keys frame generation reads are not the
+        // denoiser's -- and that is the point: the parameter object logs every key the DLL asks for
+        // and does not find, so an evaluate that fails still returns the contract. It is the same
+        // trick that turned the create refusal into a handle, and it is cheaper than guessing at
+        // header names nobody here has.
+        if (fgOk && fg.features[0]) {
+            if (BeginCmd(ns.vk.cmdEval)) {
+                Log("[mfg] evaluating once to discover the resource contract");
+                NgxSetDlssgEval(fg, true);
+                const bool evOk = NgxEvaluatePass(fg, 0, ns.vk.cmdEval);
+                Log("[mfg] evaluate returned %s", evOk ? "ok" : "failed");
+                SubmitAndWait(ns.vk, ns.vk.cmdEval);
+            }
+        }
         NgxTeardown(fg, ns.vk.device);
     }
     if (!SubmitAndWait(ns.vk, ns.vk.cmdCreate) || !ok) {

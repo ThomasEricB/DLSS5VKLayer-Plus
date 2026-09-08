@@ -119,6 +119,10 @@ static bool ParamSetF(NVSDK_NGX_Parameter* p, const char* n, float v, DWORD* seh
     Guarded([&] { p->Set(n, v); return true; }, false, seh);
     return *seh == 0;
 }
+static bool ParamSetPtr(NVSDK_NGX_Parameter* p, const char* n, void* v, DWORD* seh) {
+    Guarded([&] { p->Set(n, v); return true; }, false, seh);
+    return *seh == 0;
+}
 static bool ParamGetUI(NVSDK_NGX_Parameter* p, const char* n, unsigned int* v, DWORD* seh) {
     return Guarded([&] { return NVSDK_NGX_SUCCEED(p->Get(n, v)); }, false, seh);
 }
@@ -186,6 +190,7 @@ static void RegisterPeRange(const char* name, HMODULE mod) {
 // ---------------------------------------------------------------------------
 // Load + init (everything up to and including CreateFeature(18))
 // ---------------------------------------------------------------------------
+static void ApplyDlssgContract(NgxSnippet& s, uint32_t width, uint32_t height);
 bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
                     uint32_t width, uint32_t height, VkCommandBuffer recordingCmd,
                     const NgxTuning& tuning) {
@@ -312,6 +317,19 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         ok = ok && ParamGetUI(s.params, "__selftest", &back, &seh2) && back == 0xC0FFEE;
         Log("[params] round-trip self-test: %s (seh=%#x)", ok ? "PASS" : "FAIL", seh2);
         if (!ok) { s.disabled = true; return false; }
+    }
+
+    // Frame generation reads its contract earlier than the denoiser does -- some of it while the
+    // snippet is still initialising, before any feature is built -- so it is written here, the moment
+    // there is a parameter block to write it into. Putting it at create time was not early enough:
+    // the keys kept reporting missing after they were being set, because the read that logged them
+    // had already happened.
+    if (s.featureId == 11) {
+        s.featureW = width;
+        s.featureH = height;
+        ApplyDlssgContract(s, width, height);
+        NgxSetDlssgEval(s, true, 1);
+        Log("[mfg] contract written at init for %ux%u", width, height);
     }
 
     // Create parameters (extracted_pipeline_notes.md section 4).
@@ -514,7 +532,139 @@ static void ApplyDlssgContract(NgxSnippet& s, uint32_t width, uint32_t height) {
     // No Reflex here: there is no game presenting through this device, so there are no camera
     // matrices to hand over and nothing to align them to.
     ParamSetUI(s.params, "DLSSG.UseReflexMatrices", 0u, &seh);
-    Log("[mfg] create contract: %ux%u backbufferFormat=37 reflexMatrices=0", width, height);
+
+    // The tier the first successful create named on its way through.
+    ParamSetUI(s.params, "DLSSG.InternalWidth", width, &seh);
+    ParamSetUI(s.params, "DLSSG.InternalHeight", height, &seh);
+    ParamSetUI(s.params, "DLSSG.DynamicResolution", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.ResourceAlwaysProvidedFlags", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.ResourceNeverProvidedFlags", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.UserInterfaceRecompositionEnabled", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.NvAppOvrAppliedVal.StreamlineMode", 0u, &seh);
+
+    // How many frames to generate between each pair of real ones. This is the number the reference
+    // project patches the snippet's architecture clamp to raise; asking for it directly first
+    // establishes whether the clamp is even reached by this route.
+    static const unsigned int frames = [] {
+        const char* v = getenv("DLSSNR_MFG_FRAMES");
+        const int n = v && *v ? atoi(v) : 1;
+        return (unsigned int)(n < 1 ? 1 : (n > 8 ? 8 : n));
+    }();
+    ParamSetUI(s.params, "DLSSG.NvAppOvrAppliedVal.MultiFrameCount", frames, &seh);
+    ParamSetUI(s.params, "DLSSG.MultiFrameCount", frames, &seh);
+
+    Log("[mfg] create contract: %ux%u backbufferFormat=37 reflexMatrices=0 multiFrameCount=%u",
+        width, height, frames);
+}
+
+// The evaluate-time block, discovered the same way the create block was: run it, read what it asked
+// for and did not find, fill that in, run it again.
+void NgxSetDlssgEval(NgxSnippet& s, bool reset, unsigned int frameIndex) {
+    if (!s.params) return;
+    DWORD seh = 0;
+    ParamSetUI(s.params, "DLSSG.Reset", reset ? 1u : 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.MenuDetectionEnabled", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.AsyncCreateEnabled", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.IndicatorLevel", 0u, &seh);
+    // Depth is a zero-filled image here, so the linearisation has nothing to describe. Written
+    // because the DLL reads them, with values that say "no useful depth" as plainly as the contract
+    // allows rather than inventing a near and far plane the frame does not have.
+    ParamSetF(s.params, "DLSSG.LinearizedDepth_Scale", 1.0f, &seh);
+    ParamSetF(s.params, "DLSSG.LinearizedDepth_NearFarPartition", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.MinRelativeLinearDepthObjectSeparation", 1.0f, &seh);
+
+    // Clip space to the previous frame's clip space, as a camera matrix.
+    //
+    // There is no game camera to read here -- a swapchain-only layer never sees one -- so this is the
+    // identity, which states that the camera did not move and leaves the whole displacement to the
+    // motion field. That is the honest description of what this process knows, and it is also what
+    // the motion field is already carrying, since it is estimated from the frames themselves rather
+    // than supplied by the game.
+    //
+    // Static because the DLL keeps the pointer rather than the values.
+    static float clipToPrevClip[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    ParamSetPtr(s.params, "DLSSG.ClipToPrevClip", clipToPrevClip, &seh);
+    // And its inverse, which for the identity is itself.
+    ParamSetPtr(s.params, "DLSSG.PrevClipToClip", clipToPrevClip, &seh);
+
+    // How to read the motion field's units. The helper writes it in pixels, so one texel of the
+    // field is one pixel of the frame and the scale is the reciprocal of the raster -- the same
+    // convention the denoiser is already given through ApplyMotionScale.
+    const float w = s.featureW ? float(s.featureW) : 1.0f;
+    const float h = s.featureH ? float(s.featureH) : 1.0f;
+    ParamSetF(s.params, "DLSSG.MvecScaleX", 1.0f / w, &seh);
+    ParamSetF(s.params, "DLSSG.MvecScaleY", 1.0f / h, &seh);
+
+    // A camera at the origin looking down +Z, with the axes it implies. Same reasoning as the
+    // matrices above: there is no game camera to report, so this states a still one and leaves the
+    // motion to the field.
+    ParamSetF(s.params, "DLSSG.CameraPosX", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraPosY", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraPosZ", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraRightX", 1.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraRightY", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraRightZ", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraUpX", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraUpY", 1.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraUpZ", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraFwdX", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraFwdY", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraFwdZ", 1.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraNear", 0.1f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraFar", 1000.0f, &seh);
+    ParamSetUI(s.params, "DLSSG.DepthInverted", 0u, &seh);
+
+    // No distortion field is supplied, so its precision hints describe nothing.
+    ParamSetUI(s.params, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", 0u, &seh);
+    ParamSetF(s.params, "DLSSG.BidirectionalDistortionFieldLowPrecision.Bias", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.BidirectionalDistortionFieldLowPrecision.Scale", 1.0f, &seh);
+
+    // Projection, jitter and lens. All identity or zero, for the same reason: this process has the
+    // frames and nothing that produced them.
+    static float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    ParamSetPtr(s.params, "DLSSG.CameraViewToClip", ident, &seh);
+    ParamSetPtr(s.params, "DLSSG.ClipToCameraView", ident, &seh);
+    ParamSetPtr(s.params, "DLSSG.ClipToLensClip", ident, &seh);
+    ParamSetF(s.params, "DLSSG.JitterOffsetX", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.JitterOffsetY", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraPinholeOffsetX", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraPinholeOffsetY", 0.0f, &seh);
+    ParamSetF(s.params, "DLSSG.CameraFOV", 1.0472f, &seh);  // 60 degrees
+    ParamSetF(s.params, "DLSSG.CameraAspectRatio", w / (h > 0.0f ? h : 1.0f), &seh);
+    ParamSetUI(s.params, "DLSSG.OrthoProjection", 0u, &seh);
+
+    // What the motion field is and is not. It is estimated by optical flow over the whole picture, so
+    // it already contains the camera's own movement, and it is neither dilated nor jittered because
+    // nothing here does either of those things.
+    ParamSetUI(s.params, "DLSSG.CameraMotionIncluded", 1u, &seh);
+    ParamSetUI(s.params, "DLSSG.MvecDilated", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.MvecJittered", 0u, &seh);
+    // A sentinel the field will never carry, so nothing is mistaken for it.
+    ParamSetF(s.params, "DLSSG.MvecInvalidValue", -1.0e30f, &seh);
+
+    ParamSetUI(s.params, "DLSSG.EvalFlags", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.ColorBuffersHDR", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.AutomodeOverrideReset", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.NotRenderingGameFrames", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.FullscreenMode", 0u, &seh);
+
+    // Which of the generated frames this evaluate is producing, counted from one.
+    ParamSetUI(s.params, "DLSSG.MultiFrameIndex", frameIndex, &seh);
+
+    // Read one of them straight back. If a key reports missing after this says it is present, the
+    // DLL is reading a different parameter object than the one being written.
+    {
+        DWORD seh2 = 0;
+        float back = -1.0f;
+        const bool got = ParamGetF(s.params, "DLSSG.CameraFOV", &back, &seh2);
+        Log("[mfg] write check: CameraFOV set, read back %s value=%.4f (seh=%#x) params=%p own=%d",
+            got ? "OK" : "MISSING", back, seh2, (void*)s.params, int(s.ownParams));
+    }
 }
 
 bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height,
@@ -522,7 +672,18 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
     if (s.disabled || !s.params || pass >= kMaxPasses) return false;
     if (s.features[pass]) return true;
 
-    if (s.featureId == 11) ApplyDlssgContract(s, width, height);
+    // The evaluate block is written here as well as before each evaluate.
+    //
+    // The DLL reads much of it while the feature is being built, not only when it runs -- the camera
+    // basis, the projection, what the motion field means. The parameter object logs a missing key
+    // once per process, which is what made this visible: the keys kept reporting missing after they
+    // were being set, because the read that logged them had already happened at create time.
+    if (s.featureId == 11) {
+        ApplyDlssgContract(s, width, height);
+        s.featureW = width;
+        s.featureH = height;
+        NgxSetDlssgEval(s, true, 1);
+    }
     ApplyHdrContract(s);
 
     DWORD seh = 0;

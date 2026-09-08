@@ -125,6 +125,8 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
                      const NVSDK_NGX_Resource_VK& out, const NVSDK_NGX_Resource_VK& mv,
                      const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height);
 void NgxSetReset(NgxSnippet& s, bool reset, bool logValue = false);
+// Frame generation's evaluate-time block. See NgxSetDlssgEval.
+void NgxSetDlssgEval(NgxSnippet& s, bool reset, unsigned int frameIndex = 1);
 // The one strength the model reads at evaluate rather than at create, so it follows the setting
 // without a rebuild. The others were removed from this interface deliberately: writing them here did
 // nothing at all, which is what made every one of them look like a control that was simply ignored.
