@@ -746,7 +746,7 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->editBlurMilli.store(0);
     h->publishStride.store(0);
     h->motionSmoothPercent.store(100);
-    h->colourTrustPercent.store(100);
+    h->colourTrustPercent.store(200);
     h->ratioSmoothPercent.store(100);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {

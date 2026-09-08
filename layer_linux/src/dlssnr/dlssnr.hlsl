@@ -1496,14 +1496,32 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // Measured on a game frame: the pass moved colour balance three to five times more at edges than
     // on flat pixels, and every bit of it came from this blend. Under it the ringing is gone with the
     // luminance detail untouched, because that lives in boundedRatio and not here.
-    const float chromaSwing = length(upgraded - lumaOnly) / max(dot(lumaOnly, kLuma), 1e-4);
-    const float kAgree = 0.05;   // the two want much the same colour: take all of it
-    const float kDiffer = 0.25;  // they plainly disagree: keep the frame's own hue
-    // Softened by the control, so the gate can be taken out of the picture without also giving up the
-    // colour strength it multiplies. At 1 this is the gate as measured; at 0 the model's colour is
-    // taken everywhere, which is what it did before the gate existed.
-    const float colourTrust = lerp(1.0, saturate((kDiffer - chromaSwing) / (kDiffer - kAgree)),
-                                   saturate(gColourTrust));
+    // How far the composed colour sits from the frame's own, at matched luminance -- the guard above
+    // bound the two together -- so this is a pure colour difference and nothing to do with brightness.
+    const float3 colourDev = upgraded - lumaOnly;
+    const float chromaSwing = length(colourDev) / max(dot(lumaOnly, kLuma), 1e-4);
+
+    // Bound that difference rather than switching it off. The switch was backwards.
+    //
+    // It faded the model's colour to nothing as disagreement grew: all of it below a swing of 0.05,
+    // none at all above 0.25. The reasoning was sound as far as it went -- the model disagrees most
+    // at edges, and taking its hue whole there put one colour on one side of an edge and its
+    // complement on the other. What it missed is that a large disagreement is also exactly what a
+    // real colour correction looks like. So the rule discarded the model's verdict precisely where it
+    // had one, and the bigger the correction the more completely it went.
+    //
+    // Measured on a ceiling strip light: the game's own glow is blue, the model corrects it to white,
+    // the swing is 1.82, and the gate handed back the game's blue untouched. Composing made that
+    // light bluer than not composing at all, which is the opposite of what the pass is for.
+    //
+    // A bound keeps what the gate was protecting and drops what it was breaking. A correction of
+    // ordinary size passes whole, so the light comes back white. Fringing, which is larger still, is
+    // capped -- and capped without inverting, because the direction is kept and only the length is
+    // limited. More disagreement can no longer mean less colour, only the same amount of it.
+    const float colourBand = max(gColourTrust, 0.0);
+    const float colourAllow = colourBand <= 0.0
+                                  ? 0.0
+                                  : min(1.0, colourBand / max(chromaSwing, 1e-6));
 
     // Below a few code values the model's hue is quantisation, not information.
     //
@@ -1533,7 +1551,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     const float hueTrust = gHdrProxy != 0 ? 1.0
                                           : smoothstep(0.0, kQuantFloor, dot(modelDirect, kLuma));
 
-    float3 result = lerp(lumaOnly, upgraded, min(gColourStrength, 1.0) * colourTrust * hueTrust);
+    float3 result = lerp(lumaOnly, lumaOnly + colourDev * colourAllow,
+                         min(gColourStrength, 1.0) * hueTrust);
 
     if (gColourStrength > 1.0)
         result = ClampAp1(FromOkLab(float3(1.0, gColourStrength, gColourStrength) * ToOkLab(max(result, 0.0))));

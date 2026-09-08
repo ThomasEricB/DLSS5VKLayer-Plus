@@ -908,6 +908,21 @@ QWidget* MainWindow::buildSettings() {
                                             0.0, 4.0, 0.05,
                                             "How much of the model's color comes with its light. At "
                                             "zero the frame keeps the game's hue exactly.");
+        compositionRows << binder->AddInt(f, "Color bound (%)", &ShmHeader::colourTrustPercent,
+                       0, 800,
+                       "How far the model may move a pixel's color away from the game's own.\n\n"
+                       "The model disagrees about color most at edges, and taking its hue whole "
+                       "there can put one color on one side of an edge and its complement on the "
+                       "other. But a large disagreement is also what a real correction looks like -- "
+                       "a strip light the game glows blue and the model returns white -- so a rule "
+                       "that backs off as disagreement grows throws away the verdict exactly where "
+                       "there is one.\n\nThis bounds the move instead of refusing it. A correction "
+                       "of ordinary size passes through whole; anything several times larger is "
+                       "capped, keeping its direction and losing only its length, so it can never "
+                       "invert.\n\n200 is the default. Lower it if colored fringes appear along "
+                       "high-contrast edges; 0 keeps the game's hue exactly, which is the same as "
+                       "setting Color strength to 0.",
+                       ShmBinder::Live);
         compositionRows << binder->AddInt(f, "Smooth the relighting (%)", &ShmHeader::ratioSmoothPercent,
                        0, 100,
                        "What lets the Highlight guard be raised without the picture going patchy.\n\n"
