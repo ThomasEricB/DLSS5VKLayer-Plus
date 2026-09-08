@@ -284,6 +284,14 @@ struct VkCtx {
 
 static uint32_t FindMemoryType(VkCtx& c, uint32_t bits, VkMemoryPropertyFlags want);
 static void DestroyImage2D(VkCtx& c, GpuImage& img);
+// Frame generation runs only when asked for. DLSSNR_MFG=1.
+static bool MfgEnabled() {
+    static const bool v = [] {
+        const char* e = getenv("DLSSNR_MFG");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
 static void FillResource(NVSDK_NGX_Resource_VK& r, GpuImage& img, bool rw);
 static uint32_t FindHostMemoryType(VkCtx& c, uint32_t bits, bool preferCached);
 static bool CreateStaging(VkCtx& c, size_t bytes);
@@ -1170,6 +1178,16 @@ struct NeuralState {
     // a pass must read the previous pass's answer while writing its own: with a single surface the
     // model would be reading and writing the same image.
     GpuImage colorIn{}, workA{}, workB{}, mv{}, depth{};
+    // Frame generation, alongside the denoiser rather than instead of it.
+    //
+    // Driven on the frame path, once per answer, because that is where the colour is the answer the
+    // model just produced and the motion field is the one NVOF just wrote. Run during a feature
+    // rebuild instead -- which is where it started -- and both are whatever happened to be left in
+    // them, which is how an evaluate can succeed and write nothing.
+    NgxSnippet fg{};
+    GpuImage fgInterp{}, fgReal{};
+    bool fgReady = false;
+    uint32_t fgFrames = 0;
     // Where the chain lands before it leaves. The passes run at higher precision than the
     // transport, so the last one is brought down to the transport's format here, once.
     GpuImage colorOut{};
@@ -2863,6 +2881,88 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     ns.mvecResetPending = false;
     ns.firstFrame = false;
     const double tEval = time ? NowMs() : 0.0;
+
+    // Generate between consecutive answers.
+    //
+    // The two pictures frame generation sits between are this answer and the one before it, and it
+    // keeps the previous one itself -- so this is evaluated once per answer and the history builds up
+    // on its own. Both are already in the past, which is what makes this possible at all here: the
+    // pipelined path's answers arrive late, and interpolating between two late answers needs no
+    // future frame and adds no latency of its own.
+    if (MfgEnabled() && last) {
+        if (!ns.fgReady && !ns.fg.disabled) {
+            if (CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.fgInterp) &&
+                CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.fgReal) &&
+                BeginCmd(ns.vk.cmdCreate)) {
+                ns.fg.snippetName = L"nvngx_dlssg.dll";
+                ns.fg.featureId = 11;
+                NgxTuning t{};
+                ns.fgReady = NgxLoadAndInit(ns.fg, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h,
+                                            ns.vk.cmdCreate, t);
+                SubmitAndWait(ns.vk, ns.vk.cmdCreate);
+                Log("[mfg] frame generation %s at %ux%u", ns.fgReady ? "ready" : "unavailable", w, h);
+            }
+        }
+        if (ns.fgReady && ns.fg.features[0] && BeginCmd(ns.vk.cmdEval)) {
+            TransitionImage(ns.vk, ns.vk.cmdEval, ns.fgInterp, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_ACCESS_MEMORY_READ_BIT,
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            TransitionImage(ns.vk, ns.vk.cmdEval, ns.fgReal, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_ACCESS_MEMORY_READ_BIT,
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            NVSDK_NGX_Resource_VK rBack{}, rMv{}, rDepth{}, rInterp{}, rReal{};
+            FillResource(rBack, *last, false);
+            FillResource(rMv, ns.mv, false);
+            FillResource(rDepth, ns.depth, false);
+            FillResource(rInterp, ns.fgInterp, true);
+            FillResource(rReal, ns.fgReal, true);
+            // Reset only on the first answer: after that the history is the point.
+            NgxSetDlssgEval(ns.fg, ns.fgFrames == 0, 1);
+            NgxSetDlssgResources(ns.fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, 60u);
+            const bool ok = NgxEvaluatePass(ns.fg, 0, ns.vk.cmdEval);
+            SubmitAndWait(ns.vk, ns.vk.cmdEval);
+            ++ns.fgFrames;
+
+            // What came out, every so often. The surface reads as the zeros it was created with
+            // until something writes it, so this says whether a frame exists rather than whether a
+            // call returned.
+            if (ok && (ns.fgFrames % 60) == 0) {
+                const size_t fgBytes = size_t(w) * size_t(h) * 4;
+                if (ReadbackPixels(ns.vk, ns.fgInterp, fgBytes) && ns.vk.readMap) {
+                    const unsigned char* px = (const unsigned char*)ns.vk.readMap;
+                    unsigned long long sum = 0, nonzero = 0;
+                    for (size_t i = 0; i < fgBytes; i += 4) {
+                        const unsigned v = px[i] + px[i + 1] + px[i + 2];
+                        sum += v;
+                        if (v) ++nonzero;
+                    }
+                    const size_t pixels = fgBytes / 4;
+                    Log("[mfg] answer %u: interpolated %.1f%% non-zero, mean channel %.1f",
+                        ns.fgFrames, 100.0 * double(nonzero) / double(pixels),
+                        double(sum) / double(pixels) / 3.0);
+                    // And the other surface. If the real frame comes through while the interpolated
+                    // one stays empty, the model is passing the picture along without generating;
+                    // if both are empty it is not writing at all.
+                    if (ReadbackPixels(ns.vk, ns.fgReal, fgBytes) && ns.vk.readMap) {
+                        const unsigned char* q = (const unsigned char*)ns.vk.readMap;
+                        unsigned long long s2 = 0, nz2 = 0;
+                        for (size_t i = 0; i < fgBytes; i += 4) {
+                            const unsigned v = q[i] + q[i + 1] + q[i + 2];
+                            s2 += v;
+                            if (v) ++nz2;
+                        }
+                        Log("[mfg] answer %u: real         %.1f%% non-zero, mean channel %.1f",
+                            ns.fgFrames, 100.0 * double(nz2) / double(pixels),
+                            double(s2) / double(pixels) / 3.0);
+                    }
+                }
+            } else if (!ok) {
+                Log("[mfg] evaluate failed on answer %u", ns.fgFrames);
+            }
+        }
+    }
 
     if (!last) return false;
 

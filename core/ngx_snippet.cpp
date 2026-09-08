@@ -898,7 +898,11 @@ void NgxSetDlssgResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK* backbuffer
     ParamSetUI(s.params, "DLSSG.TargetFrameRate", targetFrameRate, &seh);
     // Not running under Streamline: this helper drives the snippet directly, the same way it drives
     // the denoiser. Saying zero is the truthful answer rather than impersonating an interposer.
-    ParamSetUI(s.params, "DLSSG.StreamlineMode", 0u, &seh);
+    static const unsigned int slMode = [] {
+        const char* v = getenv("DLSSNR_MFG_SLMODE");
+        return (unsigned int)(v && *v ? atoi(v) : 0);
+    }();
+    ParamSetUI(s.params, "DLSSG.StreamlineMode", slMode, &seh);
     ParamSetUI(s.params, "DLSSG.StreamlineVersionTag", 0u, &seh);
     // Interpolation is the whole point, so it is not disabled.
     ParamSetUI(s.params, "DLSSG.OutputDisableInterpolation", 0u, &seh);
