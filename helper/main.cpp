@@ -2311,6 +2311,32 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
 
     if (!BeginCmd(ns.vk.cmdCreate)) return false;
     bool ok = NgxLoadAndInit(ns.ngx, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h, ns.vk.cmdCreate, first);
+
+    // Frame generation, probed rather than assumed.
+    //
+    // nvngx_dlssg.dll exports the same Vulkan surface as the denoiser snippet -- Init_Ext,
+    // CreateFeature, EvaluateFeature, ReleaseFeature -- so the loader above can carry it unchanged,
+    // and feature 11 is FrameGeneration. What is not known is whether the snippet will build that
+    // feature against this device, off a Wine process, with no depth buffer and estimated motion.
+    // Nothing downstream is worth writing until that question has an answer, so this asks it and
+    // reports, and does nothing else. DLSSNR_MFG_PROBE=1 to run it.
+    static const bool probeMfg = [] {
+        const char* v = getenv("DLSSNR_MFG_PROBE");
+        return v && v[0] == '1';
+    }();
+    if (probeMfg && ok) {
+        NgxSnippet fg{};
+        fg.snippetName = L"nvngx_dlssg.dll";
+        fg.featureId = 11;  // NVSDK_NGX_Feature_FrameGeneration
+        Log("[mfg] probing frame generation: loading %ls for feature %u at %ux%u",
+            fg.snippetName, fg.featureId, w, h);
+        const bool fgOk = NgxLoadAndInit(fg, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h,
+                                         ns.vk.cmdCreate, first);
+        Log("[mfg] probe result: init+create %s (disabled=%d createFailed=%d handle=%p)",
+            fgOk ? "SUCCEEDED" : "failed", int(fg.disabled), int(fg.createFailed),
+            (void*)fg.features[0]);
+        NgxTeardown(fg, ns.vk.device);
+    }
     if (!SubmitAndWait(ns.vk, ns.vk.cmdCreate) || !ok) {
         // Two different failures wearing one face, until now.
         //

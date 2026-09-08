@@ -194,10 +194,10 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     if (s.binDir.empty()) { Log("[ngx] nvngx_dlssnr.dll not found (set DLSSNR_BIN_DIR)"); s.disabled = true; return false; }
     Log("[ngx] bin dir: %ls", s.binDir.c_str());
 
-    s.snippet = LoadLibraryExW((s.binDir + L"\\nvngx_dlssnr.dll").c_str(), nullptr,
+    s.snippet = LoadLibraryExW((s.binDir + L"\\" + s.snippetName).c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!s.snippet) { Log("[ngx] LoadLibrary nvngx_dlssnr.dll failed (%lu)", GetLastError()); s.disabled = true; return false; }
-    Log("[ngx] nvngx_dlssnr.dll loaded at %p", (void*)s.snippet);
+    if (!s.snippet) { Log("[ngx] LoadLibrary %ls failed (%lu)", s.snippetName, GetLastError()); s.disabled = true; return false; }
+    Log("[ngx] %ls loaded at %p", s.snippetName, (void*)s.snippet);
     RegisterPeRange("nvngx_dlssnr.dll", s.snippet);
 
     s.initExt = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init_Ext"));
@@ -508,11 +508,11 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
     DWORD seh = 0;
     const auto t0 = std::chrono::steady_clock::now();
     NVSDK_NGX_Result createResult = CallCreateSafely(s.createFeature, recordingCmd,
-        FEATURE_DLSSNR, s.params, &s.features[pass], &seh);
+        s.featureId, s.params, &s.features[pass], &seh);
     const double ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
-    Log("[ngx] VULKAN_CreateFeature(18) pass %u -> %#x seh=%#x handle=%p size=%ux%u in %.0f ms",
-        pass, (uint32_t)createResult, seh, (void*)s.features[pass], width, height, ms);
+    Log("[ngx] VULKAN_CreateFeature(%u) pass %u -> %#x seh=%#x handle=%p size=%ux%u in %.0f ms",
+        s.featureId, pass, (uint32_t)createResult, seh, (void*)s.features[pass], width, height, ms);
     if (!NVSDK_NGX_SUCCEED(createResult) || !s.features[pass]) {
         s.features[pass] = nullptr;
         // Only the first pass failing leaves the feature unusable, and even then it is not the end of

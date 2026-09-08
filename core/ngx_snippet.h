@@ -11,6 +11,15 @@ namespace dlssnr {
 // core (nvngx.dll) init, parameter block, Feature 18 create/evaluate/teardown.
 // All NGX calls are SEH-guarded; any failure latches `disabled` (pass-through).
 struct NgxSnippet {
+    // Which snippet this instance owns, and which NGX feature it builds.
+    //
+    // Defaulted to the denoiser so every existing caller is unchanged. They are fields rather than
+    // constants because nvngx_dlssg.dll exports the same Vulkan surface -- Init_Ext, CreateFeature,
+    // EvaluateFeature, ReleaseFeature -- so the whole loader, including the caller-identity spoof the
+    // snippets check for, works for frame generation without being written twice.
+    const wchar_t* snippetName = L"nvngx_dlssnr.dll";
+    unsigned int featureId = FEATURE_DLSSNR;
+
     HMODULE snippet = nullptr;
     HMODULE core = nullptr;
     HMODULE nvapi = nullptr;
