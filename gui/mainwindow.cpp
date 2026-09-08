@@ -1339,16 +1339,20 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
 
         compositionRows << binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.0, 30.0,
                                             0.5,
-                                            "The most the pass may brighten or darken a pixel. A "
-                                            "detail pass has no business restyling a light source, "
-                                            "whatever the model returns.\n\nOn Classic and Matched "
-                                            "residual this bounds a per-pixel luminance ratio, so "
-                                            "raising it lets more of that ratio's pixel-to-pixel "
-                                            "variation through and detailed surfaces can go patchy. "
-                                            "If you want a high guard without that, set \"How the "
-                                            "answer is applied\" to Native + edit, which adds the "
-                                            "model's difference instead of dividing by the frame and "
-                                            "so has no ratio to amplify.");
+                                            "How far the pass may move the light. A detail pass has "
+                                            "no business restyling a light source, whatever the "
+                                            "model returns.\n\nThis sets how far the light over a "
+                                            "pixel's neighbourhood may move, which is the relighting "
+                                            "you are asking for when you raise it. How far a single "
+                                            "pixel may then depart from its own neighbourhood is a "
+                                            "separate, fixed bound that does not move with this -- "
+                                            "so raising the guard buys range without buying speckle. "
+                                            "It used to be one number doing both jobs, and at a high "
+                                            "setting the per-pixel half stopped bounding anything, "
+                                            "which is what put blown and black pixels on detailed "
+                                            "surfaces.\n\nDetail is a pixel differing from its "
+                                            "neighbours by tens of percent. A blowout is one "
+                                            "differing by multiples. Only the second is refused.");
         compositionRows << binder->AddChoice(f, "How the answer is applied", &ShmHeader::transfer,
                                              { "Classic", "Matched residual", "Native + edit" },
                                              "How a model that worked at a different size from the "
