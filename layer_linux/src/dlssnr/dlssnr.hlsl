@@ -38,6 +38,7 @@ cbuffer Params : register(b0)
                            //    white point -- no knee, no sRGB, no ceiling. Off is the SDR path.
     uint  gHdrTransfer;    // 1 with gHdrProxy: the swapchain carries PQ (ST 2084), so the frame is
                            //    PQ-decoded on the way in and PQ-encoded on the way out.
+    float gColourTrust;    // how much of the chroma-agreement gate to apply, 0..1
 
 };
 
@@ -1411,7 +1412,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     const float chromaSwing = length(upgraded - lumaOnly) / max(dot(lumaOnly, kLuma), 1e-4);
     const float kAgree = 0.05;   // the two want much the same colour: take all of it
     const float kDiffer = 0.25;  // they plainly disagree: keep the frame's own hue
-    const float colourTrust = saturate((kDiffer - chromaSwing) / (kDiffer - kAgree));
+    // Softened by the control, so the gate can be taken out of the picture without also giving up the
+    // colour strength it multiplies. At 1 this is the gate as measured; at 0 the model's colour is
+    // taken everywhere, which is what it did before the gate existed.
+    const float colourTrust = lerp(1.0, saturate((kDiffer - chromaSwing) / (kDiffer - kAgree)),
+                                   saturate(gColourTrust));
 
     float3 result = lerp(lumaOnly, upgraded, min(gColourStrength, 1.0) * colourTrust);
 

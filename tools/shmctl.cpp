@@ -59,6 +59,8 @@ const Setting kSettings[] = {
       "how fast the pipelined edit walks toward a new answer, 0-100 (100 = take it whole)" },
     { "ghostslack", &ShmHeader::ghostSlackPercent, false,
       "how far past its neighbours a pipelined pixel may land, in hundredths (0 = pinned, 50 default)" },
+    { "colourtrust", &ShmHeader::colourTrustPercent, false,
+      "how much of the chroma-agreement gate to apply, 0-100 (0 = take the model's colour everywhere)" },
     { "smooth", &ShmHeader::motionSmoothPercent, false,
       "how hard the measured displacement is filtered over time, 0-100 (0 = raw, 100 default)" },
     { "gap", &ShmHeader::publishStride, false,

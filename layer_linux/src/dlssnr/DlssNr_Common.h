@@ -214,6 +214,9 @@ struct alignas(256) DlssNrConstants
     uint32_t HdrProxy;
     uint32_t HdrTransfer;
 
+    // How much of the chroma-agreement gate to apply, 0..1. See colourTrustPercent.
+    float ColourTrust;
+
 };
 
 class DlssNr_Common

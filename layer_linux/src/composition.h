@@ -78,6 +78,9 @@ struct FrameSettings {
     // How hard the displacement estimate is filtered over time. See motionSmoothPercent.
     float motionSmooth = 1.0f;
 
+    // How much of the chroma-agreement gate to apply. See colourTrustPercent.
+    float colourTrust = 1.0f;
+
     static FrameSettings Read(const ShmHeader* h);
 };
 

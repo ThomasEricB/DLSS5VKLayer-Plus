@@ -38,7 +38,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // decision are carried here. From this branch: the pipelined path's settle, ghost bound, edit split
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 16;
+static constexpr uint32_t kShmVersion = 17;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 // Eight bytes a pixel: the float16 proxy needs them, and the 8-bit path simply uses the first half of
@@ -593,6 +593,21 @@ struct ShmHeader {
     // 0.37 with this at 100, and the estimate tracks the true speed instead of stepping 0, 1, 3, 4
     // pixels at a time to average it.
     std::atomic<uint32_t> motionSmoothPercent;
+
+    // How much of the chroma-agreement gate to apply, in hundredths. 100 is the gate as written; 0
+    // switches it off and takes the model's colour everywhere.
+    //
+    // The gate exists because the model's colour disagrees with the frame's most at edges -- an edge
+    // being precisely what it was asked to re-decide -- and taking that hue whole put one colour on
+    // one side of an edge and its complement on the other. Measured, the pass moved colour balance
+    // three to five times more at edges than on flat pixels.
+    //
+    // The cost of it is that where the gate closes, the composed pixel falls back to the frame's own
+    // colour scaled by one luminance ratio -- so on a detailed frame the model's chroma detail is
+    // dropped exactly where the model had most to say. That is a real part of "composition only ever
+    // removes detail", and it was never separable from the colour strength control, because the gate
+    // multiplies that control rather than being one.
+    std::atomic<uint32_t> colourTrustPercent;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -720,6 +735,7 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->editBlurMilli.store(0);
     h->publishStride.store(0);
     h->motionSmoothPercent.store(100);
+    h->colourTrustPercent.store(100);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);
