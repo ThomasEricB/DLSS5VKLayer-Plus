@@ -960,7 +960,8 @@ void NgxSetSharpness(NgxSnippet& s, float sharpness) {
 void NgxSetDlssgResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK* backbuffer,
                           const NVSDK_NGX_Resource_VK* mvec, const NVSDK_NGX_Resource_VK* depth,
                           const NVSDK_NGX_Resource_VK* outInterpolated,
-                          const NVSDK_NGX_Resource_VK* outReal, unsigned int targetFrameRate) {
+                          const NVSDK_NGX_Resource_VK* outReal, unsigned int targetFrameRate,
+                          const NVSDK_NGX_Resource_VK* ui) {
     if (!s.params) return;
     DWORD seh = 0;
     s.params->Set("DLSSG.Backbuffer", (void*)backbuffer);
@@ -976,8 +977,9 @@ void NgxSetDlssgResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK* backbuffer
     // is true, at the cost of the model treating the HUD as scene content -- the thing a real
     // HUDLess input exists to avoid.
     s.params->Set("DLSSG.HUDLess", (void*)backbuffer);
-    s.params->Set("DLSSG.UI", (void*)nullptr);
-    s.params->Set("DLSSG.UIAlpha", (void*)nullptr);
+    // Bound rather than null: DLSS-G lists UIColorAndAlpha as required and this was absent.
+    s.params->Set("DLSSG.UI", (void*)ui);
+    s.params->Set("DLSSG.UIAlpha", (void*)ui);
     s.params->Set("DLSSG.BidirectionalDistortionField", (void*)nullptr);
     s.params->Set("DLSSG.NoWarp", (void*)nullptr);
 

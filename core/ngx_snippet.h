@@ -139,7 +139,8 @@ void NgxSetDlssgEval(NgxSnippet& s, bool reset, unsigned int frameIndex = 1);
 void NgxSetDlssgResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK* backbuffer,
                           const NVSDK_NGX_Resource_VK* mvec, const NVSDK_NGX_Resource_VK* depth,
                           const NVSDK_NGX_Resource_VK* outInterpolated,
-                          const NVSDK_NGX_Resource_VK* outReal, unsigned int targetFrameRate);
+                          const NVSDK_NGX_Resource_VK* outReal, unsigned int targetFrameRate,
+                          const NVSDK_NGX_Resource_VK* ui = nullptr);
 // The one strength the model reads at evaluate rather than at create, so it follows the setting
 // without a rebuild. The others were removed from this interface deliberately: writing them here did
 // nothing at all, which is what made every one of them look like a control that was simply ignored.

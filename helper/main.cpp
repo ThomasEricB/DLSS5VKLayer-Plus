@@ -1185,7 +1185,7 @@ struct NeuralState {
     // rebuild instead -- which is where it started -- and both are whatever happened to be left in
     // them, which is how an evaluate can succeed and write nothing.
     NgxSnippet fg{};
-    GpuImage fgInterp{}, fgReal{};
+    GpuImage fgInterp{}, fgReal{}, fgUi{}, fgDepth{};
     bool fgReady = false;
     uint32_t fgFrames = 0;
     // Where the chain lands before it leaves. The passes run at higher precision than the
@@ -2253,6 +2253,8 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     DestroyOpticalFlow(ns.vk, ns.flow);
     DestroyImage2D(ns.vk, ns.colorIn);
     DestroyImage2D(ns.vk, ns.colorOut);
+    DestroyImage2D(ns.vk, ns.fgUi);
+    DestroyImage2D(ns.vk, ns.fgDepth);
     DestroyImage2D(ns.vk, ns.workA);
     DestroyImage2D(ns.vk, ns.workB);
     DestroyImage2D(ns.vk, ns.mv);
@@ -2302,8 +2304,34 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
         Log("[helper] estimated motion vectors unavailable; falling back to a zero field");
 
     std::vector<uint8_t> zeros(size_t(w) * h * 4, 0);
-    if (!UploadPixels(ns.vk, ns.mv, zeros.data(), zeros.size()) ||
-        !UploadPixels(ns.vk, ns.depth, zeros.data(), zeros.size())) return false;
+    if (!UploadPixels(ns.vk, ns.mv, zeros.data(), zeros.size())) return false;
+
+    if (!UploadPixels(ns.vk, ns.depth, zeros.data(), zeros.size())) return false;
+
+    // A depth plane for frame generation only, on its own image.
+    //
+    // Frame generation lists depth as required and this process has none, so what it is given is a
+    // statement rather than a measurement: every pixel the same distance away. A mid-range constant
+    // says "one plane, no parallax", which is what a layer with no depth can honestly offer and is
+    // consistent with the identity matrices alongside it.
+    //
+    // Its own image, because the denoiser is handed ns.depth on every evaluate and has been shown a
+    // field of zeros for its entire life. Writing a plane into the shared image to satisfy frame
+    // generation would quietly change what the model that actually works is being told.
+    if (CreateImage2D(ns.vk, VK_FORMAT_R32_SFLOAT, w, h, ns.fgDepth)) {
+        std::vector<float> plane(size_t(w) * h, 0.5f);
+        if (!UploadPixels(ns.vk, ns.fgDepth, plane.data(), plane.size() * sizeof(float))) return false;
+    }
+
+    // A transparent interface layer, which is the truthful version of "there is no separate UI".
+    //
+    // This one was not a lie at all before, it was absent: DLSS-G requires UIColorAndAlpha and the
+    // contract bound null. Alpha zero everywhere says the interface contributes nothing, which is
+    // the right thing to say when the interface is already inside the colour and cannot be
+    // separated out again.
+    if (CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.fgUi)) {
+        if (!UploadPixels(ns.vk, ns.fgUi, zeros.data(), zeros.size())) return false;
+    }
 
     if (!BeginCmd(ns.vk.cmdScratch)) return false;
     TransitionImage(ns.vk, ns.vk.cmdScratch, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -2386,7 +2414,7 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
                 NVSDK_NGX_Resource_VK rBack{}, rMv{}, rDepth{}, rInterp{}, rReal{};
                 FillResource(rBack, ns.colorIn, false);
                 FillResource(rMv, ns.mv, false);
-                FillResource(rDepth, ns.depth, false);
+                FillResource(rDepth, ns.fgDepth.image ? ns.fgDepth : ns.depth, false);
                 FillResource(rInterp, outInterp, true);
                 FillResource(rReal, outReal, true);
 
@@ -2912,7 +2940,8 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
                             VK_ACCESS_MEMORY_READ_BIT,
                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            NVSDK_NGX_Resource_VK rBack{}, rMv{}, rDepth{}, rInterp{}, rReal{};
+            NVSDK_NGX_Resource_VK rBack{}, rMv{}, rDepth{}, rInterp{}, rReal{}, rUi{};
+            if (ns.fgUi.image) FillResource(rUi, ns.fgUi, false);
             FillResource(rBack, *last, false);
             FillResource(rMv, ns.mv, false);
             FillResource(rDepth, ns.depth, false);
@@ -2932,7 +2961,8 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
                 const char* v = getenv("DLSSNR_MFG_TARGET_FPS");
                 return (unsigned int)(v && *v ? atoi(v) : 60);
             }();
-            NgxSetDlssgResources(ns.fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, targetFps);
+            NgxSetDlssgResources(ns.fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, targetFps,
+                                 ns.fgUi.image ? &rUi : nullptr);
             NgxDlssgQuerySettings(ns.fg);
             const bool ok = NgxEvaluatePass(ns.fg, 0, ns.vk.cmdEval);
             SubmitAndWait(ns.vk, ns.vk.cmdEval);
