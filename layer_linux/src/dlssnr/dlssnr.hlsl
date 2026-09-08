@@ -1418,7 +1418,35 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     const float colourTrust = lerp(1.0, saturate((kDiffer - chromaSwing) / (kDiffer - kAgree)),
                                    saturate(gColourTrust));
 
-    float3 result = lerp(lumaOnly, upgraded, min(gColourStrength, 1.0) * colourTrust);
+    // Below a few code values the model's hue is quantisation, not information.
+    //
+    // The answer crosses as 8-bit. In a near-black region that leaves two or three levels, so the
+    // *hue* of such a pixel is decided by which channel happened to round up. The composition then
+    // reads that hue as the model's verdict and amplifies it: the ratio is (modelLuma + headroom) /
+    // modelLuma, which on a near-black pixel runs to a hundred and more, and the guard that follows
+    // bounds luminance only -- deliberately, one scalar over the whole triple, so that a bound cannot
+    // shift hue. The result is that the meaningless hue is preserved exactly and lifted to the
+    // frame's own brightness.
+    //
+    // Simulated on this path with real 8-bit inputs: a model pixel of (0,0,1) composes to
+    // (0, 0, 0.694) -- one least significant bit of blue becomes a saturated blue pixel -- and
+    // (1,0,1) composes to (0.176, 0, 0.176), which is magenta. That is the dead blue, red and
+    // magenta speckle, it is why it sits only on dark detailed content, and it is why it disappears
+    // when the composition is bypassed: presented directly, (0,0,1) is simply a black pixel. It reads
+    // as blocks rather than speckle because above a working scale of 1 the model's raster is filtered
+    // down, so neighbouring output pixels share the same few codes.
+    //
+    // So the model's colour is trusted in proportion to how much light it actually reported, and
+    // below the noise floor the frame's own hue is used instead. Measured against the same
+    // simulation: codes 0 to 5 collapse to the frame's colour and codes of 12 and above come out bit
+    // identical, so this cannot touch content the model had a real opinion about.
+    //
+    // Only where the transport quantises. A float16 proxy has no such floor and needs no guard.
+    const float kQuantFloor = 0.0018;  // SrgbToLinear(6/255), in the same normalised units as model
+    const float hueTrust = gHdrProxy != 0 ? 1.0
+                                          : smoothstep(0.0, kQuantFloor, dot(modelDirect, kLuma));
+
+    float3 result = lerp(lumaOnly, upgraded, min(gColourStrength, 1.0) * colourTrust * hueTrust);
 
     if (gColourStrength > 1.0)
         result = ClampAp1(FromOkLab(float3(1.0, gColourStrength, gColourStrength) * ToOkLab(max(result, 0.0))));
