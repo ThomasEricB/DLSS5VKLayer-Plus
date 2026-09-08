@@ -1444,9 +1444,15 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "Soft knee is the default and the two replace modes are known to flash on "
                           "bright lights.");
         binder->AddChoice(f, "Debug view", &ShmHeader::debugView,
-                          { "Off", "The picture the model saw", "Its raw answer", "What it changed" },
-                          "The last one is amplified and centred on grey, so both directions of the "
-                          "edit are visible at once.");
+                          { "Off", "The picture the model saw", "Its raw answer", "What it changed",
+                            "Where the color bound engages", "The color before the bound" },
+                          "\"What it changed\" is amplified and centred on grey, so both directions "
+                          "of the edit are visible at once.\n\n\"Where the color bound engages\" is "
+                          "green where the model's color passes whole and red where it is held back. "
+                          "It puts a wrong color on one side or the other of that line: green means "
+                          "the bound is not engaging and the fault is upstream; red means the bound "
+                          "is working and the color is coming from the frame's own hue times one "
+                          "scalar, which makes it a brightness problem rather than a color one.");
         binder->AddFloat(f, "Debug scale", &ShmHeader::debugScaleBits, 0.01, 100.0, 0.1,
                          "What the debug views are multiplied by on their way out.");
         binder->AddChoice(f, "Compare", &ShmHeader::compareMode, { "Off", "Side by side", "Wipe" },
