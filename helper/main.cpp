@@ -284,6 +284,7 @@ struct VkCtx {
 
 static uint32_t FindMemoryType(VkCtx& c, uint32_t bits, VkMemoryPropertyFlags want);
 static void DestroyImage2D(VkCtx& c, GpuImage& img);
+static void FillResource(NVSDK_NGX_Resource_VK& r, GpuImage& img, bool rw);
 static uint32_t FindHostMemoryType(VkCtx& c, uint32_t bits, bool preferCached);
 static bool CreateStaging(VkCtx& c, size_t bytes);
 static float HalfToFloat(uint16_t h);
@@ -2344,13 +2345,42 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
         // trick that turned the create refusal into a handle, and it is cheaper than guessing at
         // header names nobody here has.
         if (fgOk && fg.features[0]) {
-            if (BeginCmd(ns.vk.cmdEval)) {
-                Log("[mfg] evaluating once to discover the resource contract");
-                NgxSetDlssgEval(fg, true);
+            // The two surfaces frame generation writes: the interpolated frame and the real one
+            // passed through. Created here rather than reused from the denoiser's chain because the
+            // model writes them, and nothing else in this process owns a writable pair at this size.
+            GpuImage outInterp{}, outReal{};
+            const bool madeOut = CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, outInterp) &&
+                                 CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, outReal);
+            if (!madeOut) Log("[mfg] could not create the output surfaces");
+
+            if (madeOut && BeginCmd(ns.vk.cmdEval)) {
+                TransitionImage(ns.vk, ns.vk.cmdEval, outInterp, VK_IMAGE_LAYOUT_GENERAL,
+                                VK_ACCESS_MEMORY_READ_BIT,
+                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                TransitionImage(ns.vk, ns.vk.cmdEval, outReal, VK_IMAGE_LAYOUT_GENERAL,
+                                VK_ACCESS_MEMORY_READ_BIT,
+                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+                NVSDK_NGX_Resource_VK rBack{}, rMv{}, rDepth{}, rInterp{}, rReal{};
+                FillResource(rBack, ns.colorIn, false);
+                FillResource(rMv, ns.mv, false);
+                FillResource(rDepth, ns.depth, false);
+                FillResource(rInterp, outInterp, true);
+                FillResource(rReal, outReal, true);
+
+                Log("[mfg] evaluating with resources bound");
+                NgxSetDlssgEval(fg, true, 1);
+                NgxSetDlssgResources(fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, 60u);
                 const bool evOk = NgxEvaluatePass(fg, 0, ns.vk.cmdEval);
                 Log("[mfg] evaluate returned %s", evOk ? "ok" : "failed");
                 SubmitAndWait(ns.vk, ns.vk.cmdEval);
             }
+            DestroyImage2D(ns.vk, outInterp);
+            DestroyImage2D(ns.vk, outReal);
         }
         NgxTeardown(fg, ns.vk.device);
     }

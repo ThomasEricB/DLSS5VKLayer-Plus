@@ -543,9 +543,17 @@ static void ApplyDlssgContract(NgxSnippet& s, uint32_t width, uint32_t height) {
     // resource key, which taught nothing. The parameter object logs a miss on the pointer getter as
     // well as the scalar ones, so the way to learn the resource contract is to say everything is
     // there and read the list it comes back with. DLSSNR_MFG_CLAIM_ALL=0 restores the honest value.
+    // Zero, which is what makes evaluate succeed.
+    //
+    // All-ones was a discovery trick: at zero the DLL decided it had nothing and failed without
+    // naming a single resource, so claiming everything made it ask, and the list it asked for is the
+    // contract above. Kept as the claim, though, it then *demands* what it was promised -- UI,
+    // UIAlpha, the distortion field, none of which a swapchain-only layer has -- and returns
+    // MissingInput forever. Saying nothing is guaranteed lets it work with what is actually bound.
+    // DLSSNR_MFG_CLAIM_ALL=1 restores the trick for discovering keys on another snippet version.
     static const unsigned int provided = [] {
         const char* v = getenv("DLSSNR_MFG_CLAIM_ALL");
-        return (v && v[0] == '0') ? 0u : 0xFFFFFFFFu;
+        return (v && v[0] == '1') ? 0xFFFFFFFFu : 0u;
     }();
     ParamSetUI(s.params, "DLSSG.ResourceAlwaysProvidedFlags", provided, &seh);
     ParamSetUI(s.params, "DLSSG.ResourceNeverProvidedFlags", 0u, &seh);
@@ -851,6 +859,71 @@ void NgxSetSharpness(NgxSnippet& s, float sharpness) {
         ParamGetF(s.params, "Sharpness", &back, &seh);
         Log("[params] Sharpness=%.4f readback=%.4f (seh=%#x)", sharpness, back, seh);
     }
+}
+
+// Frame generation's resource block, and the three scalars that came with it.
+//
+// The names are the DLL's own, read out of the miss log once the contract survived its reset:
+// Backbuffer, MVecs, Depth, HUDLess, UI, UIAlpha, BidirectionalDistortionField, NoWarp,
+// OutputInterpolated, OutputReal.
+//
+// Four of those are bound and the rest are explicitly null. A swapchain-only layer sees the frame
+// with the HUD already composited into it, so there is no HUDLess colour to hand over and no UI
+// layer either -- saying so plainly is better than pointing them at the backbuffer and letting the
+// model treat the HUD as scene content.
+void NgxSetDlssgResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK* backbuffer,
+                          const NVSDK_NGX_Resource_VK* mvec, const NVSDK_NGX_Resource_VK* depth,
+                          const NVSDK_NGX_Resource_VK* outInterpolated,
+                          const NVSDK_NGX_Resource_VK* outReal, unsigned int targetFrameRate) {
+    if (!s.params) return;
+    DWORD seh = 0;
+    s.params->Set("DLSSG.Backbuffer", (void*)backbuffer);
+    s.params->Set("DLSSG.MVecs", (void*)mvec);
+    s.params->Set("DLSSG.Depth", (void*)depth);
+    s.params->Set("DLSSG.OutputInterpolated", (void*)outInterpolated);
+    s.params->Set("DLSSG.OutputReal", (void*)outReal);
+    // The frame is the only colour this process has, HUD and all.
+    //
+    // Null was the honest answer and it is not an accepted one: the flags above say every resource is
+    // provided, and the DLL keeps returning MissingInput while the pointer is absent. Pointing
+    // HUDLess at the backbuffer says "this is the picture, there is no separate HUD-less copy", which
+    // is true, at the cost of the model treating the HUD as scene content -- the thing a real
+    // HUDLess input exists to avoid.
+    s.params->Set("DLSSG.HUDLess", (void*)backbuffer);
+    s.params->Set("DLSSG.UI", (void*)nullptr);
+    s.params->Set("DLSSG.UIAlpha", (void*)nullptr);
+    s.params->Set("DLSSG.BidirectionalDistortionField", (void*)nullptr);
+    s.params->Set("DLSSG.NoWarp", (void*)nullptr);
+
+    ParamSetUI(s.params, "DLSSG.TargetFrameRate", targetFrameRate, &seh);
+    // Not running under Streamline: this helper drives the snippet directly, the same way it drives
+    // the denoiser. Saying zero is the truthful answer rather than impersonating an interposer.
+    ParamSetUI(s.params, "DLSSG.StreamlineMode", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.StreamlineVersionTag", 0u, &seh);
+    // Interpolation is the whole point, so it is not disabled.
+    ParamSetUI(s.params, "DLSSG.OutputDisableInterpolation", 0u, &seh);
+
+    // A subrect per resource, each the whole surface.
+    //
+    // Nothing here renders to a corner of a larger target, so every one of these is the full raster
+    // at the origin. They are written for the resources that are null as well as the bound ones,
+    // because the DLL reads the rectangle before it looks at the pointer.
+    static const char* const kSubrects[] = {
+        "InputBackbuffer", "Backbuffer", "MVecs", "Depth", "HUDLess", "UI", "UIAlpha",
+        "OutputInterpolated", "OutputReal", "BidirectionalDistortionField", "NoWarp",
+    };
+    for (const char* r : kSubrects) {
+        char key[128];
+        snprintf(key, sizeof(key), "DLSSG.%sSubrectBaseX", r);   ParamSetUI(s.params, key, 0u, &seh);
+        snprintf(key, sizeof(key), "DLSSG.%sSubrectBaseY", r);   ParamSetUI(s.params, key, 0u, &seh);
+        snprintf(key, sizeof(key), "DLSSG.%sSubrectWidth", r);   ParamSetUI(s.params, key, s.featureW, &seh);
+        snprintf(key, sizeof(key), "DLSSG.%sSubrectHeight", r);  ParamSetUI(s.params, key, s.featureH, &seh);
+    }
+
+    if (s.ownParams) static_cast<OwnParam*>(s.params)->Persist();
+    Log("[mfg] resources bound: backbuffer=%p mvec=%p depth=%p outInterp=%p outReal=%p targetFps=%u",
+        (const void*)backbuffer, (const void*)mvec, (const void*)depth,
+        (const void*)outInterpolated, (const void*)outReal, targetFrameRate);
 }
 
 bool NgxEvaluatePass(NgxSnippet& s, uint32_t pass, VkCommandBuffer recordingCmd) {
