@@ -2922,7 +2922,17 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
             ns.fg.fgSwapchainFormat = shm.hdr->swapchainFormat.load();
             ns.fg.fgPresentIndex = shm.hdr->presentIndex.load();
             NgxSetDlssgEval(ns.fg, ns.fgFrames == 0, 1);
-            NgxSetDlssgResources(ns.fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, 60u);
+            // What rate generation is being asked to reach.
+            //
+            // Hardcoded to 60 until now, which is very likely the wrong question: frame generation
+            // exists to close a gap between the rate a game achieves and a rate it is asked for, and
+            // a game already past the target needs nothing generated. "No evaluation required" is
+            // the correct answer to that, and it is the answer this has been giving.
+            static const unsigned int targetFps = [] {
+                const char* v = getenv("DLSSNR_MFG_TARGET_FPS");
+                return (unsigned int)(v && *v ? atoi(v) : 60);
+            }();
+            NgxSetDlssgResources(ns.fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, targetFps);
             NgxDlssgQuerySettings(ns.fg);
             const bool ok = NgxEvaluatePass(ns.fg, 0, ns.vk.cmdEval);
             SubmitAndWait(ns.vk, ns.vk.cmdEval);
