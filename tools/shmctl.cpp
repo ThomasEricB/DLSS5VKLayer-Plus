@@ -34,6 +34,7 @@ struct Setting {
 
 const Setting kSettings[] = {
     { "enabled", &ShmHeader::enabled, false, "0/1 run the model at all" },
+    { "hdrmode", &ShmHeader::hdrMode, false, "0 auto, 1 off, 2 force float16 proxy" },
     { "passes", &ShmHeader::passes, false, "how many times the model runs over one frame" },
     { "unlockpasses", &ShmHeader::unlockPasses, false, "0/1 lift the pass ceiling" },
     { "preset", &ShmHeader::preset, false, "model preset" },
@@ -185,6 +186,9 @@ void PrintStatus(const ShmHeader* h) {
                 (unsigned long long) ShmLoad64(h->layerFramesLo, h->layerFramesHi),
                 double(BitsToFloat(h->layerMsBits.load())));
     std::printf("measured_white_point=%g\n", double(BitsToFloat(h->layerMeasuredWhiteBits.load())));
+    std::printf("hdr_mode=%u\nhdr_detected=%u\nhdr_active=%u\nproxy_format=%u\nhdr_encode=%u\n",
+                h->hdrMode.load(), h->hdrDetected.load(), h->hdrActive.load(),
+                h->proxyFormat.load(), h->hdrEncode.load());
     const std::string reason = ShmLoadString(h->helperReasonSeq, h->helperReason, kReasonBytes);
     if (!reason.empty()) std::printf("helper_reason=%s\n", reason.c_str());
 }

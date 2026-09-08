@@ -3,7 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="${DLSSNR_VERSION:-0.2.2}"
+# What to produce: tarballs only, RPMs only, or both. The RPMs install the staged
+# tarball as their payload, so "rpm" still stages (and leaves behind) the tar.gz.
+MODE="${1:-both}"
+case "$MODE" in
+    tar|rpm|both) ;;
+    *) echo "usage: $0 [tar|rpm|both]" >&2; exit 1 ;;
+esac
+
+VERSION="${DLSSNR_VERSION:-0.2.5}"
 RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
 RELEASE="${RELEASE:-1}"
 DIST="dist"
@@ -46,6 +54,7 @@ stage_variant() {
   cp "$BUILD/gui/dlssnr_gui" "$root/usr/bin/dlssnr-gui"
   cp dlssnr-helper "$root/usr/bin/dlssnr-helper"
   ln -sf ../lib64/dlssnr/bin/runner_probe "$root/usr/bin/dlssnr-runner-probe"
+  ln -sf ../lib64/dlssnr/bin/dlssnr-shmctl "$root/usr/bin/dlssnr-shmctl"
   cp third_party/dxvk/2.7.1/x64/vulkan-1.dll "$root/usr/lib64/dlssnr/dxvk/2.7.1/"
   cp third_party/dxvk/2.7.1/LICENSE.txt "$root/usr/share/doc/dlssnr/dxvk-license.txt"
   cp packaging/dlssnr.desktop "$root/usr/share/applications/"
@@ -96,9 +105,16 @@ build_rpm() {
 stage_variant public dlssnr
 stage_variant personal dlssnr-personal
 
-build_rpm packaging/dlssnr.spec
-build_rpm packaging/dlssnr-personal.spec
+if [ "$MODE" != "tar" ]; then
+    build_rpm packaging/dlssnr.spec
+    build_rpm packaging/dlssnr-personal.spec
+fi
 
 echo
 echo "artifacts:"
-ls -1 "$DIST"/dlssnr-*.tar.gz "$DIST"/dlssnr-*.rpm 2>/dev/null || true
+if [ "$MODE" != "rpm" ]; then
+    ls -1 "$DIST"/dlssnr-*.tar.gz 2>/dev/null || true
+fi
+if [ "$MODE" != "tar" ]; then
+    ls -1 "$DIST"/dlssnr-*.rpm 2>/dev/null || true
+fi

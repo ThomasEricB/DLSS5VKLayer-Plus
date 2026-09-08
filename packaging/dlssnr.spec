@@ -1,10 +1,10 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 3
+%global pkg_release 2
 
 Name:           dlssnr
-Version:        0.2.2
+Version:        0.2.5
 Release:        %{pkg_release}%{?dist}
 Summary:        DLSS5 Neural Rendering Vulkan layer and helper
 License:        MIT
@@ -40,11 +40,65 @@ cp -a root/usr %{buildroot}/usr
 %{_bindir}/dlssnr-helper
 %{_bindir}/dlssnr-gui
 %{_bindir}/dlssnr-runner-probe
+%{_bindir}/dlssnr-shmctl
 %{_datadir}/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.*.json
 %{_datadir}/applications/dlssnr.desktop
 %doc %{_datadir}/doc/dlssnr/dxvk-license.txt
 
 %changelog
+* Mon Sep 07 2026 DLSS5VKLayer - 0.2.5-2
+- GUI: the binary now loads on distros whose Qt6 exports the meta-object data symbols with protected
+  visibility (CachyOS/Arch). GCC bakes copy relocations against QSpinBox::staticMetaObject and friends
+  even into a PIE, and glibc 2.41+ refuses to copy-relocate a protected symbol, so the GUI died at exec
+  with GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS. The GUI is now built with clang++ plus
+  -Wl,-z,nocopyreloc -Wl,-z,indirect-extern-access, which reaches every Qt data symbol through the GOT
+  -- legal under either visibility, and unchanged on the distros that always worked.
+
+* Mon Sep 07 2026 DLSS5VKLayer - 0.2.5-1
+- HDR input. On an HDR swapchain -- float16 linear, or 10-bit with a PQ colour space -- the proxy
+  crosses as float16 carrying linear light normalised by the white point, PQ-decoded on the way in
+  and re-encoded on the way out, and the model's feature contract is created as HDR. The GUI's
+  "HDR input" row (and shmctl hdrmode) choose Auto / Off / Force; Auto decides from the swapchain's
+  format and colour space. The device and the model have veto power: a device that cannot hold a
+  float16 surface or a model that refuses the float contract falls back to the 8-bit proxy by
+  itself, and no frame is ever read at the wrong width.
+- Protocol bumped to v10: the pixel regions carry eight bytes a pixel, and the header names the HDR
+  decision, the detection, the live proxy format and the width of the bytes in the request.
+
+* Mon Sep 07 2026 DLSS5VKLayer - 0.2.4-1
+- Transport: frames can now cross as dma-buf memory (VK_EXT_external_memory_dma_buf). The
+  helper exports the proxy and the answer as dma-bufs and names them in the shared header; the
+  layer adopts each with pidfd_getfd and writes/samples them as its own memory -- no host
+  round trip when the driver allows it (same uid, yama ptrace_scope 0). DLSSNR_DMABUF=0 disables
+  it; every failed step falls back to the host transport.
+- Protocol bumped to v9: the answer echoes its raster size, and the header carries the
+  dma-buf export descriptors and the importer's sequence echo.
+- Fix: blue/red pixel garbage when a second swapchain (Steam overlay, window resize) raced
+  the shared channel -- one swapchain now drives the helper, the rest present raw.
+- Fix: host-transport imports failed at nearly every resolution because the allocation size
+  was not rounded to the driver's import alignment; the zero-copy host path now engages.
+- Fix: the helper never loaded vkGetMemoryHostPointerPropertiesEXT, silently disabling its
+  side of the host-import path.
+- GUI: composition moved to its own tab, with the colour controls beside it.
+
+* Sun Sep 06 2026 DLSS5VKLayer - 0.2.3-1
+- Transport: the shared-memory pixel regions are imported as Vulkan buffers via
+  VK_EXT_external_memory_host, so the proxy upload and the answer readback are GPU copies
+  into and out of the mapping itself. Staging copies remain as the fallback when the driver
+  refuses the import or the view is misaligned. Protocol bumped to v7 (regions at 64 KiB).
+- Layer: the compose leg no longer stalls the game thread. Its fence is collected at the
+  start of the next present, where the reused surfaces actually need it.
+- Layer: the white-point meter runs on the GPU (reduce compute pass + mirrored result);
+  the measured value is patched into the pass constants device-side.
+- Helper: the optical-flow deadzone/upscale pass runs entirely on the GPU for both flow
+  formats (two compile-time shader variants); the CPU and hybrid conversion paths are gone.
+- Cross-process sequence handshakes now carry explicit release/acquire fences.
+
+* Sun Sep 06 2026 DLSS5VKLayer - 0.2.2-4
+- Layer: side-by-side and wipe compare now work with composition off. The raw-answer path returned ahead of the compare overlay, so compare did nothing while composition was off; the raw answer is now presented through the replace-mode exact inverse, which carries the overlay.
+- GUI: the presenting indicator no longer opens claiming Active. The first poll seeds the frame counter rather than judging it against zero.
+- GUI: "Rebuild spacing (ms)" moves from the Cost group to the gear menu as an inline spinbox; the menu opens attached under the gear.
+
 * Sun Sep 06 2026 DLSS5VKLayer - 0.2.2-3
 - Multipass: changing one pass's model settings rebuilds only that pass. It used to tear down the whole chain and rebuild every pass, one per settle window, which is what made a single slider feel like it crawled through each pass.
 - Multipass: a retuned pass keeps answering with its old tuning until its replacement is ready, so changing settings no longer drops the chain mid-rebuild.

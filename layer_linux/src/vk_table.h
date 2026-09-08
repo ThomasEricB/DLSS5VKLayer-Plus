@@ -23,7 +23,8 @@ namespace dlssnr {
     X(vkGetPhysicalDeviceFormatProperties)                                                         \
     X(vkGetPhysicalDeviceQueueFamilyProperties)                                                    \
     X(vkEnumerateDeviceExtensionProperties)                                                        \
-    X(vkGetPhysicalDeviceMemoryProperties2)
+    X(vkGetPhysicalDeviceMemoryProperties2)                                                        \
+    X(vkGetPhysicalDeviceProperties2)
 
 #define DLSSNR_DEVICE_FN_LIST(X)                                                                   \
     X(vkDestroyDevice)                                                                             \
@@ -66,6 +67,7 @@ namespace dlssnr {
     X(vkCmdCopyBufferToImage)                                                                      \
     X(vkCmdCopyImageToBuffer)                                                                      \
     X(vkCmdCopyImage)                                                                              \
+    X(vkCmdCopyBuffer)                                                                             \
     X(vkCmdBlitImage)                                                                              \
     X(vkCmdPipelineBarrier)                                                                        \
     X(vkDeviceWaitIdle)                                                                            \
@@ -83,9 +85,16 @@ namespace dlssnr {
     X(vkUpdateDescriptorSets)                                                                      \
     X(vkCreateComputePipelines)                                                                    \
     X(vkDestroyPipeline)                                                                           \
-    X(vkCmdBindPipeline)                                                                           \
-    X(vkCmdBindDescriptorSets)                                                                     \
-    X(vkCmdDispatch)                                                                               \
+X(vkCmdBindPipeline)                                                                            \
+    X(vkCmdBindDescriptorSets)                                                                   \
+    X(vkCmdDispatch)                                                                             \
+    X(vkCmdPushConstants)                                                                        \
+    X(vkCmdFillBuffer)                                                                           \
+    X(vkGetMemoryHostPointerPropertiesEXT)                                                       \
+    X(vkGetMemoryFdKHR)                                                                              \
+    X(vkGetSemaphoreFdKHR)                                                                           \
+    X(vkImportSemaphoreFdKHR)                                                                        \
+    X(vkGetSemaphoreCounterValueKHR)                                                                 \
     X(vkCreateQueryPool)                                                                           \
     X(vkDestroyQueryPool)                                                                          \
     X(vkCmdResetQueryPool)                                                                         \

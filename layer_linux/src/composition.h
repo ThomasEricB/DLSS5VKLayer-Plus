@@ -107,12 +107,31 @@ class Composition {
 
     // Build or rebuild everything sized to this frame and this model resolution. Cheap and a no-op
     // when nothing has changed, so it is safe to call every present.
+    // hdrProxy asks for the float16 HDR proxy: the crossing surfaces become R16G16B16A16_SFLOAT and
+    // the encode writes normalised linear light instead of an sRGB picture. hdrTransfer = 1 says the
+    // swapchain itself carries PQ. Both are honoured only while the device can hold a float16 proxy;
+    // Prepare reports the decision it actually made through HdrProxyActive().
     bool Prepare(uint32_t width, uint32_t height, VkFormat swapchainFormat, const FrameSettings& s,
-                 bool linearHdr);
+                 bool linearHdr, bool hdrProxy = false, uint32_t hdrTransfer = 0);
+
+    // The raster the model will work at, for a caller that has to size a transport before Prepare
+    // runs. Same arithmetic Prepare uses, in one place so the two cannot disagree.
+    static void ModelExtent(uint32_t width, uint32_t height, const FrameSettings& s,
+                            uint32_t& modelW, uint32_t& modelH);
 
     uint32_t ModelWidth() const { return _modelW; }
     uint32_t ModelHeight() const { return _modelH; }
-    size_t ModelBytes() const { return size_t(_modelW) * _modelH * 4; }
+    // Eight bytes a pixel while the float16 proxy is on, four when it is not -- every transport size
+    // in the layer derives from this one number so the two sides cannot disagree.
+    size_t ModelBytes() const { return size_t(_modelW) * _modelH * (_hdrProxy ? 8 : 4); }
+    bool HdrProxyActive() const { return _hdrProxy; }
+    uint32_t HdrTransfer() const { return _hdrProxy ? _hdrTransfer : 0; }
+
+    // Point the transport buffers at the shared-memory pixel regions so the GPU reads and writes
+    // them directly, with no host copy in between. Null pointers fall back to private host-visible
+    // staging. Safe to call every present; buffers are rebuilt only when the mapping changes, and
+    // only between frames (the caller must have waited for the previous frame's work).
+    void SetTransport(void* inRegion, void* outRegion, size_t bytes);
 
     // Leg 1. Leaves the proxy the model should see in the download buffer, and the swapchain image
     // back in PRESENT_SRC_KHR so a caller that gives up after this still presents something valid.
@@ -171,13 +190,11 @@ class Composition {
     // Both return null once the shared regions have been imported as device memory: the capture leg
     // writes the proxy into the shared pages itself and the compose leg reads the answer from them,
     // so there is nothing for the caller to move and asking for a pointer would only invite a copy.
-    const void* ProxyPixels() const { return _sharedIn ? nullptr : _download.mapped; }
-    void* ModelPixels() { return _sharedOut ? nullptr : _upload.mapped; }
+    const void* ProxyPixels() const { return _download.mapped; }
+    void* ModelPixels() { return _upload.mapped; }
 
     // Use the caller's buffers -- the shared regions -- instead of this object's own staging. Passing
     // two null handles goes back to staging, which is what happens on a device that cannot import.
-    void UseSharedBuffers(VkBuffer in, VkBuffer out) { _sharedIn = in; _sharedOut = out; }
-    bool ZeroCopy() const { return _sharedIn && _sharedOut; }
 
     // Leg 2. Composes and leaves the swapchain image holding the result, in PRESENT_SRC_KHR.
     //
@@ -187,6 +204,41 @@ class Composition {
     // model image already holds the last answer, so composing from it is both safe and correct.
     bool RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s,
                        bool refreshModel = true);
+
+    // ---------------------------------------------------------------------
+    // Phase 5: dma-buf transport. When both sides can, the proxy and the answer are device memory
+    // exported as dma-bufs and adopted through /proc -- the pixels never touch host
+    // pages at all. Every step is optional: with no channel, no extension, or a failed import, the
+    // shared-memory transport above carries the frame exactly as before.
+    // ---------------------------------------------------------------------
+
+    // Adopt one of the helper's exported images. The fd is consumed (or closed). Returns false if
+    // it cannot be imported at this raster; the shared-memory path then carries that direction.
+    bool ImportProxy(int fd, uint32_t w, uint32_t h);
+    bool ImportAnswerFd(int fd, uint32_t w, uint32_t h);
+    // True when the imported answer covers the current model raster, so leg 2 can read it directly.
+    bool AnswerImported() const {
+        return _answerXfer.image != VK_NULL_HANDLE && _answerXfer.width == _modelW &&
+               _answerXfer.height == _modelH;
+    }
+    void DropXfer();
+
+    // The channel's readiness, restated every present: the exportable proxy is only built while it
+    // is on, and leg 1 only writes it while it is on. Turning it off mid-run falls back to the
+    // shared-memory transport on the next frame.
+    void SetDmaBuf(bool on) { _dmaBuf = on; }
+    bool DmaBuf() const { return _dmaBuf; }
+
+    // True when leg 1 writes the proxy into the imported image this frame, so the caller must not
+    // also copy it into the shared-memory region -- and the helper reads it through the fd.
+    bool ProxyActive() const {
+        return _dmaBuf && _proxyXfer.image != VK_NULL_HANDLE && _proxyXfer.width == _modelW &&
+               _proxyXfer.height == _modelH;
+    }
+    void SetAnswerViaFd(bool on) { _answerViaFd = on; }
+    bool AnswerViaFd() const { return _dmaBuf && _answerViaFd && AnswerImported(); }
+    // The channel went away: forget both imported surfaces so the next frame falls back whole.
+    void InvalidateXfer() { DropXfer(); _answerViaFd = false; }
 
     bool HasModelFrame() const { return _haveModel; }
     void MarkModelFrame() { _haveModel = true; }
@@ -220,13 +272,25 @@ class Composition {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void* mapped = nullptr;
         size_t size = 0;
+        // Non-null when the allocation is the shared-memory region itself (an imported host
+        // pointer), rather than private pinned memory the transport is copied through.
+        void* hostPtr = nullptr;
     };
 
     bool MakeImage(Image& img, uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage);
     void DropImage(Image& img);
+    bool ImportFdMemory(int fd, const VkMemoryRequirements& req, VkDeviceMemory* out);
     bool MakeHostBuffer(HostBuffer& buf, size_t bytes, VkBufferUsageFlags usage);
+    bool MakeTransportBuffer(HostBuffer& buf, size_t bytes, VkBufferUsageFlags usage, void* hostPtr);
     void DropHostBuffer(HostBuffer& buf);
+    void EnsureTransport();
     void DropAll();
+
+    bool BuildMeterPipeline();
+    void DropMeterObjects();
+    bool BuildMeterDescriptors();
+    bool MakeMeterState();
+    void DropMeterState();
 
     void Transition(VkCommandBuffer cb, Image& img, VkImageLayout to);
     void TransitionSwapchain(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to);
@@ -258,6 +322,8 @@ class Composition {
     bool _blitSwapchain = false;                 // set when _workFormat is not the swapchain's twin
     VkFormat _keepFormat = VK_FORMAT_UNDEFINED;
     bool _linearHdr = false;
+    bool _hdrProxy = false;
+    uint32_t _hdrTransfer = 0;
     bool _haveModel = false;
 
     Image _frame{}, _keep{}, _proxy{}, _work{}, _model{}, _composed{};
@@ -313,19 +379,39 @@ class Composition {
     uint32_t _scalerFilter = kScalerLanczos3;
 
     // The white point meter: a grid of tile peak luminances measured off the untouched copy, and the
-    // percentile the host takes across it. See ConsumeMeter.
+    // percentile taken across it -- on the GPU. The reduce pass keeps the percentile, the history
+    // and the resolved value in a device-local state buffer; the resolve reads the resolved value
+    // through a four-byte copy into its own constant block, so no tensor crosses to the host. The
+    // mirror is a 128-byte copy of the state the CPU reads after leg 1's fence, for the frame-hold
+    // snapshot and the status field only. See ConsumeMeter.
     Image _meter{};
-    HostBuffer _meterBuf{};
-    bool _meterRecorded = false;
+    bool _meterGpu = false;
+    bool _meterStateCleared = false;
+    VkBuffer _meterState = VK_NULL_HANDLE;
+    VkDeviceMemory _meterStateMemory = VK_NULL_HANDLE;
+    HostBuffer _meterMirror{};
+    VkPipeline _meterPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout _meterPipelineLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout _meterDescriptorLayout = VK_NULL_HANDLE;
+    VkDescriptorPool _meterDescriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet _meterDescriptorSet = VK_NULL_HANDLE;
+    VkSampler _meterSampler = VK_NULL_HANDLE;
     float _measuredWhitePoint = 0.0f;
-    static constexpr uint32_t kMeterHistory = 16;
-    float _meterHistory[kMeterHistory] = {};
-    uint32_t _meterCount = 0;
     float _meterSteadiness = 0.0f;
     HostBuffer _download{}, _upload{}, _captureBuf{};
 
-    // Not owned. The shared regions, imported by the transport and bound to buffers there.
-    VkBuffer _sharedIn = VK_NULL_HANDLE, _sharedOut = VK_NULL_HANDLE;
+    // The shared-memory regions the transport buffers alias, when they alias them at all.
+    void* _transportIn = nullptr;
+    void* _transportOut = nullptr;
+    size_t _transportBytes = 0;
+
+    // Phase 5. _proxyXfer is the proxy at the model's raster in exportable device memory;
+    // _answerXfer is the helper's answer, imported from its dma-buf. Both are null when the
+    // channel is not up, and the host transport above carries the frame.
+    Image _proxyXfer{}, _answerXfer{};
+    bool _dmaBuf = false;
+    bool _answerViaFd = false;
+
 
     CaptureWriter _capture;
     bool _captureRecorded = false;

@@ -52,6 +52,10 @@ struct NgxSnippet {
     // Captured from NVSDK_NGX_VULKAN_GetFeatureRequirements (bit 0 = HDR path).
     unsigned int featureFlags = 0;
     bool hdrCapable = false;
+    // Whether the feature is being built as HDR. The helper sets it before the first create and on
+    // every switch; NgxCreatePass rewrites the create flags and the tonemap hint from it, so a
+    // rebuild after a toggle carries the new contract without re-running init.
+    bool hdrActive = false;
 
     // Last values the evaluate contract reported, so it says something only when it changes.
     unsigned int loggedAutoMask = 0xFFFFFFFFu;
@@ -93,6 +97,7 @@ struct NgxTuning {
 
 // Writes the create-time block. Must be called before NgxCreatePass, never instead of it.
 void NgxSetCreateTuning(NgxSnippet& s, const NgxTuning& t);
+void NgxSetHdr(NgxSnippet& s, bool want);
 
 // Loads the snippet, initialises it, and builds pass 0.
 //

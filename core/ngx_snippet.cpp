@@ -346,7 +346,7 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     unsigned int createFlags = NVSDK_NGX_DLSS_Feature_Flags_DoSharpening |
                                NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     const char* hdrEnv = getenv("DLSSNR_HDR");
-    const bool wantHdr = hdrEnv && hdrEnv[0] == '1';
+    const bool wantHdr = s.hdrActive || (hdrEnv && hdrEnv[0] == '1');
     if (wantHdr) createFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     ps &= ParamSetUI(s.params, "Feature_Flags", createFlags, &seh);
     ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_Feature_Flags", createFlags, &seh);
@@ -405,6 +405,7 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
             if (NVSDK_NGX_SUCCEED(r)) {
                 s.featureFlags = fr.FeatureFlags;
                 s.hdrCapable = (fr.FeatureFlags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0u;
+                s.hdrActive = wantHdr && s.hdrCapable;
             }
         }
     }
@@ -475,10 +476,34 @@ void NgxReleaseAllPasses(NgxSnippet& s, VkDevice device) {
     s.ready = false;
 }
 
+void NgxSetHdr(NgxSnippet& s, bool want) {
+    // Raw: the caller decides, the create either succeeds or the helper falls back. Clamping to
+    // hdrCapable here would silently swallow the request before init has learned the capability.
+    s.hdrActive = want;
+}
+
+// The HDR contract, rewritten from s.hdrActive before every create. The create flags and the
+// tonemap hint are ordinary string-keyed parameters, so restating them here is exactly what the
+// init-time block did once -- and doing it at create is what lets a toggle take effect on the next
+// feature build rather than never.
+static void ApplyHdrContract(NgxSnippet& s) {
+    if (!s.params) return;
+    DWORD seh = 0;
+    unsigned int flags = NVSDK_NGX_DLSS_Feature_Flags_DoSharpening |
+                         NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    if (s.hdrActive) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+    ParamSetUI(s.params, "Feature_Flags", flags, &seh);
+    ParamSetUI(s.params, "NVSDK_NGX_Parameter_Feature_Flags", flags, &seh);
+    ParamSetUI(s.params, "DLSSNR.Hdr", s.hdrActive ? 1u : 0u, &seh);
+    ParamSetUI(s.params, "DLSSNR.SDR", s.hdrActive ? 0u : 1u, &seh);
+}
+
 bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height,
                    VkCommandBuffer recordingCmd) {
     if (s.disabled || !s.params || pass >= kMaxPasses) return false;
     if (s.features[pass]) return true;
+
+    ApplyHdrContract(s);
 
     DWORD seh = 0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -490,12 +515,16 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
         pass, (uint32_t)createResult, seh, (void*)s.features[pass], width, height, ms);
     if (!NVSDK_NGX_SUCCEED(createResult) || !s.features[pass]) {
         s.features[pass] = nullptr;
-        // Only the first pass failing leaves the feature unusable; a later one failing simply caps
-        // the chain, which is what a memory ceiling looks like and is not a reason to lose the pass
-        // altogether. Even pass 0 is not fatal to the *snippet*: it loaded and initialised, and it
-        // may well accept a different raster, so the caller is told this size was refused rather than
-        // that the model is gone.
-        if (pass == 0) s.createFailed = true;
+        // Only the first pass failing leaves the feature unusable, and even then it is not the end of
+        // the snippet. A later pass failing simply caps the chain, which is what a memory ceiling
+        // looks like.
+        //
+        // Two ways pass 0 can fail and neither is fatal. A failed HDR create is the model refusing
+        // float input, and the helper answers by rebuilding at 8-bit. A failed SDR create may be a
+        // raster this model will not take, and another size may well work -- so the caller is told
+        // this create failed rather than that the model is gone, because latching on one refused size
+        // used to take the feature down until the shared header was re-initialised by hand.
+        if (pass == 0 && !s.hdrActive) s.createFailed = true;
         return false;
     }
     s.featureW = width;

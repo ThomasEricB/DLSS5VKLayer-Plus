@@ -38,7 +38,9 @@
 #include <QVBoxLayout>
 #include <QGroupBox>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QVariantMap>
+#include <QWidgetAction>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -108,6 +110,7 @@ static const SettingEntry kSettingsTable[] = {
     {"set_motion_quality", &ShmHeader::mvecQuality, false},
     {"set_motion_units", &ShmHeader::mvecScaleMode, false},
     {"set_colour_mode", &ShmHeader::colourMode, false},
+    {"set_hdr_mode", &ShmHeader::hdrMode, false},
     {"set_white_point_source", &ShmHeader::whitePointSource, false},
     {"set_paper_white", &ShmHeader::whitePointBits, true},
     {"set_white_point_scale", &ShmHeader::whitePointScaleBits, true},
@@ -198,11 +201,40 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     root->addWidget(buildSettings(), 1);
 
     // The gear, bottom right: the things that act on the whole interface rather than one setting.
+    //
+    // Icon only, no arrow section: the menu opens attached under the button the way a submenu hangs off
+    // a menu bar, not at the cursor like a context menu.
     gearBtn = new QToolButton(this);
     gearBtn->setIcon(gearIcon(this));
     gearBtn->setToolTip("Settings");
     gearBtn->setPopupMode(QToolButton::InstantPopup);
     auto* gearMenu = new QMenu(gearBtn);
+
+    // Rebuild spacing lives here rather than on the Rendering tab: it is a knob for how the helper
+    // behaves, not a setting about the picture, and it earns its keep exactly when a chain of
+    // rebuilds has wedged the model -- which is not when you want to be digging through the tab.
+    auto* rebuildAction = new QWidgetAction(gearMenu);
+    auto* rebuildRow = new QWidget(gearBtn);
+    auto* rebuildLay = new QHBoxLayout(rebuildRow);
+    rebuildLay->setContentsMargins(8, 4, 8, 4);
+    auto* rebuildLabel = new QLabel("Rebuild spacing (ms)", rebuildRow);
+    rebuildSpin = new QSpinBox(rebuildRow);
+    rebuildSpin->setRange(0, 5000);
+    rebuildSpin->setToolTip("How long the helper waits after a model setting changes before it "
+                            "rebuilds the pass, and between one rebuild and the next. Rebuilding is "
+                            "expensive, and back-to-back rebuilds have been seen to wedge the model "
+                            "on some drivers. Lower is snappier; 0 rebuilds immediately and chains "
+                            "the rest back to back. Raise it if the model ever stops answering after "
+                            "changing settings.");
+    rebuildLabel->setToolTip(rebuildSpin->toolTip());
+    if (hdr) rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
+    rebuildLay->addWidget(rebuildLabel);
+    rebuildLay->addWidget(rebuildSpin);
+    rebuildAction->setDefaultWidget(rebuildRow);
+    gearMenu->addAction(rebuildAction);
+    gearMenu->addSeparator();
+    gearMenu->addAction("Reset all settings...", this, &MainWindow::resetAllSettings);
+    gearMenu->addSeparator();
     gearMenu->addAction("Open helper log", this, [this] {
         QDesktopServices::openUrl(QUrl::fromLocalFile(logPath));
     });
@@ -212,6 +244,11 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
                          "composition, motion, colour and every per-pass override. Asks first.\n\n"
                          "Only the settings: a running helper keeps running and the game keeps being "
                          "composed, they simply start doing it with the defaults.");
+    connect(rebuildSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        if (!hdr) return;
+        hdr->rebuildSettleMs.store(uint32_t(v));
+        hdr->controlSeq.fetch_add(1);
+    });
     auto* bottom = new QHBoxLayout;
     bottom->addWidget(resetBtn);
     bottom->addStretch(1);
@@ -447,6 +484,10 @@ void MainWindow::resetAllSettings() {
     ShmResetSettings(hdr);
     if (keyCombo) keyCombo->setCurrentIndex(0);
     if (binder) binder->Reload();
+    if (rebuildSpin) {
+        QSignalBlocker block(rebuildSpin);
+        rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
+    }
     updateCompositionVisibility();
     lastSettingsBlob = settingsBlob();
     saveConfig();
@@ -564,6 +605,13 @@ void MainWindow::stopHelper() {
 
 void MainWindow::updateStatus() {
     if (binder) binder->Reload();
+    // The menu spinbox is not a bound control, so the poll keeps it honest the same way the binder
+    // keeps the bound ones honest -- unless the user is mid-edit on it, which is not the moment to
+    // overwrite the number under their cursor.
+    if (hdr && rebuildSpin && !rebuildSpin->hasFocus()) {
+        QSignalBlocker block(rebuildSpin);
+        rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
+    }
     updateCompositionVisibility();
 
     helperRunning = helperRunningNow();
@@ -591,9 +639,14 @@ void MainWindow::updateStatus() {
         // Active means a game is presenting through the layer right now: the composition is up and
         // the frame counter moved since the last poll. A counter that only ever grows would say
         // Active forever after one frame; movement is the point.
+        //
+        // The first poll seeds the counter rather than judging it. Measured against the zero it was
+        // initialised to, any frame the layer had ever presented before this window opened read as
+        // motion, so the interface opened claiming Active and corrected itself a second later.
         const quint64 frames = ShmLoad64(hdr->layerFramesLo, hdr->layerFramesHi);
-        active = hdr->layerCompositionUp.load() && frames != lastFrames;
+        active = !firstPoll && hdr->layerCompositionUp.load() && frames != lastFrames;
         lastFrames = frames;
+        firstPoll = false;
     }
 
     if (mismatch) {
@@ -629,9 +682,10 @@ void MainWindow::updateCompositionVisibility() {
 //
 // Grouped the way upstream groups them, because the grouping carries meaning: what the model was
 // told and what a pass costs, how the answer is composed onto the frame, how color is interpreted,
-// and the tools for looking at the result. Enabling the pass, the model's own controls, the cost and
-// the composition are one story and share the Rendering tab; motion, color and inspection are each
-// their own.
+// and the tools for looking at the result. Enabling the pass, the model's own controls and the cost
+// share the Rendering tab; the composition and the color the composition works in share theirs --
+// color strength, the white point and the guard are all part of how the answer lands, and none of
+// them mean anything while the answer is presented raw; motion and inspection are each their own.
 QWidget* MainWindow::buildSettings() {
     auto* tabs = new QTabWidget(this);
     binder = new ShmBinder(hdr, tabs);
@@ -740,13 +794,6 @@ QWidget* MainWindow::buildSettings() {
                                 "enhancing its own output, which is outside what it was trained for.")
                             .arg(kDefaultMaxPasses)
                             .arg(kMaxPasses));
-        binder->AddInt(f, "Rebuild spacing (ms)", &ShmHeader::rebuildSettleMs, 0, 5000,
-                       "How long the helper waits after a model setting changes before it rebuilds "
-                       "the pass, and between one rebuild and the next. Rebuilding is expensive, and "
-                       "back-to-back rebuilds have been seen to wedge the model on some drivers. "
-                       "Lower is snappier; 0 rebuilds immediately and chains the rest back to back. "
-                       "Raise it if the model ever stops answering after changing settings.",
-                       ShmBinder::Live);
         binder->AddPercent(f, "Model resolution", &ShmHeader::workingScaleBits, 25, 200,
                            "What fraction of the frame the model works at. The frame itself is never "
                            "reduced. Below 100% also cuts what crosses shared memory, quadratically. "
@@ -760,9 +807,30 @@ QWidget* MainWindow::buildSettings() {
         passBtn = new QPushButton("Per-pass settings...", col->parentWidget());
         f->addRow(passBtn);
     }
+
+    scrollTab("Motion", &col);
     {
-        // Bottom of the tab: what the model decided is one thing, how much of it lands is another,
-        // and the answer is presented raw until this is switched on.
+        auto* f = group(col, "Motion");
+        binder->AddBool(f, "Estimate motion vectors", &ShmHeader::mvecEnabled,
+                        "The model reasons about what moved between frames. A layer at present time "
+                        "has no motion vectors from the engine, so they are estimated on the GPU's "
+                        "optical-flow engine from the two frames the helper already has. Off hands "
+                        "the model a zero field, which is what it used to get.");
+        binder->AddChoice(f, "Motion quality", &ShmHeader::mvecQuality,
+                          { "Fast", "Balanced", "Quality" },
+                          "How much of the frame's budget the flow estimate may take.");
+        binder->AddChoice(f, "Motion units", &ShmHeader::mvecScaleMode,
+                          { "Normalised", "Pixels", "UV 0..1" },
+                          "What the numbers in the field mean to the model. Pixels is what the "
+                          "estimate produces; the others are for matching a model that expects them.");
+    }
+
+    scrollTab("Composition", &col);
+    {
+        // What the model decided is one thing and how much of it lands is another; the answer is
+        // presented raw until this is switched on. The color group sits under it because the color
+        // the composition works in -- the white point it normalises by, how much of the model's hue
+        // arrives -- is part of the same decision, and means nothing while the answer is raw.
         auto* f = group(col, "Composition");
         compositionForm = f;
         bypassCheck = binder->AddBool(
@@ -796,27 +864,18 @@ QWidget* MainWindow::buildSettings() {
                                              "sharpness. Only does anything below a working scale "
                                              "of 1.");
     }
-
-    scrollTab("Motion", &col);
-    {
-        auto* f = group(col, "Motion");
-        binder->AddBool(f, "Estimate motion vectors", &ShmHeader::mvecEnabled,
-                        "The model reasons about what moved between frames. A layer at present time "
-                        "has no motion vectors from the engine, so they are estimated on the GPU's "
-                        "optical-flow engine from the two frames the helper already has. Off hands "
-                        "the model a zero field, which is what it used to get.");
-        binder->AddChoice(f, "Motion quality", &ShmHeader::mvecQuality,
-                          { "Fast", "Balanced", "Quality" },
-                          "How much of the frame's budget the flow estimate may take.");
-        binder->AddChoice(f, "Motion units", &ShmHeader::mvecScaleMode,
-                          { "Normalised", "Pixels", "UV 0..1" },
-                          "What the numbers in the field mean to the model. Pixels is what the "
-                          "estimate produces; the others are for matching a model that expects them.");
-    }
-
-    scrollTab("Color", &col);
     {
         auto* f = group(col, "Color");
+        binder->AddChoice(f, "HDR input", &ShmHeader::hdrMode,
+                          { "Auto", "Off", "Force float16" },
+                          "Let the model see the frame's real light instead of a tone-mapped copy. "
+                          "Auto turns it on when the swapchain is HDR -- a float swapchain, or 10-bit "
+                          "with a PQ colour space -- and the proxy then crosses as float16 carrying "
+                          "linear light, PQ-decoded first when the swapchain carries PQ. Off keeps "
+                          "the 8-bit proxy whatever the game presents. Force feeds the float proxy "
+                          "to an SDR swapchain too, which is an A/B tool rather than a preference. "
+                          "The model has the last word: if it refuses float input the pass falls back "
+                          "to 8-bit on its own.");
         binder->AddChoice(f, "Frame holds", &ShmHeader::colourMode,
                           { "Auto", "A finished picture", "Linear light" },
                           "Whether the swapchain carries a frame the game already tone mapped or "
@@ -859,7 +918,8 @@ QWidget* MainWindow::buildSettings() {
                          "What the debug views are multiplied by on their way out.");
         binder->AddChoice(f, "Compare", &ShmHeader::compareMode, { "Off", "Side by side", "Wipe" },
                           "Shows the pass against itself. The wipe cuts one frame and resamples "
-                          "nothing, so it is the one to play with.");
+                          "nothing, so it is the one to play with. Works with composition off too: "
+                          "the model's raw answer is then shown against the frame.");
         binder->AddFloat(f, "Split", &ShmHeader::compareSplitBits, 0.0, 1.0, 0.01, "");
         binder->AddFloat(f, "Zoom", &ShmHeader::compareZoomBits, 1.0, 2.0, 0.05,
                          "Side by side only. 1 fits the whole frame and accepts the bars; 2 fills the "

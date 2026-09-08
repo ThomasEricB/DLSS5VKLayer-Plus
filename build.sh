@@ -1,7 +1,32 @@
 #!/usr/bin/env bash
 # Build the Linux Vulkan layer (.so) + Windows DLSSNR helper (.exe).
+#
+# Packaging is opt-in:
+#   ./build.sh --tar    build everything, then stage the .tar.gz tarballs (public + personal)
+#   ./build.sh --rpm    build everything, then build the RPMs (public + personal)
+#   ./build.sh --dist   build everything, then tarballs and RPMs
+# With no flag nothing is packaged, exactly as before.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+DO_TAR=0
+DO_RPM=0
+for arg in "$@"; do
+    case "$arg" in
+        --tar)  DO_TAR=1 ;;
+        --rpm)  DO_RPM=1 ;;
+        --dist) DO_TAR=1; DO_RPM=1 ;;
+        -h|--help)
+            echo "usage: $0 [--tar|--rpm|--dist]"
+            echo "  --tar   build + .tar.gz tarballs only"
+            echo "  --rpm   build + RPMs only"
+            echo "  --dist  build + tarballs + RPMs"
+            echo "  (no flag: build only, package nothing)"
+            exit 0 ;;
+        *) echo "unknown option: $arg (try --help)" >&2; exit 1 ;;
+    esac
+done
+
 mkdir -p build/layer
 
 # Vendored SDK headers (proven with MinGW by standalone_runner); /usr/include only
@@ -61,8 +86,46 @@ g++ -O2 -std=c++17 -Wall tools/shmctl.cpp -o build/dlssnr-shmctl
 
 echo "[5/5] Qt helper GUI"
 if command -v qmake6 >/dev/null 2>&1; then
+    # Distro Qt builds disagree on the visibility of the meta-object data symbols
+    # (QSpinBox::staticMetaObject and friends): Fedora's are default, CachyOS/Arch's are
+    # protected. GCC bakes copy-relocation references against them even under -fPIE, and
+    # glibc 2.41+ refuses to copy-relocate a protected symbol -- the binary dies at exec
+    # with GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS. clang always reaches those symbols
+    # through the GOT, and -z nocopyreloc pins the GOT to the library's definition, so the
+    # GUI loads against either flavour of Qt. Fall back to g++ when clang is missing or too
+    # old for the linker flags; the GUI then only loads on default-visibility Qt.
+    GUI_CXX=""
+    GUI_QMAKE_FLAGS=()
+    GUI_LINK_FLAGS=()
+    if command -v clang++ >/dev/null 2>&1 &&
+       echo 'int main(){}' | clang++ -x c++ - -pie -Wl,-z,nocopyreloc -Wl,-z,indirect-extern-access -o /dev/null 2>/dev/null; then
+        GUI_CXX=clang++
+        GUI_QMAKE_FLAGS=("QMAKE_CXXFLAGS+=-fPIE" "QMAKE_LFLAGS+=-pie -Wl,-z,nocopyreloc -Wl,-z,indirect-extern-access")
+        GUI_LINK_FLAGS=(-pie -Wl,-z,nocopyreloc -Wl,-z,indirect-extern-access)
+    else
+        echo "  warning: no clang++ with '-z nocopyreloc'; the GUI will carry copy relocations" >&2
+        echo "           and may not load on distros whose Qt uses protected visibility" >&2
+    fi
+
     mkdir -p build/gui
-    (cd build/gui && qmake6 ../../gui/dlssnr_gui.pro && make -j"$(nproc)")
+    # qmake does not notice a compiler swap, so drop the objects when the chosen compiler
+    # or flags change -- g++ objects carry the PC32 references nocopyreloc refuses.
+    GUI_STAMP="$GUI_CXX ${GUI_QMAKE_FLAGS[*]-} spec"
+    if [ "$(cat build/gui/.cxx-stamp 2>/dev/null)" != "$GUI_STAMP" ]; then
+        rm -f build/gui/*.o build/gui/dlssnr_gui
+        printf '%s' "$GUI_STAMP" > build/gui/.cxx-stamp
+    fi
+    # Swap the mkspec, not just the compiler. Overriding QMAKE_CXX alone leaves Qt's linux-g++ spec
+    # supplying its own flags, and a distro Qt built with GCC hands clang things like
+    # -mno-direct-extern-access, which clang rejects outright -- so the fix for protected-visibility
+    # Qt failed to build on exactly the distro it was written for. linux-clang is used when it exists
+    # and the plain override remains the fallback.
+    GUI_SPEC=()
+    if [ -n "$GUI_CXX" ] && [ -d "$(qmake6 -query QT_HOST_DATA)/mkspecs/linux-clang" ]; then
+        GUI_SPEC=(-spec linux-clang)
+    fi
+    (cd build/gui && qmake6 "${GUI_SPEC[@]-}" ../../gui/dlssnr_gui.pro ${GUI_CXX:+QMAKE_CXX=$GUI_CXX} \
+        "${GUI_QMAKE_FLAGS[@]-}" && make -j"$(nproc)")
 
     # The binder's regression test. Offscreen, so it needs no display; run it with
     #   QT_QPA_PLATFORM=offscreen ./build/binder_test
@@ -78,9 +141,9 @@ if command -v qmake6 >/dev/null 2>&1; then
         done
         if [ -x "$MOC" ]; then
             "$MOC" -I gui -I common gui/shm_binder.h -o build/gui/moc_binder_test.cpp
-            g++ -O2 -std=c++17 -fPIC -I gui -I common $(pkg-config --cflags Qt6Widgets) \
+            "${GUI_CXX:-g++}" -O2 -std=c++17 -fPIC -I gui -I common $(pkg-config --cflags Qt6Widgets) \
                 test_gui/binder_test.cpp gui/shm_binder.cpp build/gui/moc_binder_test.cpp \
-                $(pkg-config --libs Qt6Widgets) -o build/binder_test
+                $(pkg-config --libs Qt6Widgets) "${GUI_LINK_FLAGS[@]-}" -o build/binder_test
         else
             echo "  binder_test skipped: no Qt6 moc found"
         fi
@@ -140,6 +203,15 @@ echo "  build/runner_probe"
 echo "  build/dlssnr-shmctl"
 echo "  build/gui/dlssnr_gui (if Qt6/qmake6 is available)"
 echo "  build/binder_test    (QT_QPA_PLATFORM=offscreen ./build/binder_test)"
+
+if [ "$DO_TAR" = 1 ] || [ "$DO_RPM" = 1 ]; then
+    echo
+    if [ "$DO_TAR" = 1 ] && [ "$DO_RPM" = 1 ]; then MODE=both
+    elif [ "$DO_TAR" = 1 ]; then MODE=tar
+    else MODE=rpm; fi
+    ./packaging/make-dist.sh "$MODE"
+fi
+
 echo
 echo "use it:"
 echo "  GUI: ./build/gui/dlssnr_gui          # start/stop helper + live settings"

@@ -70,8 +70,10 @@ cp -a "$root/usr/share/applications/dlssnr.desktop" "$APP_DIR/dlssnr.desktop"
 
 if [ "$MODE" = "system" ]; then
   ln -sf ../lib64/dlssnr/bin/runner_probe "$BINDIR/dlssnr-runner-probe"
+  ln -sf ../lib64/dlssnr/bin/dlssnr-shmctl "$BINDIR/dlssnr-shmctl"
 else
   ln -sf ../lib/dlssnr/bin/runner_probe "$BINDIR/dlssnr-runner-probe"
+  ln -sf ../lib/dlssnr/bin/dlssnr-shmctl "$BINDIR/dlssnr-shmctl"
 fi
 
 for arch_manifest in "$root"/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.*.json; do
@@ -90,6 +92,6 @@ chmod 755 "$LIBDIR/layer/libVkLayer_NV_dlssnr.so" "$LIBDIR/layer32/libVkLayer_NV
 chmod 755 "$LIBDIR/helper/dlssnr_helper.exe" 2>/dev/null || true
 
 echo "installed DLSS5VKLayer to $LIBDIR"
-echo "manifest: $MANIFEST_DIR/VK_LAYER_NV_dlssnr.json"
+echo "manifests: $MANIFEST_DIR/VK_LAYER_NV_dlssnr.*.json"
 echo "run: dlssnr-helper init && dlssnr-helper start"
 echo "or:  dlssnr-gui"

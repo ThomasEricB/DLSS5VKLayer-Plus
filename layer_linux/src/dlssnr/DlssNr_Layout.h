@@ -54,5 +54,7 @@ DLSSNR_PIN(ReprojectEdit, 96);
 DLSSNR_PIN(GhostSlack, 100);
 DLSSNR_PIN(EditBlurUv, 104);
 DLSSNR_PIN(MotionConfident, 108);
+DLSSNR_PIN(HdrProxy, 112);
+DLSSNR_PIN(HdrTransfer, 116);
 
 #undef DLSSNR_PIN

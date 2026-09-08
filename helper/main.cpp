@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unistd.h>
 #include <algorithm>
 #include <vector>
 
@@ -89,7 +90,18 @@ static bool ShmOpen(ShmMap& s) {
     SetEndOfFile(s.file);
     s.mapping = CreateFileMappingW(s.file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
     if (!s.mapping) { Log("[helper] CreateFileMapping failed"); return false; }
-    s.base = MapViewOfFile(s.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+    // Windows hands out views at the 64 KiB allocation granularity, but the API does not promise it
+    // and Wine does not guarantee it. The transport import (VK_EXT_external_memory_host) demands a
+    // 64 KiB-aligned host pointer, so ask for aligned addresses first and keep only views that
+    // actually land aligned; a base that does not simply means the helper keeps its staging copies.
+    s.base = nullptr;
+    for (uintptr_t hint = 0x200000000000ull; hint < 0x200000000000ull + (8ull << 20); hint += 64ull << 10) {
+        void* b = MapViewOfFileEx(s.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0, (void*)hint);
+        if (!b) continue;
+        if ((reinterpret_cast<uintptr_t>(b) & ((64ull << 10) - 1)) == 0) { s.base = b; break; }
+        UnmapViewOfFile(b);
+    }
+    if (!s.base) s.base = MapViewOfFile(s.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
     if (!s.base) { Log("[helper] MapViewOfFile failed"); return false; }
     s.hdr = (ShmHeader*)s.base;
     s.inPixels = (uint8_t*)s.base + kHeaderBytes;
@@ -153,6 +165,8 @@ VK_FN(vkMapMemory) VK_FN(vkUnmapMemory) VK_FN(vkBindImageMemory)
 VK_FN(vkGetImageSubresourceLayout)
 VK_FN(vkCreateBuffer) VK_FN(vkDestroyBuffer) VK_FN(vkGetBufferMemoryRequirements)
 VK_FN(vkBindBufferMemory) VK_FN(vkCmdCopyBufferToImage) VK_FN(vkCmdCopyImageToBuffer)
+VK_FN(vkGetMemoryHostPointerPropertiesEXT)
+VK_FN(vkGetMemoryFdKHR) VK_FN(vkGetMemoryFdPropertiesKHR)
 VK_FN(vkCmdCopyImage) VK_FN(vkCmdPipelineBarrier) VK_FN(vkDeviceWaitIdle)
 VK_FN(vkGetPhysicalDeviceProperties2) VK_FN(vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
 VK_FN(vkCreateOpticalFlowSessionNV) VK_FN(vkDestroyOpticalFlowSessionNV)
@@ -171,6 +185,18 @@ VK_FN(vkAllocateDescriptorSets) VK_FN(vkUpdateDescriptorSets)
 #undef VK_FN
 
 
+
+struct GpuImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0, height = 0;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageAspectFlags aspect() const {
+        return VK_IMAGE_ASPECT_COLOR_BIT;
+    }
+};
 
 struct VkCtx {
     VkInstance instance = nullptr;
@@ -217,6 +243,18 @@ struct VkCtx {
     size_t stagingSize = 0;
     bool opticalFlow = false;
     bool sync2 = false;
+    // Phase 5: the dma-buf exchange. This process owns both images that cross the boundary -- the
+    // proxy it reads and the answer it writes -- and exports each as a dma-buf whose fd number it
+    // names in the shared header. The layer takes its own reference through pidfd_getfd.
+    // The export fds stay open for as long as the images do; the layer's open is a fresh one.
+    bool dmaBuf = false;
+    uint32_t linuxPid = 0;
+    GpuImage proxyIn{};
+    int proxyExportFd = -1;
+    uint32_t proxyGen = 0, proxyW = 0, proxyH = 0, proxySeq = 0;
+    GpuImage answerOut{};
+    int answerExportFd = -1;
+    uint32_t answerGen = 0, answerSeq = 0;
     VkQueryPool flowQuery = nullptr;
     VkBuffer queryStaging = nullptr;
     VkDeviceMemory queryMem = nullptr;
@@ -224,29 +262,30 @@ struct VkCtx {
     bool flowQueryAvailable = false;
     float timestampPeriod = 1.0f;
     uint32_t flowTimestampBits = 0;
-    // Persistent MVec deadzone compute objects (pipeline itself is per-size).
+    // Persistent MVec post pass (pipeline itself is per-size). The deadzone shader comes in two
+    // compile-time variants -- one per flow format -- because a spec-constant branch on this driver
+    // mispredicted and wrote NaN into MVec; the pipeline picks the module that matches the session.
     bool mvComputeSupported = false;
-    VkShaderModule mvShaderModule = nullptr;
+    VkShaderModule mvShaderFixed5 = nullptr;
+    VkShaderModule mvShaderFloat = nullptr;
     VkDescriptorSetLayout mvDescLayout = nullptr;
     VkPipelineLayout mvPipeLayout = nullptr;
-};
-
-struct GpuImage {
-    VkImage image = VK_NULL_HANDLE;
-    VkImageView view = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    uint32_t width = 0, height = 0;
-    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageAspectFlags aspect() const {
-        return VK_IMAGE_ASPECT_COLOR_BIT;
-    }
+    // Transport: the shared-memory pixel regions imported as buffers via
+    // VK_EXT_external_memory_host. When the driver accepts the import, the proxy upload and the
+    // answer readback are GPU copies into and out of the mapping itself -- no staging, no memcpy.
+    VkBuffer transportIn = VK_NULL_HANDLE;
+    VkBuffer transportOut = VK_NULL_HANDLE;
+    VkDeviceMemory transportInMem = VK_NULL_HANDLE;
+    VkDeviceMemory transportOutMem = VK_NULL_HANDLE;
+    void* transportInPtr = nullptr;
+    void* transportOutPtr = nullptr;
+    size_t transportBytes = 0;
 };
 
 static uint32_t FindMemoryType(VkCtx& c, uint32_t bits, VkMemoryPropertyFlags want);
+static void DestroyImage2D(VkCtx& c, GpuImage& img);
 static uint32_t FindHostMemoryType(VkCtx& c, uint32_t bits, bool preferCached);
 static bool CreateStaging(VkCtx& c, size_t bytes);
-static uint16_t FloatToHalf(float f);
 static float HalfToFloat(uint16_t h);
 
 static bool HasDeviceExt(VkPhysicalDevice phys, const char* name) {
@@ -293,6 +332,7 @@ static bool CreateContext(VkCtx& c) {
     LOAD(vkBindImageMemory) LOAD(vkGetImageSubresourceLayout) LOAD(vkCreateBuffer) LOAD(vkDestroyBuffer)
     LOAD(vkGetBufferMemoryRequirements) LOAD(vkBindBufferMemory) LOAD(vkCmdCopyBufferToImage)
     LOAD(vkCmdCopyImageToBuffer) LOAD(vkCmdCopyImage) LOAD(vkCmdPipelineBarrier) LOAD(vkDeviceWaitIdle)
+    LOAD(vkGetMemoryHostPointerPropertiesEXT) LOAD(vkGetMemoryFdKHR) LOAD(vkGetMemoryFdPropertiesKHR)
     LOAD(vkGetPhysicalDeviceProperties2) LOAD(vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
     LOAD(vkCreateOpticalFlowSessionNV) LOAD(vkDestroyOpticalFlowSessionNV)
     LOAD(vkBindOpticalFlowSessionImageNV) LOAD(vkCmdOpticalFlowExecuteNV) LOAD(vkCmdBlitImage)
@@ -383,10 +423,15 @@ static bool CreateContext(VkCtx& c) {
                            "VK_KHR_maintenance1", "VK_KHR_maintenance2", "VK_KHR_maintenance3",
                            "VK_KHR_maintenance4", "VK_KHR_buffer_device_address", "VK_KHR_push_descriptor",
                            "VK_KHR_synchronization2", VK_NV_OPTICAL_FLOW_EXTENSION_NAME,
-                           // The other half of the zero-copy transport. winevulkan exposes only the
-                           // Win32 handle types, so an fd from the layer could never cross -- but a
-                           // mapped pointer can, and both sides' mapping of the shared file is one.
-                           "VK_KHR_external_memory", VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME })
+                           // The transport, in both of its forms. A mapped pointer crosses the Wine
+                           // boundary because both sides map the same file; a dma-buf crosses it
+                           // because this process can export one and name the descriptor, which the
+                           // layer then adopts through procfs. Win32 handle types are the only ones
+                           // winevulkan exposes to a PE, so neither side can pass a handle directly --
+                           // the descriptor number in shared memory is what closes that gap.
+                           "VK_KHR_external_memory", VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
+                           VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+                           VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME })
         if (HasDeviceExt(c.physical, e)) enabled.push_back(e);
     c.hostImport = HasDeviceExt(c.physical, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     c.sync2 = HasDeviceExt(c.physical, "VK_KHR_synchronization2");
@@ -458,7 +503,7 @@ static bool CreateContext(VkCtx& c) {
     // GPU MVec deadzone pass needs storage access on both flow and MVec formats.
     if (vkGetPhysicalDeviceFormatProperties && vkCreateShaderModule && vkCreateComputePipelines &&
         vkCmdDispatch && vkCreateDescriptorSetLayout && vkCreateDescriptorPool &&
-        vkAllocateDescriptorSets && vkUpdateDescriptorSets && kMVecDeadzoneSpvLen) {
+        vkAllocateDescriptorSets && vkUpdateDescriptorSets && kMVecDeadzoneSpvFixed5Len) {
         VkFormatProperties u16{};
         VkFormatProperties f16{};
         vkGetPhysicalDeviceFormatProperties(c.physical, VK_FORMAT_R16G16_UINT, &u16);
@@ -584,6 +629,256 @@ static bool CreateStaging(VkCtx& c, size_t bytes) {
     }
     c.stagingSize = bytes;
     return true;
+}
+
+// Import one shared-memory region as a buffer (VK_EXT_external_memory_host). The driver names the
+// memory type that may back the pointer, so the type is taken from that intersection rather than
+// scored on property flags like ordinary host-visible memory.
+static bool ImportTransportOne(VkCtx& c, void* ptr, size_t bytes, VkBufferUsageFlags usage,
+                               VkBuffer& buf, VkDeviceMemory& mem) {
+    VkMemoryHostPointerPropertiesEXT props{};
+    props.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+    if (vkGetMemoryHostPointerPropertiesEXT(c.device,
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr, &props) != VK_SUCCESS)
+        return false;
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = bytes;
+    bci.usage = usage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkExternalMemoryBufferCreateInfo ext{};
+    ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    bci.pNext = &ext;
+    if (vkCreateBuffer(c.device, &bci, nullptr, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(c.device, buf, &req);
+    const uint32_t typeBits = req.memoryTypeBits & props.memoryTypeBits;
+    if (!typeBits) { vkDestroyBuffer(c.device, buf, nullptr); buf = VK_NULL_HANDLE; return false; }
+    uint32_t type = 0;
+    while (!(typeBits & (1u << type))) ++type;
+    VkImportMemoryHostPointerInfoEXT hpi{};
+    hpi.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+    hpi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    hpi.pHostPointer = ptr;
+    // The allocation size must be a multiple of the driver's import alignment (64 KiB on NVIDIA);
+    // kMaxFrame already is, but the rounding keeps this correct for any region size.
+    VkDeviceSize align = 65536;
+    if (vkGetPhysicalDeviceProperties2) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps{};
+        hostProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 p2{};
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p2.pNext = &hostProps;
+        vkGetPhysicalDeviceProperties2(c.physical, &p2);
+        if (hostProps.minImportedHostPointerAlignment) align = hostProps.minImportedHostPointerAlignment;
+    }
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext = &hpi;
+    mai.allocationSize = (req.size + align - 1) & ~(align - 1);
+    mai.memoryTypeIndex = type;
+    if (vkAllocateMemory(c.device, &mai, nullptr, &mem) != VK_SUCCESS ||
+        vkBindBufferMemory(c.device, buf, mem, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(c.device, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        mem = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+// Make the two pixel regions the GPU's own buffers. When this succeeds the proxy upload and the
+// answer readback are device-side copies into and out of the file's pages -- no staging buffer and
+// no host memcpy in the frame. When it fails (no extension, misaligned view, driver refuses) the
+// staging paths below carry on exactly as before.
+static bool ImportTransport(VkCtx& c, void* in, void* out, size_t bytes) {
+    if (c.transportIn && c.transportInPtr == in && c.transportOutPtr == out && c.transportBytes == bytes)
+        return true;
+    if (c.transportIn) vkDestroyBuffer(c.device, c.transportIn, nullptr);
+    if (c.transportOut) vkDestroyBuffer(c.device, c.transportOut, nullptr);
+    if (c.transportInMem) vkFreeMemory(c.device, c.transportInMem, nullptr);
+    if (c.transportOutMem) vkFreeMemory(c.device, c.transportOutMem, nullptr);
+    c.transportIn = c.transportOut = VK_NULL_HANDLE;
+    c.transportInMem = c.transportOutMem = VK_NULL_HANDLE;
+    c.transportInPtr = c.transportOutPtr = nullptr;
+    c.transportBytes = 0;
+    if (!vkGetMemoryHostPointerPropertiesEXT || !in || !out || !bytes) return false;
+
+    VkDeviceSize align = 0;
+    if (vkGetPhysicalDeviceProperties2) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps{};
+        hostProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 props2{};
+        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props2.pNext = &hostProps;
+        vkGetPhysicalDeviceProperties2(c.physical, &props2);
+        align = hostProps.minImportedHostPointerAlignment;
+    }
+    if (!align) align = 1;
+    if ((reinterpret_cast<uintptr_t>(in) | reinterpret_cast<uintptr_t>(out)) % align) {
+        Log("[helper] view is not %llu-byte aligned; keeping staging transport",
+            (unsigned long long)align);
+        return false;
+    }
+    if (!ImportTransportOne(c, in, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                            c.transportIn, c.transportInMem))
+        return false;
+    if (!ImportTransportOne(c, out, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            c.transportOut, c.transportOutMem)) {
+        vkDestroyBuffer(c.device, c.transportIn, nullptr);
+        vkFreeMemory(c.device, c.transportInMem, nullptr);
+        c.transportIn = VK_NULL_HANDLE;
+        c.transportInMem = VK_NULL_HANDLE;
+        return false;
+    }
+    c.transportInPtr = in;
+    c.transportOutPtr = out;
+    c.transportBytes = bytes;
+    Log("[helper] transport imported: the shared-memory regions are the GPU's buffers");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: dma-buf transport
+// ---------------------------------------------------------------------------
+// The proxy arrives as a file descriptor over the socket and becomes an image of this device over
+// the proxy it reads and the answer it writes. Both are optional -- without the channel, the
+// extension, or a successful export, the shared-memory transport above carries the frame. The
+// images are CONCURRENT and cross the boundary through FOREIGN_EXT: the layer acquires the proxy
+// from FOREIGN before its first write and releases it back before this process reads it, and the
+// answer is released to FOREIGN before the answer number moves.
+
+// Build an RGBA8 image in memory that can leave this process as a dma-buf, and hand out the fd.
+// The fd stays open here: the layer opens its own reference through /proc, and the number must
+// stay meaningful until the image is rebuilt.
+static bool CreateExportable(VkCtx& c, GpuImage& img, int& exportFd, uint32_t w, uint32_t h,
+                             VkFormat fmt, const char* what) {
+    if (img.image && img.width == w && img.height == h && img.format == fmt && exportFd >= 0)
+        return true;
+    DestroyImage2D(c, img);
+    // The old descriptor is left open rather than closed: a Wine process cannot close a raw
+    // Linux fd through its CRT (the handle table does not own it), and the alternatives are
+    // either socket-only or version-fragile. Rebuilds are rare -- a resize, a header restart --
+    // so the leak is bounded long before it matters, and the kernel reclaims everything at exit.
+    exportFd = -1;
+    if (!vkGetMemoryFdKHR || !w || !h) return false;
+
+    VkExternalMemoryImageCreateInfo ext{};
+    ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkImageCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ci.pNext = &ext;
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = fmt;
+    ci.extent = { w, h, 1 };
+    ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT;
+    ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(c.device, &ci, nullptr, &img.image) != VK_SUCCESS) return false;
+    img.format = fmt;
+    img.width = w;
+    img.height = h;
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(c.device, img.image, &req);
+    uint32_t type = FindMemoryType(c, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type == UINT32_MAX) { DestroyImage2D(c, img); return false; }
+    VkExportMemoryAllocateInfo exp{};
+    exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext = &exp;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    if (vkAllocateMemory(c.device, &mai, nullptr, &img.memory) != VK_SUCCESS ||
+        vkBindImageMemory(c.device, img.image, img.memory, 0) != VK_SUCCESS) {
+        DestroyImage2D(c, img);
+        return false;
+    }
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = img.image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = fmt;
+    vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    if (vkCreateImageView(c.device, &vi, nullptr, &img.view) != VK_SUCCESS) {
+        DestroyImage2D(c, img);
+        return false;
+    }
+    VkMemoryGetFdInfoKHR gfi{};
+    gfi.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    gfi.memory = img.memory;
+    gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    if (vkGetMemoryFdKHR(c.device, &gfi, &exportFd) != VK_SUCCESS) {
+        DestroyImage2D(c, img);
+        exportFd = -1;
+        return false;
+    }
+    Log("[fd] %s exportable %ux%u fd=%d", what, w, h, exportFd);
+    return true;
+}
+
+// Keep the proxy image at the current raster and publish its descriptor. The layer writes this
+// image; this process reads it. Returns true when the image exists at this size.
+static bool EnsureProxyOut(VkCtx& c, ShmHeader* hdr, uint32_t w, uint32_t h, VkFormat fmt) {
+    const bool sizeChanged = c.proxyIn.image &&
+                             (c.proxyIn.width != w || c.proxyIn.height != h || c.proxyIn.format != fmt);
+    if (!CreateExportable(c, c.proxyIn, c.proxyExportFd, w, h, fmt, "proxy")) {
+        c.proxyW = c.proxyH = 0;
+        return false;
+    }
+    c.proxyW = w;
+    c.proxyH = h;
+    if (sizeChanged || c.proxySeq == 0) {
+        ++c.proxyGen;
+        ++c.proxySeq;
+    }
+    // Restate the descriptor whenever the header does not carry this sequence -- first frame,
+    // rebuild, or a header re-initialised by another process under us.
+    if (hdr->proxyExportSeq.load() != c.proxySeq) {
+        hdr->proxyPid.store(c.linuxPid);
+        hdr->proxyFd.store(uint32_t(c.proxyExportFd));
+        hdr->proxyGen.store(c.proxyGen);
+        std::atomic_thread_fence(std::memory_order_release);
+        hdr->proxyExportSeq.store(c.proxySeq);
+    }
+    return true;
+}
+
+static bool EnsureAnswerOut(VkCtx& c, ShmHeader* hdr, uint32_t w, uint32_t h, VkFormat fmt) {
+    const bool sizeChanged = c.answerOut.image &&
+                             (c.answerOut.width != w || c.answerOut.height != h || c.answerOut.format != fmt);
+    if (!CreateExportable(c, c.answerOut, c.answerExportFd, w, h, fmt, "answer")) {
+        if (c.answerOut.image == VK_NULL_HANDLE && hdr->answerExportSeq.load()) {
+            ++c.answerGen;
+            hdr->answerExportSeq.store(0);  // withdrawn: the layer must not open a stale number
+        }
+        return false;
+    }
+    if (sizeChanged || c.answerSeq == 0) {
+        ++c.answerGen;
+        ++c.answerSeq;
+    }
+    if (hdr->answerExportSeq.load() != c.answerSeq) {
+        hdr->answerPid.store(c.linuxPid);
+        hdr->answerFd.store(uint32_t(c.answerExportFd));
+        hdr->answerGen.store(c.answerGen);
+        std::atomic_thread_fence(std::memory_order_release);
+        hdr->answerExportSeq.store(c.answerSeq);
+    }
+    return true;
+}
+
+// The buffer a colorIn upload should read from: the imported mapping when there is one, the
+// staging copy otherwise. Callers that upload something other than the proxy pass uploadStaging
+// explicitly.
+static VkBuffer UploadSource(VkCtx& c) {
+    return c.transportIn ? c.transportIn : c.uploadStaging;
 }
 
 static bool CreateImage2DUsage(VkCtx& c, VkFormat fmt, uint32_t w, uint32_t h,
@@ -780,123 +1075,11 @@ static bool SubmitAndWait(VkCtx& c, VkCommandBuffer cb) {
     return SubmitAndWaitQueue(c, cb, c.queue);
 }
 
-// Import the layer's two shared regions as device memory, so the frame never has to be copied into
-// or out of this process's own staging. Mirrors ShmImportFrames in the layer; see the note there.
-//
-// Best-effort throughout: any failure leaves the buffers null and every user falls back to staging.
-static void ReleaseFrameImports(VkCtx& c) {
-    if (c.motionBuf) vkDestroyBuffer(c.device, c.motionBuf, nullptr);
-    if (c.motionMem) vkFreeMemory(c.device, c.motionMem, nullptr);
-    c.motionBuf = VK_NULL_HANDLE; c.motionMem = VK_NULL_HANDLE; c.importedMotion = nullptr;
-    if (c.frameInBuf) vkDestroyBuffer(c.device, c.frameInBuf, nullptr);
-    if (c.frameOutBuf) vkDestroyBuffer(c.device, c.frameOutBuf, nullptr);
-    if (c.frameInMem) vkFreeMemory(c.device, c.frameInMem, nullptr);
-    if (c.frameOutMem) vkFreeMemory(c.device, c.frameOutMem, nullptr);
-    c.frameInBuf = c.frameOutBuf = VK_NULL_HANDLE;
-    c.frameInMem = c.frameOutMem = VK_NULL_HANDLE;
-    c.importedIn = c.importedOut = nullptr;
-    c.importedBytes = 0;
-}
-
-static bool ImportOneRegion(VkCtx& c, void* host, size_t bytes, VkDeviceMemory* mem, VkBuffer* buf) {
-    auto getProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)
-        g_gipa(c.instance, "vkGetMemoryHostPointerPropertiesEXT");
-    if (!getProps) return false;
-
-    VkMemoryHostPointerPropertiesEXT hp{ VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
-    if (getProps(c.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hp) !=
-            VK_SUCCESS || !hp.memoryTypeBits)
-        return false;
-
-    const uint32_t type = FindHostMemoryType(c, hp.memoryTypeBits, false);
-    if (type == UINT32_MAX) return false;
-
-    VkImportMemoryHostPointerInfoEXT imp{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
-    imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-    imp.pHostPointer = host;
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    mai.pNext = &imp;
-    mai.allocationSize = bytes;
-    mai.memoryTypeIndex = type;
-    if (vkAllocateMemory(c.device, &mai, nullptr, mem) != VK_SUCCESS) return false;
-
-    // vkBindBufferMemory requires a buffer declared for the handle type its memory was imported
-    // from, while vkGetPhysicalDeviceExternalBufferProperties does not report HOST_ALLOCATION as a
-    // compatible buffer handle type at all. The two rules cannot both be satisfied for this handle
-    // type; the bind is the one that governs what the driver actually does, so it wins.
-    VkExternalMemoryBufferCreateInfo ext{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
-    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-    VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bci.pNext = &ext;
-    bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    if (vkCreateBuffer(c.device, &bci, nullptr, buf) != VK_SUCCESS) {
-        vkFreeMemory(c.device, *mem, nullptr);
-        *mem = VK_NULL_HANDLE;
-        return false;
-    }
-    if (vkBindBufferMemory(c.device, *buf, *mem, 0) != VK_SUCCESS) {
-        vkDestroyBuffer(c.device, *buf, nullptr);
-        vkFreeMemory(c.device, *mem, nullptr);
-        *buf = VK_NULL_HANDLE;
-        *mem = VK_NULL_HANDLE;
-        return false;
-    }
-    return true;
-}
-
-// The regions are imported at a page-rounded size covering this frame. The layer maps its own side
-// the same way, so the two agree on the pages even though the addresses differ.
-static void EnsureMotionImport(VkCtx& c, void* motion, size_t bytes) {
-    if (!c.hostImport || !motion) return;
-    const size_t want = ((bytes + kHostImportAlignment - 1) / kHostImportAlignment) * kHostImportAlignment;
-    if (c.motionBuf && c.importedMotion == motion) return;
-    if (c.motionBuf) vkDestroyBuffer(c.device, c.motionBuf, nullptr);
-    if (c.motionMem) vkFreeMemory(c.device, c.motionMem, nullptr);
-    c.motionBuf = VK_NULL_HANDLE; c.motionMem = VK_NULL_HANDLE;
-    if (ImportOneRegion(c, motion, want, &c.motionMem, &c.motionBuf)) c.importedMotion = motion;
-}
-
-static void EnsureFrameImports(VkCtx& c, void* in, void* out, size_t bytes) {
-    if (!c.hostImport || !in || !out) return;
-
-    const size_t want = ((bytes + kHostImportAlignment - 1) / kHostImportAlignment) * kHostImportAlignment;
-    if (c.frameInBuf && c.importedIn == in && c.importedOut == out && c.importedBytes >= want) return;
-
-    ReleaseFrameImports(c);
-    if (!ImportOneRegion(c, in, want, &c.frameInMem, &c.frameInBuf)) return;
-    if (!ImportOneRegion(c, out, want, &c.frameOutMem, &c.frameOutBuf)) {
-        ReleaseFrameImports(c);
-        return;
-    }
-    c.importedIn = in;
-    c.importedOut = out;
-    c.importedBytes = want;
-    Log("[helper] zero copy: the layer's regions imported as device memory (%zu bytes each)", want);
-}
-
-// Ordering against the layer, which is a separate process with its own device writing the same pages.
-// See the matching note in the layer's composition: an external agent touching host-visible memory is
-// ordered as host access, and without it a copy can be scheduled against caches that predate the
-// other side's writes.
-static void BarrierAfterExternalWrite(VkCommandBuffer cb) {
-    VkMemoryBarrier b{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    b.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                         1, &b, 0, nullptr, 0, nullptr);
-}
-
-static void BarrierBeforeExternalRead(VkCommandBuffer cb) {
-    VkMemoryBarrier b{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
-                         1, &b, 0, nullptr, 0, nullptr);
-}
-
-static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes, VkBuffer from = VK_NULL_HANDLE) {
-    if (!from && (!c.uploadMap || bytes > c.stagingSize)) return false;
+static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes,
+                               VkBuffer srcOverride = VK_NULL_HANDLE) {
+    const VkBuffer src = srcOverride ? srcOverride : c.uploadStaging;
+    if (!src) return false;
+    if (!srcOverride && (!c.uploadMap || bytes > c.stagingSize)) return false;
     if (!BeginCmd(c.cmdScratch)) return false;
     TransitionImage(c, c.cmdScratch, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -904,17 +1087,28 @@ static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes, VkBuffer f
     VkBufferImageCopy region{};
     region.imageSubresource = { img.aspect(), 0, 0, 1 };
     region.imageExtent = { img.width, img.height, 1 };
-    if (from) BarrierAfterExternalWrite(c.cmdScratch);
-    vkCmdCopyBufferToImage(c.cmdScratch, from ? from : c.uploadStaging, img.image,
+    vkCmdCopyBufferToImage(c.cmdScratch, src, img.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     return SubmitAndWait(c, c.cmdScratch);
 }
 
-static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes, VkBuffer into = VK_NULL_HANDLE) {
-    if (!into) {
-        if (bytes > c.stagingSize && !CreateStaging(c, bytes)) return false;
-        if (!c.readMap) return false;
+static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes) {
+    if (c.transportOut) {
+        // The answer lands in the shared-memory region itself; the layer's acquire fence on
+        // seq_resp is the only ordering the bytes need beyond this submit.
+        if (!BeginCmd(c.cmdEval)) return false;
+        TransitionImage(c, c.cmdEval, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = { img.aspect(), 0, 0, 1 };
+        region.imageExtent = { img.width, img.height, 1 };
+        vkCmdCopyImageToBuffer(c.cmdEval, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               c.transportOut, 1, &region);
+        return SubmitAndWait(c, c.cmdEval);
     }
+    if (bytes > c.stagingSize && !CreateStaging(c, bytes)) return false;
+    if (!c.readMap) return false;
     if (!BeginCmd(c.cmdEval)) return false;
     TransitionImage(c, c.cmdEval, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
@@ -922,9 +1116,8 @@ static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes, VkBuffer into 
     VkBufferImageCopy region{};
     region.imageSubresource = { img.aspect(), 0, 0, 1 };
     region.imageExtent = { img.width, img.height, 1 };
-    vkCmdCopyImageToBuffer(c.cmdEval, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           into ? into : c.readStaging, 1, &region);
-    if (into) BarrierBeforeExternalRead(c.cmdEval);
+    vkCmdCopyImageToBuffer(c.cmdEval, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c.readStaging, 1,
+                           &region);
     return SubmitAndWait(c, c.cmdEval);
 }
 
@@ -948,10 +1141,6 @@ struct OpticalFlowState {
     uint32_t attemptedQuality = 0;
     bool userDisabled = false;
     bool hasPrev = false;
-    bool gpuBlit = false;
-    bool gpuBlitLinear = false;
-    bool cpuOnly = false;
-    bool hybrid = false;
     bool currentToPrevious = true;
     bool flowTransferSrc = false;
     bool gpuConvertChecked = false;
@@ -962,7 +1151,7 @@ struct OpticalFlowState {
     VkPipeline mvPipeline = nullptr;
     VkDescriptorPool mvPool = nullptr;
     VkDescriptorSet mvSet = nullptr;
-    GpuImage prev{}, curr{}, out{}, flowFloat{};
+    GpuImage prev{}, curr{}, out{};
 };
 
 static float ClampF(float v, float lo, float hi) {
@@ -975,13 +1164,23 @@ struct NeuralState {
     VkCtx vk{};
     NgxSnippet ngx{};
 
-    // The proxy the layer sent, and two surfaces the chain alternates between. Two, not one, because
+    // The proxy the layer sent (8-bit display-referred, or float16 normalised linear light when the
+    // HDR path is on), and two surfaces the chain alternates between. Two, not one, because
     // a pass must read the previous pass's answer while writing its own: with a single surface the
     // model would be reading and writing the same image.
     GpuImage colorIn{}, workA{}, workB{}, mv{}, depth{};
+    // Phase 5: set every frame the imported proxy covers this raster, so the upload reads the
+    // layer's exported memory instead of the shared-memory region.
+    bool proxyActive = false;
 
     uint32_t w = 0, h = 0;
     bool ready = false;
+    // The HDR proxy state this process has actually built: 1 when the crossing images, the chain
+    // surfaces and the model's feature contract are all float16. It switches only between frames,
+    // and the frame that switches is failed on purpose -- its bytes are still the old width.
+    uint32_t hdrBuilt = 0;
+    // The model refused the float contract. Stay 8-bit until HDR is switched off and back on.
+    bool hdrRejected = false;
 
     // Per-pass state. A pass owns a feature, the tuning that feature was built with, and whether it
     // still owes the model a history reset.
@@ -1109,10 +1308,20 @@ static float MVecDeadzone() {
 static bool EnsureMVecComputeObjects(VkCtx& c) {
     if (c.mvPipeLayout) return true;
     if (!c.mvComputeSupported) return false;
-    VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    smci.codeSize = kMVecDeadzoneSpvLen * sizeof(uint32_t);
-    smci.pCode = kMVecDeadzoneSpv;
-    if (vkCreateShaderModule(c.device, &smci, nullptr, &c.mvShaderModule) != VK_SUCCESS) return false;
+    auto makeModule = [&](const uint32_t* code, size_t len, VkShaderModule& out) {
+        VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        smci.codeSize = len * sizeof(uint32_t);
+        smci.pCode = code;
+        return vkCreateShaderModule(c.device, &smci, nullptr, &out) == VK_SUCCESS;
+    };
+    // Two modules from one source, one per flow format. The format branch is compile-time because a
+    // spec-constant branch mispredicted on this driver and wrote NaN into MVec.
+    if (!makeModule(kMVecDeadzoneSpvFixed5, kMVecDeadzoneSpvFixed5Len, c.mvShaderFixed5)) return false;
+    if (!makeModule(kMVecDeadzoneSpvFloat, kMVecDeadzoneSpvFloatLen, c.mvShaderFloat)) {
+        vkDestroyShaderModule(c.device, c.mvShaderFixed5, nullptr);
+        c.mvShaderFixed5 = nullptr;
+        return false;
+    }
     VkDescriptorSetLayoutBinding bindings[2] = {};
     for (uint32_t i = 0; i < 2; ++i) {
         bindings[i].binding = i;
@@ -1128,8 +1337,9 @@ static bool EnsureMVecComputeObjects(VkCtx& c) {
     if (vkCreatePipelineLayout(c.device, &pli, nullptr, &c.mvPipeLayout) != VK_SUCCESS) {
         vkDestroyDescriptorSetLayout(c.device, c.mvDescLayout, nullptr);
         c.mvDescLayout = nullptr;
-        vkDestroyShaderModule(c.device, c.mvShaderModule, nullptr);
-        c.mvShaderModule = nullptr;
+        vkDestroyShaderModule(c.device, c.mvShaderFixed5, nullptr);
+        vkDestroyShaderModule(c.device, c.mvShaderFloat, nullptr);
+        c.mvShaderFixed5 = c.mvShaderFloat = nullptr;
         return false;
     }
     return true;
@@ -1154,7 +1364,8 @@ static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
     OpticalFlowState& f = ns.flow;
     DestroyMVecComputePass(c, f);
     if (!c.mvComputeSupported || !ns.mv.image || !f.out.image || !EnsureMVecComputeObjects(c)) return false;
-    if (f.flowFormat != VK_FORMAT_R16G16_SFIXED5_NV) return false;  // shader decodes SFIXED5 bits only
+    const bool fixed5 = f.flowFormat == VK_FORMAT_R16G16_SFIXED5_NV;
+    if (!fixed5 && f.flowFormat != VK_FORMAT_R16G16_SFLOAT) return false;  // two modules, two formats
     VkImageViewCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vi.image = f.out.image;
@@ -1166,28 +1377,29 @@ static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
         return false;
     }
     struct SpecData {
-        uint32_t grid, srcW, srcH, dstW, dstH, fixed5;
+        uint32_t grid, srcW, srcH, dstW, dstH;
         float deadzone;
         uint32_t bilinear;
     } data{};
     data.grid = f.grid ? f.grid : 1u;
     data.srcW = ow; data.srcH = oh;
     data.dstW = ns.mv.width; data.dstH = ns.mv.height;
-    data.fixed5 = f.flowFormat == VK_FORMAT_R16G16_SFIXED5_NV ? 1u : 0u;
     data.deadzone = MVecDeadzone();
     data.bilinear = 1u;
-    VkSpecializationMapEntry entries[8] = {
+    // Constants 0-4, 6, 7; there is no constant 5 any more -- the format moved from a
+    // specialization constant to the choice of module.
+    VkSpecializationMapEntry entries[7] = {
         {0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4},
-        {4, 16, 4}, {5, 20, 4}, {6, 24, 4}, {7, 28, 4},
+        {4, 16, 4}, {6, 20, 4}, {7, 24, 4},
     };
     VkSpecializationInfo sp{};
-    sp.mapEntryCount = 8; sp.pMapEntries = entries;
+    sp.mapEntryCount = 7; sp.pMapEntries = entries;
     sp.dataSize = sizeof(data); sp.pData = &data;
     VkComputePipelineCreateInfo cpi{};
     cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpi.stage.module = c.mvShaderModule;
+    cpi.stage.module = fixed5 ? c.mvShaderFixed5 : c.mvShaderFloat;
     cpi.stage.pName = "main";
     cpi.stage.pSpecializationInfo = &sp;
     cpi.layout = c.mvPipeLayout;
@@ -1223,7 +1435,7 @@ static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
     vkUpdateDescriptorSets(c.device, 2, writes, 0, nullptr);
     f.gpuCompute = true;
     Log("[mvec] GPU deadzone pass ready grid=%u flow=%ux%u mvec=%ux%u fixed5=%u deadzone=%.3f",
-        data.grid, ow, oh, data.dstW, data.dstH, data.fixed5, data.deadzone);
+        data.grid, ow, oh, data.dstW, data.dstH, fixed5 ? 1u : 0u, data.deadzone);
     return true;
 }
 
@@ -1236,7 +1448,6 @@ static void DestroyOpticalFlow(VkCtx& c, OpticalFlowState& f) {
     DestroyImage2D(c, f.prev);
     DestroyImage2D(c, f.curr);
     DestroyImage2D(c, f.out);
-    DestroyImage2D(c, f.flowFloat);
     f.enabled = false;
     f.inputFormat = f.flowFormat = VK_FORMAT_UNDEFINED;
     f.grid = 1;
@@ -1244,10 +1455,6 @@ static void DestroyOpticalFlow(VkCtx& c, OpticalFlowState& f) {
     f.attemptedQuality = 0;
     f.userDisabled = false;
     f.hasPrev = false;
-    f.gpuBlit = false;
-    f.gpuBlitLinear = false;
-    f.cpuOnly = false;
-    f.hybrid = false;
     f.currentToPrevious = true;
     f.flowTransferSrc = false;
     f.gpuConvertChecked = false;
@@ -1303,32 +1510,14 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
         return false;
     }
 
-    f.gpuBlit = false;
-    f.gpuBlitLinear = false;
     f.flowTransferSrc = false;
     if (vkGetPhysicalDeviceFormatProperties) {
         VkFormatProperties src{};
         vkGetPhysicalDeviceFormatProperties(c.physical, f.flowFormat, &src);
         f.flowTransferSrc = (src.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0;
-        if (vkCmdBlitImage && f.flowFormat != VK_FORMAT_R16G16_SFLOAT) {
-            VkFormatProperties dst{};
-            vkGetPhysicalDeviceFormatProperties(c.physical, VK_FORMAT_R16G16_SFLOAT, &dst);
-            const bool srcBlit = (src.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
-            const bool dstBlit = (dst.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
-            f.gpuBlit = srcBlit && dstBlit;
-            f.gpuBlitLinear = (src.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
-        }
-    }
-    const char* gpuEnv = getenv("DLSSNR_MVEC_GPU");
-    f.cpuOnly = gpuEnv && gpuEnv[0] == '0';
-    if (f.cpuOnly) {
-        f.gpuBlit = false;
-        f.gpuBlitLinear = false;
     }
     const char* dirEnv = getenv("DLSSNR_MVEC_DIRECTION");
     f.currentToPrevious = !(dirEnv && dirEnv[0] == '0');
-    const char* filterEnv = getenv("DLSSNR_MVEC_FILTER");
-    if (filterEnv && filterEnv[0] == '1') f.gpuBlitLinear = true;
 
     const uint32_t ow = w / f.grid;
     const uint32_t oh = h / f.grid;
@@ -1381,96 +1570,27 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
         return false;
     }
 
-    if (!f.cpuOnly) {
-        const char* compEnv = getenv("DLSSNR_MVEC_COMPUTE");
-        if (compEnv && compEnv[0] == '0') {
-            Log("[mvec] GPU deadzone pass disabled by env");
-        } else if (!BuildMVecComputePass(ns, ow, oh)) {
-            Log("[mvec] GPU deadzone pass unavailable, using legacy flow conversion");
-        }
+    // The deadzone compute pass is the only flow conversion: it runs entirely on the GPU for both
+    // flow formats, so there is no host readback path to fall back to. If it cannot be built,
+    // estimated motion vectors are unavailable -- the model runs with zeroed vectors.
+    const char* compEnv = getenv("DLSSNR_MVEC_COMPUTE");
+    if (compEnv && compEnv[0] == '0') {
+        Log("[mvec] GPU deadzone pass disabled by env; estimated motion vectors unavailable");
+        DestroyOpticalFlow(c, f);
+        return false;
+    }
+    if (!BuildMVecComputePass(ns, ow, oh)) {
+        Log("[mvec] GPU deadzone pass unavailable; estimated motion vectors unavailable");
+        DestroyOpticalFlow(c, f);
+        return false;
     }
 
     f.enabled = true;
-    const bool gpuConvert = (f.flowFormat == VK_FORMAT_R16G16_SFLOAT && !f.cpuOnly) || f.gpuBlit;
-    Log("[mvec] NV optical flow enabled size=%ux%u grid=%u quality=%u input=%d flow=%d gpu_convert=%d linear=%d dir=%d xfer=%d",
-        w, h, f.grid, quality, (int)f.inputFormat, (int)f.flowFormat, int(gpuConvert), int(f.gpuBlitLinear),
+    Log("[mvec] NV optical flow enabled size=%ux%u grid=%u quality=%u input=%d flow=%d dir=%d xfer=%d",
+        w, h, f.grid, quality, (int)f.inputFormat, (int)f.flowFormat,
         int(f.currentToPrevious), int(f.flowTransferSrc));
     Log("[mvec] session grid=%u perf=%u cost=off hints=off flags=%u",
         f.grid, (unsigned)sci.performanceLevel, (unsigned)sci.flags);
-    return true;
-}
-
-static bool ReadbackFlowToStaging(NeuralState& ns) {
-    OpticalFlowState& f = ns.flow;
-    const size_t flowBytes = ImageSizeBytes(ns.vk, f.out);
-    const size_t mvBytes = ImageSizeBytes(ns.vk, ns.mv);
-    const size_t need = flowBytes > mvBytes ? flowBytes : mvBytes;
-    if (need > ns.vk.stagingSize && !CreateStaging(ns.vk, need)) {
-        Log("[mvec] failed to allocate flow readback staging");
-        return false;
-    }
-    if (!BeginCmd(ns.vk.cmdScratch)) return false;
-    TransitionImage2(ns.vk, ns.vk.cmdScratch, f.out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     0, VK_ACCESS_2_TRANSFER_READ_BIT,
-                     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
-    VkBufferImageCopy region{};
-    region.imageSubresource = { f.out.aspect(), 0, 0, 1 };
-    region.imageExtent = { f.out.width, f.out.height, 1 };
-    vkCmdCopyImageToBuffer(ns.vk.cmdScratch, f.out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           ns.vk.readStaging, 1, &region);
-    return SubmitAndWait(ns.vk, ns.vk.cmdScratch);
-}
-
-static bool FinishFlowConversionCPU(NeuralState& ns) {
-    OpticalFlowState& f = ns.flow;
-    const size_t px = size_t(f.out.width) * f.out.height;
-    const size_t mvBytes = ImageSizeBytes(ns.vk, ns.mv);
-    const uint16_t* src = (const uint16_t*)ns.vk.readMap;
-    uint16_t* dst = (uint16_t*)ns.vk.uploadMap;
-    auto decode = [&](uint32_t x, uint32_t y, uint32_t comp) -> float {
-        size_t idx = (size_t(y) * f.out.width + x) * 2 + comp;
-        return float(int16_t(src[idx])) / 32.0f;
-    };
-    if (f.out.width == ns.mv.width && f.out.height == ns.mv.height) {
-        for (size_t i = 0; i < px * 2; ++i) dst[i] = FloatToHalf(float(int16_t(src[i])) / 32.0f);
-    } else {
-        for (uint32_t y = 0; y < ns.mv.height; ++y) {
-            float fy = (float(y) + 0.5f) * float(f.out.height) / float(ns.mv.height) - 0.5f;
-            if (fy < 0) fy = 0;
-            if (fy > float(f.out.height - 1)) fy = float(f.out.height - 1);
-            uint32_t y0 = uint32_t(fy);
-            uint32_t y1 = y0 + 1 < f.out.height ? y0 + 1 : y0;
-            float wy = fy - float(y0);
-            for (uint32_t x = 0; x < ns.mv.width; ++x) {
-                float fx = (float(x) + 0.5f) * float(f.out.width) / float(ns.mv.width) - 0.5f;
-                if (fx < 0) fx = 0;
-                if (fx > float(f.out.width - 1)) fx = float(f.out.width - 1);
-                uint32_t x0 = uint32_t(fx);
-                uint32_t x1 = x0 + 1 < f.out.width ? x0 + 1 : x0;
-                float wx = fx - float(x0);
-                uint16_t* out = dst + (size_t(y) * ns.mv.width + x) * 2;
-                for (uint32_t c = 0; c < 2; ++c) {
-                    float v00 = decode(x0, y0, c), v10 = decode(x1, y0, c);
-                    float v01 = decode(x0, y1, c), v11 = decode(x1, y1, c);
-                    float vx0 = v00 + (v10 - v00) * wx;
-                    float vx1 = v01 + (v11 - v01) * wx;
-                    out[c] = FloatToHalf(vx0 + (vx1 - vx0) * wy);
-                }
-            }
-        }
-    }
-    if (!UploadMappedPixels(ns.vk, ns.mv, mvBytes)) {
-        Log("[mvec] MVec upload failed");
-        return false;
-    }
-    if (!BeginCmd(ns.vk.cmdScratch)) return false;
-    TransitionImage(ns.vk, ns.vk.cmdScratch, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-    if (!SubmitAndWait(ns.vk, ns.vk.cmdScratch)) {
-        Log("[mvec] MVec layout transition failed");
-        return false;
-    }
     return true;
 }
 
@@ -1600,71 +1720,6 @@ static bool MVecFiniteCheck(NeuralState& ns) {
     return true;
 }
 
-static bool FinishFlowConversionHybrid(NeuralState& ns) {
-    OpticalFlowState& f = ns.flow;
-    if (!f.flowFloat.image) {
-        if (!CreateImage2D(ns.vk, VK_FORMAT_R16G16_SFLOAT, f.out.width, f.out.height, f.flowFloat)) {
-            Log("[mvec] failed to create low-res float flow image");
-            return false;
-        }
-    }
-    const size_t px = size_t(f.out.width) * f.out.height;
-    const size_t flowBytes = ImageSizeBytes(ns.vk, f.out);
-    const uint16_t* src = (const uint16_t*)ns.vk.readMap;
-    uint16_t* dst = (uint16_t*)ns.vk.uploadMap;
-    if (f.flowFormat == VK_FORMAT_R16G16_SFIXED5_NV) {
-        for (size_t i = 0; i < px * 2; ++i) dst[i] = FloatToHalf(float(int16_t(src[i])) / 32.0f);
-    } else if (f.flowFormat == VK_FORMAT_R16G16_SFLOAT) {
-        std::memcpy(dst, src, flowBytes);
-    } else {
-        return false;
-    }
-    if (!UploadMappedPixels(ns.vk, f.flowFloat, flowBytes)) {
-        Log("[mvec] low-res float flow upload failed");
-        return false;
-    }
-    if (!BeginCmd(ns.vk.cmdScratch)) return false;
-    VkCommandBuffer cb = ns.vk.cmdScratch;
-    TransitionImage(ns.vk, cb, f.flowFloat, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    TransitionImage(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT);
-    const bool sameSize = f.flowFloat.width == ns.mv.width && f.flowFloat.height == ns.mv.height;
-    if (sameSize) {
-        VkImageCopy copy{};
-        copy.srcSubresource = { f.flowFloat.aspect(), 0, 0, 1 };
-        copy.dstSubresource = { ns.mv.aspect(), 0, 0, 1 };
-        copy.extent = { f.flowFloat.width, f.flowFloat.height, 1 };
-        vkCmdCopyImage(cb, f.flowFloat.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       ns.mv.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    } else {
-        if (!vkCmdBlitImage) {
-            vkEndCommandBuffer(cb);
-            Log("[mvec] vkCmdBlitImage missing for float flow upscale");
-            return false;
-        }
-        VkImageBlit blit{};
-        blit.srcSubresource = { f.flowFloat.aspect(), 0, 0, 1 };
-        blit.srcOffsets[1] = { (int32_t)f.flowFloat.width, (int32_t)f.flowFloat.height, 1 };
-        blit.dstSubresource = { ns.mv.aspect(), 0, 0, 1 };
-        blit.dstOffsets[1] = { (int32_t)ns.mv.width, (int32_t)ns.mv.height, 1 };
-        vkCmdBlitImage(cb, f.flowFloat.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       ns.mv.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                       f.gpuBlitLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-    }
-    TransitionImage(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-    return SubmitAndWait(ns.vk, cb);
-}
-
-static bool ConvertFlowToMVecHybrid(NeuralState& ns) {
-    if (!ReadbackFlowToStaging(ns)) return false;
-    return FinishFlowConversionHybrid(ns);
-}
-
 static void ResetFlowTimestampQueries(VkCtx& c, VkCommandBuffer cb) {
     if (c.flowQueryAvailable && vkCmdResetQueryPool) {
         vkCmdResetQueryPool(cb, c.flowQuery, 0, 2);
@@ -1704,27 +1759,79 @@ static double ReadFlowTimestampMs(VkCtx& c) {
 
 static bool ForceMvShaderRead(NeuralState& ns);
 
+// The proxy arrives in the layer's exported memory, released to FOREIGN with the request. Acquire
+// it from there into a transfer source and copy it into colorIn, all inside the caller's command
+// buffer -- the same submit the upload used to ride along in. The image's own layout tracking is
+// reset to GENERAL afterwards because the producer rewrites it in that layout next frame.
+static void RecordProxyToColorIn(NeuralState& ns, VkCommandBuffer cb) {
+    VkImageMemoryBarrier acq{};
+    acq.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    acq.srcAccessMask = 0;
+    acq.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    acq.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    acq.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    acq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    acq.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    acq.image = ns.vk.proxyIn.image;
+    acq.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &acq);
+    ns.vk.proxyIn.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    TransitionImage(ns.vk, cb, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkImageCopy cp{};
+    cp.srcSubresource = { ns.vk.proxyIn.aspect(), 0, 0, 1 };
+    cp.dstSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
+    cp.extent = { ns.colorIn.width, ns.colorIn.height, 1 };
+    vkCmdCopyImage(cb, ns.vk.proxyIn.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ns.colorIn.image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    // Hand the proxy back before the producer's next write touches it.
+    VkImageMemoryBarrier prel{};
+    prel.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    prel.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    prel.dstAccessMask = 0;
+    prel.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    prel.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    prel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    prel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    prel.image = ns.vk.proxyIn.image;
+    prel.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &prel);
+    ns.vk.proxyIn.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
 static bool RunOpticalFlow(NeuralState& ns) {
     OpticalFlowState& f = ns.flow;
     if (!f.enabled) return true;
 
     const bool async = ns.vk.semPrep && ns.vk.semFlow;
-    const bool gpuCompute = f.gpuCompute && f.outBitsView && f.mvPipeline && async;
+    if (!f.gpuCompute || !f.outBitsView || !f.mvPipeline || !async) {
+        // The deadzone compute pass is the only conversion now; without it (or without the
+        // semaphores that chain the three submits) there is nothing to run this frame. The caller
+        // disables estimated motion vectors on failure and the model runs with zeroed vectors.
+        Log("[mvec] GPU deadzone pass unavailable at run time");
+        return false;
+    }
 
     // ---- cmdPrep (graphics): upload colorIn, feed NVOF inputs ----
-    // The CPU swizzle already filled uploadMap; this submit also carries the
-    // scene-cut MVec clear so no extra host round-trip is needed.
+    // The proxy comes from the imported mapping when there is one, from staging otherwise; either
+    // way this submit also carries the scene-cut MVec clear so no extra host round-trip is needed.
     if (!BeginCmd(ns.vk.cmdScratch)) return false;
     VkCommandBuffer cb = ns.vk.cmdScratch;
-    TransitionImage(ns.vk, cb, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT);
-    VkBufferImageCopy upRegion{};
-    upRegion.imageSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
-    upRegion.imageExtent = { ns.colorIn.width, ns.colorIn.height, 1 };
-    if (ns.vk.frameInBuf) BarrierAfterExternalWrite(cb);
-    vkCmdCopyBufferToImage(cb, ns.vk.frameInBuf ? ns.vk.frameInBuf : ns.vk.uploadStaging,
-                           ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &upRegion);
+    if (ns.proxyActive) {
+        RecordProxyToColorIn(ns, cb);
+    } else {
+        TransitionImage(ns.vk, cb, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy upRegion{};
+        upRegion.imageSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
+        upRegion.imageExtent = { ns.colorIn.width, ns.colorIn.height, 1 };
+        vkCmdCopyBufferToImage(cb, UploadSource(ns.vk), ns.colorIn.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &upRegion);
+    }
     TransitionImage(ns.vk, cb, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1816,20 +1923,6 @@ static bool RunOpticalFlow(NeuralState& ns) {
     if (!async && !WaitFence(ns.vk, flowFence)) { WaitFence(ns.vk, prepFence); return false; }
 
     // ---- cmdPost (graphics): harvest flow + GPU deadzone pass ----
-    const bool sameSize = f.out.width == ns.mv.width && f.out.height == ns.mv.height;
-    const bool canCopy = sameSize && f.flowFormat == VK_FORMAT_R16G16_SFLOAT;
-    const bool canBlit = vkCmdBlitImage && f.gpuBlit;
-    const bool directConvert = !gpuCompute && !f.cpuOnly && !f.hybrid && (canCopy || canBlit);
-    if (!gpuCompute && !directConvert) {
-        const size_t flowBytes = ImageSizeBytes(ns.vk, f.out);
-        const size_t mvBytes = ImageSizeBytes(ns.vk, ns.mv);
-        const size_t need = flowBytes > mvBytes ? flowBytes : mvBytes;
-        if (need > ns.vk.stagingSize && !CreateStaging(ns.vk, need)) {
-            WaitFence(ns.vk, prepFence); WaitFence(ns.vk, flowFence);
-            Log("[mvec] failed to allocate flow readback staging");
-            return false;
-        }
-    }
     if (!BeginCmd(ns.vk.cmdFlowPost)) {
         WaitFence(ns.vk, prepFence); WaitFence(ns.vk, flowFence);
         return false;
@@ -1838,61 +1931,22 @@ static bool RunOpticalFlow(NeuralState& ns) {
     WriteFlowTimestampEnd(ns.vk, cb);
     CopyFlowTimestampResults(ns.vk, cb);
 
-    if (gpuCompute) {
-        // The compute pass reads the raw NVOF texels in-place through the
-        // R16G16_UINT view, decodes, deadzone-clamps and upscales straight into
-        // the MVec resource. No host readback, no image->image bit copy.
-        TransitionImage2(ns.vk, cb, f.out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_ACCESS_2_OPTICAL_FLOW_WRITE_BIT_NV, VK_ACCESS_2_SHADER_READ_BIT,
-                         VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        TransitionImage2(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, f.mvPipeline);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, ns.vk.mvPipeLayout,
-                                0, 1, &f.mvSet, 0, nullptr);
-        vkCmdDispatch(cb, (ns.mv.width + 7) / 8, (ns.mv.height + 7) / 8, 1);
-        TransitionImage2(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_ACCESS_2_SHADER_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT,
-                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-    } else {
-        TransitionImage2(ns.vk, cb, f.out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         VK_ACCESS_2_OPTICAL_FLOW_WRITE_BIT_NV, VK_ACCESS_2_TRANSFER_READ_BIT,
-                         VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
-        if (directConvert) {
-            VkAccessFlags mvSrcA; VkPipelineStageFlags mvSrcS;
-            SrcAccessForLayout(ns.mv.layout, &mvSrcA, &mvSrcS);
-            TransitionImage(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mvSrcA,
-                            VK_ACCESS_TRANSFER_WRITE_BIT, mvSrcS, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            if (canCopy) {
-                VkImageCopy copy{};
-                copy.srcSubresource = { f.out.aspect(), 0, 0, 1 };
-                copy.dstSubresource = { ns.mv.aspect(), 0, 0, 1 };
-                copy.extent = { f.out.width, f.out.height, 1 };
-                vkCmdCopyImage(cb, f.out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               ns.mv.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            } else {
-                VkImageBlit blit{};
-                blit.srcSubresource = { f.out.aspect(), 0, 0, 1 };
-                blit.srcOffsets[1] = { (int32_t)f.out.width, (int32_t)f.out.height, 1 };
-                blit.dstSubresource = { ns.mv.aspect(), 0, 0, 1 };
-                blit.dstOffsets[1] = { (int32_t)ns.mv.width, (int32_t)ns.mv.height, 1 };
-                const VkFilter filter = sameSize ? VK_FILTER_NEAREST
-                    : (f.gpuBlitLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-                vkCmdBlitImage(cb, f.out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               ns.mv.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
-            }
-            TransitionImage(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        } else {
-            VkBufferImageCopy region{};
-            region.imageSubresource = { f.out.aspect(), 0, 0, 1 };
-            region.imageExtent = { f.out.width, f.out.height, 1 };
-            vkCmdCopyImageToBuffer(cb, f.out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                   ns.vk.readStaging, 1, &region);
-        }
-    }
+    // The compute pass reads the raw NVOF texels in-place through the
+    // R16G16_UINT view, decodes, deadzone-clamps and upscales straight into
+    // the MVec resource. No host readback, no image->image bit copy.
+    TransitionImage2(ns.vk, cb, f.out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_ACCESS_2_OPTICAL_FLOW_WRITE_BIT_NV, VK_ACCESS_2_SHADER_READ_BIT,
+                     VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    TransitionImage2(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, f.mvPipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, ns.vk.mvPipeLayout,
+                            0, 1, &f.mvSet, 0, nullptr);
+    vkCmdDispatch(cb, (ns.mv.width + 7) / 8, (ns.mv.height + 7) / 8, 1);
+    TransitionImage2(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_ACCESS_2_SHADER_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
     TransitionImage2(ns.vk, cb, f.curr, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                      VK_ACCESS_2_OPTICAL_FLOW_READ_BIT_NV, VK_ACCESS_2_TRANSFER_READ_BIT,
@@ -1950,49 +2004,13 @@ static bool RunOpticalFlow(NeuralState& ns) {
         }
     }
 
-    if (gpuCompute) {
-        if (!f.gpuConvertChecked) {
-            f.gpuConvertChecked = true;
-            if (DebugMVecEnabled() && !MVecFiniteCheck(ns)) {
-                Log("[mvec] GPU deadzone pass produced invalid MVec, disabling compute path");
-                f.gpuCompute = false;
-                if (!ForceMvShaderRead(ns)) return false;
-                ns.mvecResetPending = true;
-            }
-        }
-    } else if (directConvert) {
-        if (!f.gpuConvertChecked) {
-            f.gpuConvertChecked = true;
-            if (!MVecFiniteCheck(ns)) {
-                Log("[mvec] GPU flow conversion produced invalid MVec, trying hybrid CPU+GPU conversion");
-                if (!ConvertFlowToMVecHybrid(ns)) {
-                    Log("[mvec] hybrid flow conversion failed, falling back to CPU");
-                    f.hybrid = false;
-                    f.cpuOnly = true;
-                    f.gpuBlit = false;
-                    if (!ReadbackFlowToStaging(ns) || !FinishFlowConversionCPU(ns)) {
-                        Log("[mvec] CPU flow conversion failed");
-                        return false;
-                    }
-                } else {
-                    f.hybrid = true;
-                }
-            }
-        }
-    } else if (f.hybrid) {
-        if (!FinishFlowConversionHybrid(ns)) {
-            Log("[mvec] hybrid flow conversion failed, falling back to CPU");
-            f.hybrid = false;
-            f.cpuOnly = true;
-            if (!ReadbackFlowToStaging(ns) || !FinishFlowConversionCPU(ns)) {
-                Log("[mvec] CPU flow conversion failed");
-                return false;
-            }
-        }
-    } else {
-        if (!FinishFlowConversionCPU(ns)) {
-            Log("[mvec] CPU flow conversion failed");
-            return false;
+    if (!f.gpuConvertChecked) {
+        f.gpuConvertChecked = true;
+        if (DebugMVecEnabled() && !MVecFiniteCheck(ns)) {
+            Log("[mvec] GPU deadzone pass produced invalid MVec, disabling compute path");
+            f.gpuCompute = false;
+            if (!ForceMvShaderRead(ns)) return false;
+            ns.mvecResetPending = true;
         }
     }
     if (DebugMVecEnabled()) {
@@ -2165,21 +2183,6 @@ static void PublishStatus(ShmMap& shm, NeuralState& ns, uint32_t state) {
     ShmStore64(shm.hdr->helperFramesLo, shm.hdr->helperFramesHi, ns.evaluates);
 }
 
-static uint16_t FloatToHalf(float f) {
-    uint32_t x = 0;
-    std::memcpy(&x, &f, sizeof(x));
-    uint32_t sign = (x >> 16) & 0x8000u;
-    uint32_t exp = (x >> 23) & 0xFFu;
-    uint32_t mant = x & 0x7FFFFFu;
-    if (exp == 0xFFu) return uint16_t(sign | 0x7C00u | (mant ? 0x200u : 0u));
-    if (exp > 142u) return uint16_t(sign | 0x7C00u);
-    if (exp < 103u) return uint16_t(sign);
-    exp -= 112u;
-    uint32_t h = sign | (exp << 10) | (mant >> 13);
-    if ((mant >> 12) & 1u) ++h;
-    return uint16_t(h);
-}
-
 static float HalfToFloat(uint16_t h) {
     uint32_t sign = uint32_t(h & 0x8000u) << 16;
     uint32_t exp = (h >> 10) & 0x1Fu;
@@ -2234,9 +2237,11 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     ns.livePasses = 0;
     std::memset(ns.passDirty, 0, sizeof(ns.passDirty));
 
-    if (!CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.colorIn) ||
-        !CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.workA) ||
-        !CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.workB) ||
+    const VkFormat chainFmt = ns.hdrBuilt ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    ns.ngx.hdrActive = ns.hdrBuilt != 0;
+    if (!CreateImage2D(ns.vk, chainFmt, w, h, ns.colorIn) ||
+        !CreateImage2D(ns.vk, chainFmt, w, h, ns.workA) ||
+        !CreateImage2D(ns.vk, chainFmt, w, h, ns.workB) ||
         !CreateImage2D(ns.vk, VK_FORMAT_R16G16_SFLOAT, w, h, ns.mv) ||
         !CreateImage2D(ns.vk, VK_FORMAT_R32_SFLOAT, w, h, ns.depth)) {
         Log("[helper] image creation failed at %ux%u", w, h);
@@ -2305,6 +2310,22 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
                            "the model would not accept this frame size; try a different resolution "
                            "or model resolution");
             PublishStatus(shm, ns, kHelperRunning);
+            return false;
+        }
+        if (ns.hdrBuilt) {
+            // The float contract was refused. That is the model saying no, not the model being
+            // dead: drop back to 8-bit and let the next frame rebuild everything the SDR way.
+            Log("[helper] model refused the float16 contract at %ux%u; falling back to 8-bit", w, h);
+            ns.hdrRejected = true;
+            ns.hdrBuilt = 0;
+            ns.ngx.hdrActive = false;
+            if (ns.vk.dmaBuf) {
+                EnsureProxyOut(ns.vk, shm.hdr, w, h, VK_FORMAT_R8G8B8A8_UNORM);
+                EnsureAnswerOut(ns.vk, shm.hdr, w, h, VK_FORMAT_R8G8B8A8_UNORM);
+            }
+            shm.hdr->proxyFormat.store(kProxyRgba8);
+            ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                           "model refused float input; 8-bit proxy in use");
             return false;
         }
         Log("[helper] snippet init/create failed at %ux%u", w, h);
@@ -2474,14 +2495,95 @@ static void MaintainPasses(NeuralState& ns, ShmMap& shm, uint32_t wanted) {
     }
 }
 
+// The first field of /proc/self/stat is the kernel's pid for this process -- the number /proc is
+// keyed by, which is what the layer needs to open an exported fd. Wine's Z: drive is the host's
+// root, so the file is reachable through the ordinary file API.
+static uint32_t ReadLinuxPid() {
+    HANDLE h = CreateFileA("Z:\\proc\\self\\stat", GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    char buf[256];
+    DWORD got = 0;
+    const bool ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr) && got > 0;
+    CloseHandle(h);
+    if (!ok) return 0;
+    buf[got] = '\0';
+    return (uint32_t)strtoul(buf, nullptr, 10);
+}
+
 static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     uint32_t w = shm.hdr->width.load(), h = shm.hdr->height.load();
     if (!w || !h || w > kMaxW || h > kMaxH) return false;
+    // Echo the raster this call answers before seq_resp announces it, so a swapchain waiting on a
+    // different request (another swapchain's, or its own before a resize) can refuse an answer that
+    // was not made for it instead of copying the wrong number of bytes.
+    shm.hdr->answeredW.store(w);
+    shm.hdr->answeredH.store(h);
 
     const size_t px = size_t(w) * h;
-    const size_t bytes = px * 4;
+
+    // The HDR decision, read from the same header statement that announced this frame's bytes.
+    // hdrActive is the layer's intent (and the echo that lets this process build float surfaces at
+    // all); hdrEncode is the width of the pixels already sitting in the region -- the two differ by
+    // the frames it takes to switch, and every copy below sizes itself by hdrEncode, never by hope.
+    const uint32_t hdrActive = shm.hdr->hdrActive.load() ? 1u : 0u;
+    const uint32_t hdrEncode = shm.hdr->hdrEncode.load() ? 1u : 0u;
+    const bool wantHdr = hdrActive && !ns.hdrRejected &&
+                         (!ns.ngx.snippet || ns.ngx.hdrCapable);
+    const size_t bytes = px * (hdrEncode ? 8 : 4);
+
+    // The switch. One frame's worth of refusal, and every surface -- crossing, chain and feature
+    // contract -- moves together on the next. Refusing the frame that switches is what keeps a
+    // half-moved pipeline from ever reading bytes as the wrong width: the layer presents its own
+    // frame for that one, and the log says why.
+    const bool hdrSwitching = wantHdr != (ns.hdrBuilt != 0);
+    if (hdrSwitching) {
+        if (vkDeviceWaitIdle) vkDeviceWaitIdle(ns.vk.device);
+        NgxReleaseAllPasses(ns.ngx, ns.vk.device);
+        ns.livePasses = 0;
+        std::memset(ns.passDirty, 0, sizeof(ns.passDirty));
+        DestroyImage2D(ns.vk, ns.colorIn);
+        DestroyImage2D(ns.vk, ns.workA);
+        DestroyImage2D(ns.vk, ns.workB);
+        ns.hdrBuilt = wantHdr ? 1u : 0u;
+        ns.ready = false;
+        if (!wantHdr) ns.hdrRejected = false;  // re-arm the attempt for the next time it is asked
+    }
+    const VkFormat xferFmt = ns.hdrBuilt ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+
+    // Phase 5: the proxy image is this process's own memory, exported so the layer can write it.
+    // Publishing it is unconditional while the channel is up; reading it through the fd path is
+    // not -- that needs the layer's flag, which says the layer has imported the descriptor and is
+    // writing through it on exactly this frame.
+    // Both images are published while the channel is up -- the answer as much as the proxy,
+    // because the layer can only import what has been named, and importing is what makes it ask
+    // for the fd path. The echo below is what turns the fd path on: the layer restates the
+    // sequence it has taken a reference at, and reading or writing through the fd requires this
+    // process's current sequence to be the one echoed back.
+    if (ns.vk.dmaBuf) {
+        EnsureProxyOut(ns.vk, shm.hdr, w, h, xferFmt);
+        EnsureAnswerOut(ns.vk, shm.hdr, w, h, xferFmt);
+    }
+    ns.proxyActive = ns.vk.dmaBuf && ns.vk.proxyIn.image && ns.vk.proxyW == w && ns.vk.proxyH == h &&
+                     ns.vk.proxySeq != 0 && shm.hdr->layerProxySeq.load() == ns.vk.proxySeq;
+
+    // The crossing images now carry the new format and their export sequences have moved, so the
+    // name published here is the name of what the layer will actually import. The frame that
+    // switches is still refused: its bytes are the old width, and presenting the game's own frame
+    // for one frame beats reading them wrong.
+    if (hdrSwitching) {
+        shm.hdr->proxyFormat.store(ns.hdrBuilt ? kProxyRgba16F : kProxyRgba8);
+        Log("[helper] hdr %s at %ux%u (encoding %s); this frame passes through",
+            ns.hdrBuilt ? "on: float16" : "off: 8-bit", w, h, hdrEncode ? "float16" : "8-bit");
+        return false;
+    }
 
     if (!ShmNeuralEnabled(shm.hdr)) {
+        // The pass-through answer is a copy of the shared-memory proxy -- which the dma-buf path
+        // leaves unwritten. Failing the frame gives the same result the bypass intends: the game's
+        // own frame, presented as it is.
+        if (ns.proxyActive) return false;
         std::memcpy(shm.outPixels, shm.inPixels, bytes);
         return true;
     }
@@ -2502,6 +2604,19 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     if (!EnsureNeural(ns, shm, w, h)) return false;
     MaintainPasses(ns, shm, wanted);
     if (!ns.ready || ns.livePasses == 0) return false;
+    shm.hdr->proxyFormat.store(ns.hdrBuilt ? kProxyRgba16F : kProxyRgba8);
+
+    // Every pass failed to build under the float contract: the model said no after all. Drop back;
+    // the switch block rebuilds the whole chain 8-bit on the next frame.
+    if (ns.hdrBuilt && wanted > 0) {
+        bool anyBuilt = false;
+        for (uint32_t i = 0; i < kMaxPasses; ++i) if (ns.ngx.features[i]) anyBuilt = true;
+        if (!anyBuilt) {
+            Log("[helper] no pass built under the float contract; falling back to 8-bit");
+            ns.hdrRejected = true;
+            return false;
+        }
+    }
 
     if (ns.appliedMvecScaleMode != ns.mvecScaleMode) {
         ApplyMotionScale(ns.ngx, ns.mvecScaleMode, w, h);
@@ -2538,28 +2653,24 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         if (rc == 0) Log("[helper] estimated motion vectors disabled after a quality change");
     }
 
-    // The proxy the layer encoded. It is already R8G8B8A8_UNORM and display-referred, so there is
-    // nothing to swizzle and nothing to convert.
+    // The proxy the layer encoded. It is already in the chain's own format -- 8-bit display-referred,
+    // or float16 normalised linear light under the HDR path -- so there is nothing to swizzle and
+    // nothing to convert.
     //
-    // The flow engine wants the staging buffer too, and wants it larger than the frame when the
-    // conversion runs partly on the host, so the size is settled before anything is copied in.
-    size_t needed = bytes;
-    if (ns.flow.enabled && (ns.flow.cpuOnly || ns.flow.hybrid)) {
-        const size_t mvBytes = ImageSizeBytes(ns.vk, ns.mv);
-        const size_t flowBytes = ImageSizeBytes(ns.vk, ns.flow.out);
-        if (mvBytes > needed) needed = mvBytes;
-        if (flowBytes > needed) needed = flowBytes;
+    // When the transport is imported, the proxy is already in the GPU's buffer -- the region this
+    // process maps and the region the layer's GPU wrote are the same pages. Without the import the
+    // frame is copied into staging first, as before.
+    if (!ns.proxyActive && !ns.vk.transportIn) {
+        if (bytes > ns.vk.stagingSize && !CreateStaging(ns.vk, bytes)) return false;
+        std::memcpy(ns.vk.uploadMap, shm.inPixels, bytes);
     }
-    if (needed > ns.vk.stagingSize && !CreateStaging(ns.vk, needed)) return false;
-
-    // With the regions imported there is nothing to move: the layer wrote the proxy into these pages
-    // and the copy below reads them directly.
-    EnsureFrameImports(ns.vk, shm.inPixels, shm.outPixels, bytes);
-    if (!ns.vk.frameInBuf) std::memcpy(ns.vk.uploadMap, shm.inPixels, bytes);
 
     // A cut is not motion. Carrying a flow field across one hands the model a field describing a
-    // scene that is no longer on screen, which is worse than handing it nothing.
-    const bool sceneCut = DetectSceneCut(ns, shm.inPixels, w, h, 1);
+    // scene that is no longer on screen, which is worse than handing it nothing. The CPU detector
+    // reads the shared-memory region, which the dma-buf path leaves unwritten, so it stands down
+    // while the fd path is live -- one frame of stale flow across a cut is the price of the copy.
+    const bool sceneCut = !ns.proxyActive && !hdrEncode &&
+                          DetectSceneCut(ns, shm.inPixels, w, h, 1);
     if (sceneCut && !ns.firstFrame && ns.flow.enabled) {
         ns.flow.hasPrev = false;
         ns.pendingMvClear = true;  // zeroed inside the flow prep submit, GPU-side
@@ -2577,7 +2688,11 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
             ns.mvecResetPending = true;
             ns.lastResetLogged = 0xFFFFFFFFu;
         }
-    } else if (!UploadMappedPixels(ns.vk, ns.colorIn, bytes, ns.vk.frameInBuf)) {
+    } else if (ns.proxyActive) {
+        if (!BeginCmd(ns.vk.cmdScratch)) return false;
+        RecordProxyToColorIn(ns, ns.vk.cmdScratch);
+        if (!SubmitAndWait(ns.vk, ns.vk.cmdScratch)) return false;
+    } else if (!UploadMappedPixels(ns.vk, ns.colorIn, bytes, UploadSource(ns.vk))) {
         return false;
     }
 
@@ -2630,43 +2745,68 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     ns.firstFrame = false;
     const double tEval = time ? NowMs() : 0.0;
 
-    if (!last || !ReadbackPixels(ns.vk, *last, bytes, ns.vk.frameOutBuf)) return false;
-    if (!ns.vk.frameOutBuf) std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
+    if (!last) return false;
 
-    // The motion field, when the layer has asked for one. It says where each pixel of the *next*
-    // frame was in this one, which is what lets the layer move this answer's edit to where its
-    // content has got to instead of leaving it on the previous frame's edges.
-    //
-    // Written only on request: it is a frame-sized copy every frame, and only the pipelined path has
-    // any use for it.
-    if (shm.hdr->wantMotion.load() && ns.flow.enabled && ns.mv.image) {
-        EnsureMotionImport(ns.vk, shm.motionPixels, ImageSizeBytes(ns.vk, ns.mv));
-        const size_t mvBytes = ImageSizeBytes(ns.vk, ns.mv);
-        if (ns.vk.motionBuf) {
-            if (!BeginCmd(ns.vk.cmdScratch)) return false;
-            TransitionImage(ns.vk, ns.vk.cmdScratch, ns.mv, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkBufferImageCopy r{};
-            r.imageSubresource = { ns.mv.aspect(), 0, 0, 1 };
-            r.imageExtent = { ns.mv.width, ns.mv.height, 1 };
-            vkCmdCopyImageToBuffer(ns.vk.cmdScratch, ns.mv.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                   ns.vk.motionBuf, 1, &r);
-            BarrierBeforeExternalRead(ns.vk.cmdScratch);
-            TransitionImage(ns.vk, ns.vk.cmdScratch, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            if (SubmitAndWait(ns.vk, ns.vk.cmdScratch)) {
-                shm.hdr->motionW.store(ns.mv.width);
-                shm.hdr->motionH.store(ns.mv.height);
-                shm.hdr->motionSeq.store(shm.hdr->seq_req.load());
-            }
-        } else if (mvBytes <= ns.vk.stagingSize && ReadbackPixels(ns.vk, ns.mv, mvBytes)) {
-            std::memcpy(shm.motionPixels, ns.vk.readMap, mvBytes);
-            shm.hdr->motionW.store(ns.mv.width);
-            shm.hdr->motionH.store(ns.mv.height);
-            shm.hdr->motionSeq.store(shm.hdr->seq_req.load());
-        }
+    // Phase 5: the answer goes back the way the proxy came -- a copy into exportable memory,
+    // released to FOREIGN. The shared-memory write stops exactly when the layer's flag says it is
+    // reading the fd, and the flag is honoured on the frame it was set for. If the exportable
+    // image has gone away while the flag was up, the answer has no destination: fail the frame so
+    // the layer presents the raw one, and the withdrawn export clears the flag on the next.
+    // The two directions are independent: the answer can ride the fd path on a frame where the
+    // proxy still rides shared memory, and the echo says so per direction.
+    const bool wantFdAnswer = ns.vk.answerSeq != 0 &&
+                              shm.hdr->layerAnswerSeq.load() == ns.vk.answerSeq;
+    const bool fdAnswer = wantFdAnswer && EnsureAnswerOut(ns.vk, shm.hdr, w, h, xferFmt);
+    if (wantFdAnswer && !fdAnswer) return false;
+    if (fdAnswer) {
+        if (!BeginCmd(ns.vk.cmdScratch)) return false;
+        VkCommandBuffer cb = ns.vk.cmdScratch;
+        VkAccessFlags srcA;
+        VkPipelineStageFlags srcS;
+        SrcAccessForLayout(last->layout, &srcA, &srcS);
+        TransitionImage(ns.vk, cb, *last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, srcA,
+                        VK_ACCESS_TRANSFER_READ_BIT, srcS, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // Acquire the answer surface from FOREIGN: the layer sampled it last frame and released it
+        // back before presenting, so its caches are clean and the layout is whatever the layer left.
+        VkImageMemoryBarrier aacq{};
+        aacq.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        aacq.srcAccessMask = 0;
+        aacq.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        aacq.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        aacq.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        aacq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+        aacq.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        aacq.image = ns.vk.answerOut.image;
+        aacq.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             0, nullptr, 0, nullptr, 1, &aacq);
+        ns.vk.answerOut.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        VkImageCopy cp{};
+        cp.srcSubresource = { last->aspect(), 0, 0, 1 };
+        cp.dstSubresource = { ns.vk.answerOut.aspect(), 0, 0, 1 };
+        cp.extent = { w, h, 1 };
+        vkCmdCopyImage(cb, last->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ns.vk.answerOut.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        TransitionImage(ns.vk, cb, ns.vk.answerOut, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        VkImageMemoryBarrier rel{};
+        rel.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        rel.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        rel.dstAccessMask = 0;
+        rel.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        rel.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        rel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+        rel.image = ns.vk.answerOut.image;
+        rel.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &rel);
+        ns.vk.answerOut.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (!SubmitAndWait(ns.vk, cb)) return false;
+    } else {
+        if (!ReadbackPixels(ns.vk, *last, bytes)) return false;
+        if (!ns.vk.transportOut) std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
     }
     const double tDone = time ? NowMs() : 0.0;
 
@@ -2727,6 +2867,29 @@ int main() {
                        "no NVIDIA device with the NVX extensions");
         return 3;
     }
+    // Best-effort: if the view landed aligned and the driver accepts the import, the frame carries
+    // no host copies. Otherwise the staging paths are used and everything still works.
+    ImportTransport(ns.vk, shm.inPixels, shm.outPixels, kMaxFrame);
+
+    // Phase 5: the dma-buf exchange, if the driver can carry it. The layer takes a reference on
+    // exported memory by duplicating descriptors out of this process, so it needs the real Linux pid --
+    // GetCurrentProcessId answers with the Win32 one, which means nothing to procfs. The kernel's
+    // own record of the process says otherwise, and Wine can read it like any file.
+    {
+        const char* env = getenv("DLSSNR_DMABUF");
+        const bool want = !(env && !_stricmp(env, "0"));
+        if (want && vkGetMemoryFdKHR &&
+            HasDeviceExt(ns.vk.physical, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) &&
+            HasDeviceExt(ns.vk.physical, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+            ns.vk.linuxPid = ReadLinuxPid();
+            if (ns.vk.linuxPid) {
+                ns.vk.dmaBuf = true;
+                Log("[fd] dma-buf exchange ready (linux pid %u)", ns.vk.linuxPid);
+            } else {
+                Log("[fd] could not read the linux pid; shared memory transport stays");
+            }
+        }
+    }
     shm.hdr->helperState.store(kHelperRunning);
     Log("[helper] context ready, waiting for frames");
 
@@ -2764,7 +2927,12 @@ int main() {
         }
         // The moment this helper first knew there was work. Everything between the layer's publish
         // and here is wake-up latency and belongs to nobody's compute.
+        // The moment this helper first knew there was work. Everything between the layer's publish
+        // and here is wake-up latency and belongs to nobody's compute.
         shm.hdr->dbgDetectMs.store(DoubleBits(NowMs()));
+        // The acquire pairs with the layer's release before seq_req: the proxy it wrote (by GPU into
+        // the imported region, or by memcpy) is visible here before we read it.
+        std::atomic_thread_fence(std::memory_order_acquire);
         bool ok = ProcessFrame(ns, shm);
         if (!ok) Log("[helper] frame %u failed (w=%u h=%u)", req, shm.hdr->width.load(), shm.hdr->height.load());
         shm.hdr->seq_ok.store(ok ? req : 0);
@@ -2772,6 +2940,10 @@ int main() {
         // watching -- writing it afterwards would put the timestamp in the past of a reader that has
         // already moved on.
         shm.hdr->dbgWrittenMs.store(DoubleBits(NowMs()));
+        // The release pairs with the layer's acquire on seq_resp: the answer -- written by the GPU
+        // into the imported region or by the staging memcpy -- is visible before the number that
+        // announces it.
+        std::atomic_thread_fence(std::memory_order_release);
         shm.hdr->seq_resp.store(req);
         lastReq = req;
         if (ns.ngx.disabled) {
@@ -2786,10 +2958,14 @@ int main() {
     Log("[helper] shutting down");
     if (ns.ngx.snippet) NgxTeardown(ns.ngx, ns.vk.device);
     vkDeviceWaitIdle(ns.vk.device);
+    DestroyImage2D(ns.vk, ns.vk.proxyIn);
+    DestroyImage2D(ns.vk, ns.vk.answerOut);
+    // Export fds are left to the kernel at exit -- see CreateExportable.
     DestroyOpticalFlow(ns.vk, ns.flow);
     if (ns.vk.mvPipeLayout && vkDestroyPipelineLayout) vkDestroyPipelineLayout(ns.vk.device, ns.vk.mvPipeLayout, nullptr);
     if (ns.vk.mvDescLayout && vkDestroyDescriptorSetLayout) vkDestroyDescriptorSetLayout(ns.vk.device, ns.vk.mvDescLayout, nullptr);
-    if (ns.vk.mvShaderModule && vkDestroyShaderModule) vkDestroyShaderModule(ns.vk.device, ns.vk.mvShaderModule, nullptr);
+    if (ns.vk.mvShaderFixed5 && vkDestroyShaderModule) vkDestroyShaderModule(ns.vk.device, ns.vk.mvShaderFixed5, nullptr);
+    if (ns.vk.mvShaderFloat && vkDestroyShaderModule) vkDestroyShaderModule(ns.vk.device, ns.vk.mvShaderFloat, nullptr);
     if (ns.vk.semPrep && vkDestroySemaphore) vkDestroySemaphore(ns.vk.device, ns.vk.semPrep, nullptr);
     if (ns.vk.semFlow && vkDestroySemaphore) vkDestroySemaphore(ns.vk.device, ns.vk.semFlow, nullptr);
     if (ns.vk.cmdPoolFlow) vkDestroyCommandPool(ns.vk.device, ns.vk.cmdPoolFlow, nullptr);
