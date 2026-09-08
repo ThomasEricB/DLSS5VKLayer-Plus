@@ -102,6 +102,15 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
         if (!std::isfinite(s.ghostSlack) || s.ghostSlack < 0.0f) s.ghostSlack = 0.5f;
     }
     {
+        s.ratioSmooth = float(h->ratioSmoothPercent.load()) / 100.0f;
+        static const int forcedRs = [] {
+            const char* v = getenv("DLSSNR_RATIO_SMOOTH");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forcedRs >= 0) s.ratioSmooth = float(forcedRs) / 100.0f;
+        if (!std::isfinite(s.ratioSmooth) || s.ratioSmooth < 0.0f) s.ratioSmooth = 0.0f;
+        if (s.ratioSmooth > 1.0f) s.ratioSmooth = 1.0f;
+
         s.colourTrust = float(h->colourTrustPercent.load()) / 100.0f;
         static const int forcedCt = [] {
             const char* v = getenv("DLSSNR_COLOUR_TRUST");
@@ -1129,6 +1138,7 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.HdrProxy = _hdrProxy ? 1u : 0u;
     c.HdrTransfer = _hdrProxy ? _hdrTransfer : 0u;
     c.ColourTrust = s.colourTrust;
+    c.RatioSmooth = s.ratioSmooth;
     return c;
 }
 

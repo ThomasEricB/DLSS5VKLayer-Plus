@@ -71,6 +71,9 @@ struct FrameSettings {
     // How much of the chroma-agreement gate to apply. See colourTrustPercent.
     float colourTrust = 1.0f;
 
+    // How much of the relighting ratio comes from the neighbourhood. See ratioSmoothPercent.
+    float ratioSmooth = 0.0f;
+
 
     static FrameSettings Read(const ShmHeader* h);
 };

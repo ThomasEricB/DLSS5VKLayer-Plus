@@ -51,6 +51,8 @@ const Setting kSettings[] = {
     { "transfer", &ShmHeader::transfer, false, "0 classic, 1 matched residual, 2 native + edit" },
       "present the model's raw answer instead of composing its edit, 0 or 1" },
       "run the model alongside the frame instead of waiting for it, 0 or 1" },
+      "how much of the relighting ratio comes from the neighbourhood, 0-100 (0 = per-pixel, as before)" },
+
     { "colourtrust", &ShmHeader::colourTrustPercent, false,
       "how much of the chroma-agreement gate to apply, 0-100 (0 = take the model's colour everywhere)" },
       "how hard the measured displacement is filtered over time, 0-100 (0 = raw, 100 default)" },
