@@ -33,6 +33,9 @@ cbuffer Params : register(b0)
                            //    white point -- no knee, no sRGB, no ceiling. Off is the SDR path.
     uint  gHdrTransfer;    // 1 with gHdrProxy: the swapchain carries PQ (ST 2084), so the frame is
                            //    PQ-decoded on the way in and PQ-encoded on the way out.
+    float gColourTrust;    // how much of the chroma-agreement gate to apply, 0..1
+
+
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -1105,7 +1108,32 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // neutral, NOT by clipping channels. So an over-driven colour rolls off at the gamut boundary
     // (maximally vivid but still a real colour with detail) instead of flattening into a blown peak.
     // At strength 1 the boost is the identity, so <=1 is bit-identical to before.
-    float3 result = lerp(original * boundedRatio, upgraded, min(gColourStrength, 1.0));
+    const float3 lumaOnly = original * boundedRatio;
+
+    // How far taking the model's colour would move this pixel's balance, and how much of it to take.
+    //
+    // Both ends of the blend carry the same luminance -- the guard above bound them together -- so
+    // what separates them is chroma and nothing else. On a flat surface the model agrees with the
+    // frame about hue and that separation is small, which is where the colour transfer earns its
+    // keep. On an edge the model's answer differs most, because an edge is precisely what it was
+    // asked to re-decide, and taking its hue whole puts one colour on one side of the edge and its
+    // complement on the other. That is the blue and orange fringing, and at strength 1 -- the
+    // default -- there was nothing between the disagreement and the screen.
+    //
+    // Measured on a game frame: the pass moved colour balance three to five times more at edges than
+    // on flat pixels, and every bit of it came from this blend. Under it the ringing is gone with the
+    // luminance detail untouched, because that lives in boundedRatio and not here.
+    const float chromaSwing = length(upgraded - lumaOnly) / max(dot(lumaOnly, kLuma), 1e-4);
+    const float kAgree = 0.05;   // the two want much the same colour: take all of it
+    const float kDiffer = 0.25;  // they plainly disagree: keep the frame's own hue
+    // Softened by the control, so the gate can be taken out of the picture without also giving up the
+    // colour strength it multiplies. At 1 this is the gate as measured; at 0 the model's colour is
+    // taken everywhere, which is what it did before the gate existed.
+    const float colourTrust = lerp(1.0, saturate((kDiffer - chromaSwing) / (kDiffer - kAgree)),
+                                   saturate(gColourTrust));
+
+    float3 result = lerp(lumaOnly, upgraded, min(gColourStrength, 1.0) * colourTrust);
+
 
     if (gColourStrength > 1.0)
         result = ClampAp1(FromOkLab(float3(1.0, gColourStrength, gColourStrength) * ToOkLab(max(result, 0.0))));

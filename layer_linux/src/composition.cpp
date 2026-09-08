@@ -85,6 +85,50 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
     s.holdFrame = h->holdFrame.load();
     s.downscaler = h->scalingDownscaler.load();
     s.compositionBypass = h->compositionBypass.load();
+    {
+        // DLSSNR_SETTLE, in the same hundredths, so the ramp can be swept from a launch option --
+        // including back to 100, which is the behaviour before it existed.
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_SETTLE");
+            return v && *v ? atoi(v) : -1;
+        }();
+    }
+    {
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_GHOST_SLACK");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.ghostSlack = float(forced) / 100.0f;
+        if (!std::isfinite(s.ghostSlack) || s.ghostSlack < 0.0f) s.ghostSlack = 0.5f;
+    }
+    {
+        s.colourTrust = float(h->colourTrustPercent.load()) / 100.0f;
+        static const int forcedCt = [] {
+            const char* v = getenv("DLSSNR_COLOUR_TRUST");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forcedCt >= 0) s.colourTrust = float(forcedCt) / 100.0f;
+        if (!std::isfinite(s.colourTrust) || s.colourTrust < 0.0f) s.colourTrust = 1.0f;
+        if (s.colourTrust > 1.0f) s.colourTrust = 1.0f;
+
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_MOTION_SMOOTH");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.motionSmooth = float(forced) / 100.0f;
+        if (!std::isfinite(s.motionSmooth) || s.motionSmooth < 0.0f) s.motionSmooth = 0.0f;
+        if (s.motionSmooth > 1.0f) s.motionSmooth = 1.0f;
+    }
+    {
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_EDIT_BLUR");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.editBlur = float(forced) / 1000.0f;
+        if (!std::isfinite(s.editBlur) || s.editBlur < 0.0f) s.editBlur = 0.0f;
+        if (s.editBlur > 0.25f) s.editBlur = 0.25f;
+    }
+
 
     s.whitePointManual = BitsToFloat(h->whitePointBits.load());
     s.whitePointScale = BitsToFloat(h->whitePointScaleBits.load());
@@ -1084,6 +1128,7 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.ExposurePreMul = 1.0f;
     c.HdrProxy = _hdrProxy ? 1u : 0u;
     c.HdrTransfer = _hdrProxy ? _hdrTransfer : 0u;
+    c.ColourTrust = s.colourTrust;
     return c;
 }
 

@@ -192,6 +192,11 @@ struct alignas(256) DlssNrConstants
     // byte-identical. Trailing, mirroring the cbuffer.
     uint32_t HdrProxy;
     uint32_t HdrTransfer;
+
+    // How much of the chroma-agreement gate to apply, 0..1. See colourTrustPercent.
+    float ColourTrust;
+
+
 };
 
 class DlssNr_Common
