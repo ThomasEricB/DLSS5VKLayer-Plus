@@ -525,6 +525,30 @@ static void ApplyHdrContract(NgxSnippet& s) {
 // find, so the first create attempt named its own requirements -- Width, Height, BackbufferFormat and
 // UseReflexMatrices -- and each round of filling them in reveals the next. That log is why this can
 // be written at all without the DLSS-G headers.
+// Why frame generation declines, found in Streamline's own header.
+//
+// The snippet answers its settings callback with MustCallEval=0 -- it is not failing, it is saying
+// no evaluation is required -- and sl_dlss_g.h enumerates the reasons DLSS-G reports for not
+// running:
+//
+//     eFailResolutionTooLow                   the swapchain is too small
+//     eFailReflexNotDetectedAtRuntime         "Reflex must be turned on when DLSS-G is on"
+//     eFailHDRFormatNotSupported
+//     eFailCommonConstantsInvalid             the camera matrices, jitter and depth
+//     eFailGetCurrentBackBufferIndexNotCalled the swapchain's own index API
+//
+// Two of those are this architecture rather than a missing key. Reflex is a documented hard
+// requirement, and it is not a flag: it is frame markers -- simulation start and end, present --
+// around the game's actual frame loop, which is why the reference project hooks slReflexSetMarker
+// and slPCLSetMarker and spoofs the architecture for kFeatureReflex. This helper is a separate
+// process with no game loop and no present queue to mark. And the common constants are the camera
+// matrices, the jitter and the depth, all of which are supplied here as identity and zeros because a
+// swapchain-only layer has none of them; "invalid" is a fair description.
+//
+// So the parameter contract was never the obstacle, and satisfying more of it will not help. What
+// DLSS-G wants is to be inside the presenting process, holding the swapchain, with Reflex marking
+// the frame -- which is the one thing this design puts in another process on purpose.
+
 // Answers the snippet's memory question. Flat, like the reference project's.
 static NVSDK_NGX_Result NVSDK_CONV DlssgEstimateVram(unsigned int, unsigned int, unsigned int,
                                                      unsigned int, unsigned int, unsigned int,
