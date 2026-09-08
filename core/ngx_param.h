@@ -21,11 +21,17 @@ struct OwnParam final : NVSDK_NGX_Parameter {
     mutable std::map<std::string, ParamVal> m;
 
     NVSDK_NGX_Result miss(const char* n) const {
-        static std::set<std::string> logged;
+        // Keyed per object, and the object is named.
+        //
+        // The set used to be shared by every parameter block in the process, which reports a key
+        // once and then never again -- so a key set after its first miss went on looking missing
+        // for the rest of the run, and two blocks could not be told apart at all. That cost two
+        // rounds of chasing a contract that was already satisfied.
         if (n && logged.insert(n).second)
-            Log("[param-miss] DLL queried missing key: '%s'", n);
+            Log("[param-miss] params=%p (%zu keys held) queried missing key: '%s'", (const void*)this, m.size(), n);
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     }
+    mutable std::set<std::string> logged;
 
     // Slot 0 (0x00)
     void NVSDK_CONV Set(const char* n, void* v) override {
@@ -118,10 +124,19 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         if (Verbose()) Log("[param-get:float] '%s' -> %f", n, *v);
         return NVSDK_NGX_Result_Success;
     }
+    // Values that survive a reset.
+    //
+    // Frame generation calls Reset as the first thing it does inside evaluate, which cleared the
+    // whole contract before it read a single key of it -- so every key reported missing while a
+    // read-back a microsecond earlier said it was present. Anything marked to persist is put back,
+    // which leaves the denoiser unaffected because it marks nothing.
+    std::map<std::string, ParamVal> sticky;
+    void Persist() { sticky = m; }
+
     // Slot 15 (0x78)
     void NVSDK_CONV Reset() override {
-        Log("[param-reset]");
-        m.clear();
+        Log("[param-reset] %zu keys cleared, %zu restored", m.size(), sticky.size());
+        m = sticky;
     }
 };
 

@@ -537,7 +537,17 @@ static void ApplyDlssgContract(NgxSnippet& s, uint32_t width, uint32_t height) {
     ParamSetUI(s.params, "DLSSG.InternalWidth", width, &seh);
     ParamSetUI(s.params, "DLSSG.InternalHeight", height, &seh);
     ParamSetUI(s.params, "DLSSG.DynamicResolution", 0u, &seh);
-    ParamSetUI(s.params, "DLSSG.ResourceAlwaysProvidedFlags", 0u, &seh);
+    // Claim every resource is provided, so the DLL asks for them by name.
+    //
+    // At zero it decided it had nothing and failed with MissingInput without querying a single
+    // resource key, which taught nothing. The parameter object logs a miss on the pointer getter as
+    // well as the scalar ones, so the way to learn the resource contract is to say everything is
+    // there and read the list it comes back with. DLSSNR_MFG_CLAIM_ALL=0 restores the honest value.
+    static const unsigned int provided = [] {
+        const char* v = getenv("DLSSNR_MFG_CLAIM_ALL");
+        return (v && v[0] == '0') ? 0u : 0xFFFFFFFFu;
+    }();
+    ParamSetUI(s.params, "DLSSG.ResourceAlwaysProvidedFlags", provided, &seh);
     ParamSetUI(s.params, "DLSSG.ResourceNeverProvidedFlags", 0u, &seh);
     ParamSetUI(s.params, "DLSSG.UserInterfaceRecompositionEnabled", 0u, &seh);
     ParamSetUI(s.params, "DLSSG.NvAppOvrAppliedVal.StreamlineMode", 0u, &seh);
@@ -662,6 +672,8 @@ void NgxSetDlssgEval(NgxSnippet& s, bool reset, unsigned int frameIndex) {
         DWORD seh2 = 0;
         float back = -1.0f;
         const bool got = ParamGetF(s.params, "DLSSG.CameraFOV", &back, &seh2);
+        // Marked to survive the reset the DLL performs at the top of evaluate.
+        if (s.ownParams) static_cast<OwnParam*>(s.params)->Persist();
         Log("[mfg] write check: CameraFOV set, read back %s value=%.4f (seh=%#x) params=%p own=%d",
             got ? "OK" : "MISSING", back, seh2, (void*)s.params, int(s.ownParams));
     }
