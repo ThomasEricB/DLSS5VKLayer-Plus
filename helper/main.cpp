@@ -2373,11 +2373,37 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
                 FillResource(rReal, outReal, true);
 
                 Log("[mfg] evaluating with resources bound");
+                // Twice: the first call is the model's history, the second is the frame it
+                // interpolates toward. Frame generation holds the previous picture itself, so a
+                // single evaluate has nothing to sit between.
                 NgxSetDlssgEval(fg, true, 1);
                 NgxSetDlssgResources(fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, 60u);
-                const bool evOk = NgxEvaluatePass(fg, 0, ns.vk.cmdEval);
-                Log("[mfg] evaluate returned %s", evOk ? "ok" : "failed");
+                bool evOk = NgxEvaluatePass(fg, 0, ns.vk.cmdEval);
+                Log("[mfg] evaluate 1 (history) returned %s", evOk ? "ok" : "failed");
+                if (evOk) {
+                    NgxSetDlssgEval(fg, false, 1);
+                    NgxSetDlssgResources(fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, 60u);
+                    evOk = NgxEvaluatePass(fg, 0, ns.vk.cmdEval);
+                    Log("[mfg] evaluate 2 (interpolate) returned %s", evOk ? "ok" : "failed");
+                }
                 SubmitAndWait(ns.vk, ns.vk.cmdEval);
+
+                // Did it write anything? A surface it never touched reads as the zeros it was
+                // created with, so this separates "the call succeeded" from "there is a frame in it".
+                const size_t fgBytes = size_t(w) * size_t(h) * 4;
+                if (evOk && ReadbackPixels(ns.vk, outInterp, fgBytes) && ns.vk.readMap) {
+                    const unsigned char* px = (const unsigned char*)ns.vk.readMap;
+                    unsigned long long sum = 0, nonzero = 0;
+                    for (size_t i = 0; i < fgBytes; i += 4) {
+                        const unsigned v = px[i] + px[i + 1] + px[i + 2];
+                        sum += v;
+                        if (v) ++nonzero;
+                    }
+                    const size_t pixels = fgBytes / 4;
+                    Log("[mfg] OutputInterpolated: %.1f%% of pixels non-zero, mean channel %.1f",
+                        100.0 * double(nonzero) / double(pixels ? pixels : 1),
+                        double(sum) / double(pixels ? pixels : 1) / 3.0);
+                }
             }
             DestroyImage2D(ns.vk, outInterp);
             DestroyImage2D(ns.vk, outReal);
