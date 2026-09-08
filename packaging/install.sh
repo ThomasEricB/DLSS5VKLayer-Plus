@@ -87,11 +87,22 @@ done
 # layer a second time under a different name.
 rm -f "$MANIFEST_DIR/VK_LAYER_NV_dlssnr.json"
 
+# Pin the Vulkan layer order so this layer runs before Smooth Motion's VK_LAYER_NV_present.
+# systemd user sessions read environment.d at login, so this applies on the next login.
+if [ "$MODE" = "user" ] && [ -z "$PREFIX" ]; then
+  ENV_DIR="$HOME/.config/environment.d"
+else
+  ENV_DIR="${PREFIX:+$PREFIX}/etc/environment.d"
+fi
+mkdir -p "$ENV_DIR"
+printf 'VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present"\n' > "$ENV_DIR/dlssnr.conf"
+
 chmod 755 "$BINDIR/dlssnr-helper" "$BINDIR/dlssnr-gui" "$LIBDIR/bin/runner_probe" "$LIBDIR/bin/dlssnr-shmctl" 2>/dev/null || true
 chmod 755 "$LIBDIR/layer/libVkLayer_NV_dlssnr.so" "$LIBDIR/layer32/libVkLayer_NV_dlssnr.so" 2>/dev/null || true
 chmod 755 "$LIBDIR/helper/dlssnr_helper.exe" 2>/dev/null || true
 
 echo "installed DLSS5VKLayer to $LIBDIR"
 echo "manifests: $MANIFEST_DIR/VK_LAYER_NV_dlssnr.*.json"
+echo "env: $ENV_DIR/dlssnr.conf (layer order; applies on next login)"
 echo "run: dlssnr-helper init && dlssnr-helper start"
 echo "or:  dlssnr-gui"

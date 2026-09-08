@@ -72,16 +72,21 @@ The RPMs are the packaged builds under `dist/`, produced by [Packaging](#packagi
 Public package:
 
 ```bash
-sudo dnf install ./dist/dlssnr-0.2.5-2.fc44.x86_64.rpm
+sudo dnf install ./dist/dlssnr-0.2.5-3.fc44.x86_64.rpm
 ```
 
 Personal package:
 
 ```bash
-sudo dnf install ./dist/dlssnr-personal-0.2.5-2.fc44.x86_64.rpm
+sudo dnf install ./dist/dlssnr-personal-0.2.5-3.fc44.x86_64.rpm
 ```
 
 `wine` is a recommended package, not a hard dependency, so Proton-only users are not forced to install host Wine.
+
+Installing also writes `~/.config/environment.d/dlssnr.conf` for each user -- a systemd user-session
+snippet pinning `VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present"` so this layer orders
+correctly alongside Smooth Motion. It takes effect on the next login, never overwrites an existing
+file, and is removed on uninstall if you have not edited it.
 
 ### Updating an RPM Install
 
@@ -90,10 +95,10 @@ prefix survive the update:
 
 ```bash
 dlssnr-helper stop
-sudo dnf upgrade ./dist/dlssnr-0.2.5-2.fc44.x86_64.rpm
+sudo dnf upgrade ./dist/dlssnr-0.2.5-3.fc44.x86_64.rpm
 ```
 
-(`rpm -Uvh ./dist/dlssnr-0.2.5-2.fc44.x86_64.rpm` does the same job on systems without `dnf`.)
+(`rpm -Uvh ./dist/dlssnr-0.2.5-3.fc44.x86_64.rpm` does the same job on systems without `dnf`.)
 Relaunch any game that was presenting through the layer so it picks up the new layer library.
 
 The two variants carry the same files and conflict with each other, so switching between them is a
@@ -114,8 +119,8 @@ older tarballs die at exec on Arch-based systems with
 Extract the tarball:
 
 ```bash
-tar -xzf dist/dlssnr-0.2.5-2-linux-x86_64.tar.gz
-cd dlssnr-0.2.5-2-linux-x86_64
+tar -xzf dist/dlssnr-0.2.5-3-linux-x86_64.tar.gz
+cd dlssnr-0.2.5-3-linux-x86_64
 ```
 
 User install, no root required:
@@ -132,6 +137,10 @@ sudo ./install.sh --system
 
 For user installs, make sure `~/.local/bin` is in your `PATH`.
 
+`install.sh` also writes `~/.config/environment.d/dlssnr.conf` (system installs:
+`/etc/environment.d/dlssnr.conf`) pinning `VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present"`
+so this layer orders correctly alongside Smooth Motion. It takes effect on the next login.
+
 ### Updating a Tarball Install
 
 `install.sh` overwrites the files it owns in place, so an update is just the new tarball installed
@@ -139,8 +148,8 @@ over the old one -- user config, state and the managed prefix are not touched:
 
 ```bash
 dlssnr-helper stop
-tar -xzf dist/dlssnr-0.2.5-2-linux-x86_64.tar.gz
-cd dlssnr-0.2.5-2-linux-x86_64
+tar -xzf dist/dlssnr-0.2.5-3-linux-x86_64.tar.gz
+cd dlssnr-0.2.5-3-linux-x86_64
 ./install.sh --user        # or: sudo ./install.sh --system
 ```
 
@@ -535,9 +544,11 @@ Tarball system install:
 sudo ./uninstall.sh --system
 ```
 
-Both modes remove the binaries, the desktop entry and the per-architecture layer manifests
-(`VK_LAYER_NV_dlssnr.*.json`), so the loader stops looking for the layer. Add `--purge` to also
-remove user config, state, runtime data, and the managed prefix.
+Both modes remove the binaries, the desktop entry, the per-architecture layer manifests
+(`VK_LAYER_NV_dlssnr.*.json`) and the `environment.d/dlssnr.conf` layer-order snippet, so the loader
+stops looking for the layer. Add `--purge` to also remove user config, state, runtime data, and the
+managed prefix. The RPM removes the snippet too, but only if it is still exactly what the package
+wrote.
 
 ## Troubleshooting
 
@@ -552,6 +563,12 @@ If a Steam game crashes in `steamoverlayvulkanlayer.so`, update to `0.2.1-3` or 
 If a Steam/Proton game logs `no answer ... (helper not running)` while the helper is waiting for
 frames, it is on a different mapping than the helper -- see [Steam / Proton
 Containers](#steam--proton-containers).
+
+If you run Smooth Motion alongside this layer, the two implicit layers can end up in the wrong order
+and the frames are layered incorrectly. The installers pin the order via
+`VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present"` in `~/.config/environment.d/dlssnr.conf`
+(see [Install From Tarball](#install-from-tarball)); if you installed before `0.2.5-3`, add that file
+yourself and log out and back in.
 
 ## Important Notes
 

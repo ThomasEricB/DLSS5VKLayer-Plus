@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 2
+%global pkg_release 3
 
 Name:           dlssnr
 Version:        0.2.5
@@ -45,7 +45,43 @@ cp -a root/usr %{buildroot}/usr
 %{_datadir}/applications/dlssnr.desktop
 %doc %{_datadir}/doc/dlssnr/dxvk-license.txt
 
+%post
+/sbin/ldconfig || :
+# Pin the Vulkan layer order so this layer runs before Smooth Motion's VK_LAYER_NV_present.
+# Written per-user into ~/.config/environment.d (the package owns no files there); an existing
+# file is left untouched. systemd user sessions pick it up on the next login.
+getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1 "|" $6}' | while IFS='|' read -r user home; do
+    [ -d "$home" ] || continue
+    group=$(id -gn "$user" 2>/dev/null) || group="$user"
+    conf="$home/.config/environment.d/dlssnr.conf"
+    if [ ! -e "$conf" ]; then
+        install -d -m 0755 "$home/.config" "$home/.config/environment.d"
+        printf 'VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present"\n' > "$conf"
+        chown "$user:$group" "$home/.config" "$home/.config/environment.d" "$conf"
+        chmod 0644 "$conf"
+    fi
+done
+
+%preun
+if [ "$1" -eq 0 ]; then
+    getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $6}' | while IFS= read -r home; do
+        conf="$home/.config/environment.d/dlssnr.conf"
+        if [ -f "$conf" ] && [ "$(cat "$conf" 2>/dev/null)" = 'VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present"' ]; then
+            rm -f "$conf"
+        fi
+    done
+fi
+
+%postun
+/sbin/ldconfig || :
+
 %changelog
+* Mon Sep 07 2026 DLSS5VKLayer - 0.2.5-3
+- Install ~/.config/environment.d/dlssnr.conf (per user) pinning
+  VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present", so the layer orders correctly alongside
+  Smooth Motion instead of being layered after its VK_LAYER_NV_present. An existing file is never
+  overwritten; uninstall removes the file only if it is still exactly what we wrote. Applies on the
+  next login.
 * Mon Sep 07 2026 DLSS5VKLayer - 0.2.5-2
 - GUI: the binary now loads on distros whose Qt6 exports the meta-object data symbols with protected
   visibility (CachyOS/Arch). GCC bakes copy relocations against QSpinBox::staticMetaObject and friends
