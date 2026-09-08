@@ -60,7 +60,7 @@ const Setting kSettings[] = {
     { "ghostslack", &ShmHeader::ghostSlackPercent, false,
       "how far past its neighbours a pipelined pixel may land, in hundredths (0 = pinned, 50 default)" },
     { "ratiosmooth", &ShmHeader::ratioSmoothPercent, false,
-      "how much of the relighting ratio comes from the neighbourhood, 0-100 (0 = per-pixel, as before)" },
+      "how much of the relighting ratio comes from the neighbourhood, 0-100 (100 default, 0 = per-pixel)" },
     { "colourtrust", &ShmHeader::colourTrustPercent, false,
       "how much of the chroma-agreement gate to apply, 0-100 (0 = take the model's colour everywhere)" },
     { "smooth", &ShmHeader::motionSmoothPercent, false,

@@ -747,7 +747,7 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->publishStride.store(0);
     h->motionSmoothPercent.store(100);
     h->colourTrustPercent.store(100);
-    h->ratioSmoothPercent.store(0);
+    h->ratioSmoothPercent.store(100);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);

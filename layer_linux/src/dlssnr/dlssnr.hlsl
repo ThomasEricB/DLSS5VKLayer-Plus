@@ -920,6 +920,38 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // The proxy as it was sampled, kept for the same reason: the residual branch below rewrites
     // `proxy`, and the relighting ratio's smoothing has to compare like with like.
     float3 proxyDirect = proxy;
+
+    // What the model says about the light over this pixel's neighbourhood, and over the pixel alone.
+    //
+    // Computed once, here, because two different bounds below both need it and both were previously
+    // making do with the pixel alone. Five taps of each picture, no encode: the expensive thing in
+    // this pass has always been encoding neighbours, never fetching them.
+    float gainSharp = 1.0;
+    float gainSmooth = 1.0;
+    {
+        const float kGainFloor = 1.0 / 512.0;
+        const float2 texel = 1.0 / float2(gWidth, gHeight);
+        float mAcc = dot(modelDirect, kLuma);
+        float pAcc = dot(proxyDirect, kLuma);
+        [unroll]
+        for (int nb = 0; nb < 4; ++nb)
+        {
+            const float2 off = float2(nb == 0 ? -1.0 : nb == 1 ? 1.0 : 0.0,
+                                      nb == 2 ? -1.0 : nb == 3 ? 1.0 : 0.0) * texel;
+            const float2 uvn = saturate(editUv + off);
+            float3 pn = gSource.SampleLevel(gLinear, uvn, 0).rgb;
+            float3 mn = gModel.SampleLevel(gLinear, uvn, 0).rgb;
+            if (gHdrProxy == 0 && gPassthrough == 0)
+            {
+                pn = SrgbToLinear(pn);
+                mn = SrgbToLinear(mn);
+            }
+            mAcc += dot(mn, kLuma);
+            pAcc += dot(pn, kLuma);
+        }
+        gainSharp  = (dot(modelDirect, kLuma) + kGainFloor) / (dot(proxyDirect, kLuma) + kGainFloor);
+        gainSmooth = (mAcc / 5.0 + kGainFloor) / (pAcc / 5.0 + kGainFloor);
+    }
     float4 originalSample = gCompareMode == 1 ? gOriginal.SampleLevel(gLinear, cmpUv, 0)
                                               : gOriginal.Load(int3(id.xy, 0));
 
@@ -1294,9 +1326,29 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             // should be the exception. The absolute term stays, so a near-black pixel keeps an
             // allowance rather than one that scales away with it. One scalar over the whole triple:
             // a per-channel bound moves hue.
+            // The guard was doing two jobs with one number, and they pull in opposite directions.
+            //
+            // Raising it is how you ask for stronger relighting -- more room for the model's verdict
+            // about how much light belongs somewhere. But the same number was also the only thing
+            // bounding how far a *single* pixel may depart from its neighbours, and that one must
+            // stay tight whatever the first is set to. At a guard of 8 this band is
+            // [originalLuma/8, originalLuma*8], which is no bound at all: the raw sum passes through
+            // with every per-pixel excursion the addition produced, and the ones that drive a channel
+            // to nothing arrive as blown or black pixels wearing the texture's own colour. That is
+            // why the artifacts scale with the guard, and why smoothing the relighting ratio further
+            // down could not reach them -- the damage is already in `upgraded` before that ratio is
+            // applied to it.
+            //
+            // So the two are separated. The guard sets how far the *neighbourhood's* light may move,
+            // which is the relighting it was always meant to control. A single pixel may then depart
+            // from that level by a fixed factor and no more, however high the guard goes. Detail is a
+            // pixel differing from its neighbours by tens of percent; a blowout is one differing by
+            // multiples, and only the second is refused.
             const float addGuard = max(gMaxRatio, 1.0);
-            const float maxLuma = max(originalLuma * addGuard, targetLuma * 1.5 + 0.1);
-            const float minLuma = originalLuma / addGuard;
+            const float broadLuma = originalLuma * clamp(gainSmooth, 1.0 / addGuard, addGuard);
+            const float kPixelBand = 1.6;
+            const float maxLuma = max(broadLuma * kPixelBand, targetLuma * 0.25 + 0.02);
+            const float minLuma = broadLuma / kPixelBand;
 
             if (sumLuma > maxLuma)
                 upgraded *= maxLuma / sumLuma;
@@ -1376,32 +1428,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // when a raised guard is wanted.
     if (gRatioSmooth > 0.0)
     {
-        const float2 texel = 1.0 / float2(gWidth, gHeight);
-        float mAcc = dot(modelDirect, kLuma);
-        float pAcc = dot(proxyDirect, kLuma);
-        [unroll]
-        for (int nb = 0; nb < 4; ++nb)
-        {
-            const float2 off = float2(nb == 0 ? -1.0 : nb == 1 ? 1.0 : 0.0,
-                                      nb == 2 ? -1.0 : nb == 3 ? 1.0 : 0.0) * texel;
-            const float2 uvn = saturate(editUv + off);
-            float3 pn = gSource.SampleLevel(gLinear, uvn, 0).rgb;
-            float3 mn = gModel.SampleLevel(gLinear, uvn, 0).rgb;
-            if (gHdrProxy == 0 && gPassthrough == 0)
-            {
-                pn = SrgbToLinear(pn);
-                mn = SrgbToLinear(mn);
-            }
-            mAcc += dot(mn, kLuma);
-            pAcc += dot(pn, kLuma);
-        }
-        // The model's gain here against the model's gain over the neighbourhood. Their quotient is
-        // exactly the high-frequency part being removed, so where the gain is already smooth the two
-        // agree and this is the identity.
-        const float gainSharp  = (dot(modelDirect, kLuma) + kRatioFloor) /
-                                 (dot(proxyDirect, kLuma) + kRatioFloor);
-        const float gainSmooth = (mAcc / 5.0 + kRatioFloor) / (pAcc / 5.0 + kRatioFloor);
-        const float corrected  = lumaRatio * (gainSmooth / max(gainSharp, 1e-6));
+        // The pixel's own gain against the neighbourhood's. Their quotient is exactly the
+        // high-frequency part being removed, so where the gain is already smooth this is the
+        // identity.
+        const float corrected = lumaRatio * (gainSmooth / max(gainSharp, 1e-6));
         lumaRatio = lerp(lumaRatio, corrected, saturate(gRatioSmooth));
     }
 
