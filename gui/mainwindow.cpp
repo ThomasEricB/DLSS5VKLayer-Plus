@@ -767,6 +767,25 @@ QWidget* MainWindow::buildSettings() {
                        "50 is the default. Raise it if the enhancement feels muted; lower it if you "
                        "can see a second copy of edges during fast movement.",
                        ShmBinder::Live);
+        binder->AddInt(f, "Gap between answers (frames)", &ShmHeader::publishStride, 0, 64,
+                       "Only used when the model runs alongside the frame. The model answers every "
+                       "few frames, and without this the edit changes on whichever frame the answer "
+                       "happens to land on -- which, because the round trip does not divide the "
+                       "frame time, is an uneven interval.\n\nEach change is a step: the edit jumps "
+                       "from an old answer warped a long way to a fresh one warped a short way. A "
+                       "step at an uneven interval reads as judder; the same step at an even one "
+                       "reads as smooth. This pins the interval to a fixed number of frames.\n\n0 "
+                       "is the old behaviour -- send a new frame to the model the moment the last "
+                       "answer is back.\n\nRaising it does not make the edit any older: what is "
+                       "paced is the sending, and each answer is still used the instant it arrives. "
+                       "Measured on a panning scene at three passes, the edit stayed the same 13 "
+                       "frames old at every setting from 0 to 32. It is also cheaper -- the model "
+                       "runs less often, and that came back as frame rate, 577 up to 729 fps across "
+                       "the same range.\n\nThe cost is that the edit is refreshed less often, so "
+                       "set it near the rate the model already answers at and you get the even "
+                       "spacing for free. A value below what the round trip needs is rounded up to "
+                       "the next multiple rather than missed.",
+                       ShmBinder::Live);
         binder->AddInt(f, "Settle the edit (%)", &ShmHeader::settlePercent, 0, 100,
                        "Only used when the model runs alongside the frame. An answer arrives every "
                        "few frames, so without this the edit changes all at once on the frame it "

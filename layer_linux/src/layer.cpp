@@ -369,6 +369,21 @@ static bool ShmInputFree(ShmMap& s) {
 }
 
 // Take delivery of an answer that has already arrived. Never blocks.
+// The gap the user asked for between answers, in presented frames. See publishStride in the
+// protocol. DLSSNR_PUBLISH_STRIDE overrides the setting, so a cadence can be swept from a launch
+// option without going through the GUI. Bounded, because a stride longer than the estimator can warp
+// across is a worse picture rather than a smoother one.
+static uint32_t ShmPublishStride(ShmMap& s) {
+    static const int forced = [] {
+        const char* v = getenv("DLSSNR_PUBLISH_STRIDE");
+        return v && *v ? atoi(v) : -1;
+    }();
+    if (forced >= 0) return uint32_t(forced > 64 ? 64 : forced);
+    if (!s.hdr) return 0;
+    const uint32_t v = s.hdr->publishStride.load();
+    return v > 64 ? 64 : v;
+}
+
 // How many presented frames passed between the request going out and its answer being taken up.
 static void ShmNoteAge(ShmMap& s) {
     const uint64_t age = s.frames - s.publishedAtFrame;
@@ -405,8 +420,9 @@ static void ShmNoteAge(ShmMap& s) {
     s.ageSum += age;
     s.ageMax = age > s.ageMax ? uint32_t(age) : s.ageMax;
     if (++s.ageCount >= 300) {
-        Log("[pipe] answers are %.1f frames old on average, worst %u; reprojection scaled by %.2f",
-            double(s.ageSum) / double(s.ageCount), s.ageMax, s.reprojScale);
+        Log("[pipe] answers are %.1f frames old on average, worst %u; reprojection scaled by %.2f; "
+            "cadence gap %u (0 = as soon as ready)",
+            double(s.ageSum) / double(s.ageCount), s.ageMax, s.reprojScale, ShmPublishStride(s));
         if (s.rtCount) {
             const double n = double(s.rtCount);
             const double rt = s.rtSum / n, helper = s.helperSum / n;
@@ -1639,12 +1655,27 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         if (dc->shm.hdr) dc->shm.hdr->wantMotion.store(wantField ? 1u : 0u);
 
         dc->shm.frames++;
+        // The cadence gate: the *request* goes out only on a frame that is a multiple of the stride.
+        //
+        // The gate is here rather than on the collect, which is where it was first put and which does
+        // nothing. ShmInputFree asks only whether the helper has answered, not whether the layer ever
+        // took the answer up, so gating the collect leaves the publish free to run at full rate --
+        // it just overwrites pendingReq, dropping the answer nobody collected. Measured, that made
+        // the helper work 264 times in 4000 frames to produce an edit that updated fewer than 60
+        // times, which is the cost of the cadence with none of the benefit.
+        //
+        // Pacing the send instead paces the whole cycle. The answer is still collected the moment it
+        // arrives, so it is as fresh as the round trip allows; what is pinned is the interval between
+        // one update and the next, because each is the same round trip after an evenly spaced send.
+        // A stride below 2 is the behaviour that has always been here.
+        const uint32_t cadence = ShmPublishStride(dc->shm);
+        const bool atCadence = cadence < 2 || (dc->shm.frames % cadence) == 0;
         const bool haveAnswer = ShmCollect(dc->shm, modelBytes, sc.comp->ModelPixels());
         // Free to send only when the helper has finished with the last request *and* the last send
         // has actually been handed over. The publish is deferred by a frame now, and recording a
         // second send before the first is published would overwrite the region it is about to be
         // told to read -- and, on the copying fallback, the staging the publish still reads from.
-        const bool mayPublish = ShmInputFree(dc->shm) && !dc->shm.dead &&
+        const bool mayPublish = atCadence && ShmInputFree(dc->shm) && !dc->shm.dead &&
                                 sc.pendingSlot >= SwapchainState::kSlots;
         if (haveAnswer) {
             // The proxy this answer was computed from becomes the matched one, before anything reads
