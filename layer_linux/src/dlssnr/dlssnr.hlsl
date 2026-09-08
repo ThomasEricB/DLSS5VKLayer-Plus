@@ -1219,7 +1219,22 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // Only upward. Darkening a near-black pixel further is harmless -- it stays black -- and
     // clamping that side would be a second bound nobody asked for.
     const float lift = lerp(1.0, guard, smoothstep(0.0, 8.0 * kRatioFloor, originalLuma));
-    float boundedRatio = clamp(amplified, 1.0 / guard, lift);
+
+    // And the room to darken shrinks toward none as a pixel approaches white, for the same reason
+    // read the other way round.
+    //
+    // The guard is symmetric, so raising it to allow stronger relighting allows equally strong
+    // *darkening* -- and a light source is exactly where that shows. At a guard of 1 the clamp is
+    // [1,1] and a lamp comes out white; at 3 the same lamp is allowed down to a third of itself and
+    // visibly dims, which reads as the value inverting. Detail strength makes it worse rather than
+    // better, because it raises the ratio to a power: at 2.0 a ratio of 0.85 becomes 0.72.
+    //
+    // The help text for this control has always said that a detail pass has no business restyling a
+    // light source. Nothing enforced it. Now the floor rises to 1 as the pixel reaches paper white,
+    // so a highlight cannot be pulled down however high the guard goes, while a bright wall at 0.75
+    // and everything below it is bounded exactly as before.
+    const float drop = lerp(1.0 / guard, 1.0, smoothstep(0.6, 1.1, originalLuma));
+    float boundedRatio = clamp(amplified, drop, lift);
 
     // Exactly one while the ratio is already inside the guard, so a frame that never needed bounding
     // is untouched rather than rounded, and strength zero stays bit-identical.
