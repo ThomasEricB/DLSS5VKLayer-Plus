@@ -120,6 +120,16 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
         if (!std::isfinite(s.ghostSlack) || s.ghostSlack < 0.0f) s.ghostSlack = 0.5f;
     }
     {
+        s.motionSmooth = float(h->motionSmoothPercent.load()) / 100.0f;
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_MOTION_SMOOTH");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.motionSmooth = float(forced) / 100.0f;
+        if (!std::isfinite(s.motionSmooth) || s.motionSmooth < 0.0f) s.motionSmooth = 0.0f;
+        if (s.motionSmooth > 1.0f) s.motionSmooth = 1.0f;
+    }
+    {
         s.editBlur = float(h->editBlurMilli.load()) / 1000.0f;
         static const int forced = [] {
             const char* v = getenv("DLSSNR_EDIT_BLUR");
@@ -1632,7 +1642,11 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         if (stale) {
             Transition(cb, _proxy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             Transition(cb, *stale, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            globalMotion = _globalMotion->Record(cb, _proxy.view, stale->view, refreshModel);
+            // The reference is the proxy this answer was computed from, so its age is the round
+            // trip that answer took, and one more for each frame it has been held since.
+            _ageFrames = refreshModel ? _answerAge : _ageFrames + 1.0f;
+            globalMotion = _globalMotion->Record(cb, _proxy.view, stale->view, refreshModel,
+                                                 _ageFrames, s.motionSmooth);
             if (globalMotion) {
                 // What the estimate actually said, reported rather than assumed. The gate that will
                 // read the confidence has to be calibrated against real values.

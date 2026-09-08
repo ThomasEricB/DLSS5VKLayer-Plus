@@ -75,6 +75,9 @@ struct FrameSettings {
     // Radius splitting the stale edit's safe half from the half that can ghost, in uv.
     float editBlur = 0.04f;
 
+    // How hard the displacement estimate is filtered over time. See motionSmoothPercent.
+    float motionSmooth = 1.0f;
+
     static FrameSettings Read(const ShmHeader* h);
 };
 
@@ -159,6 +162,10 @@ class Composition {
     // How many round trips of motion the stale edit has to be moved by. The layer measures it; see
     // ShmMap::reprojScale.
     void SetReprojScale(float r) { _reprojScale = r; }
+
+    // How many presented frames the answer just taken up had been in flight for. The filter on the
+    // displacement needs it to divide by, because what it filters is a velocity; see PASS_SMOOTH.
+    void SetAnswerAge(float frames) { _answerAge = frames > 1.0f ? frames : 1.0f; }
 
     // The answer for the proxy in flight has arrived, so that proxy becomes the matched one. A swap
     // of handles rather than a copy -- the surfaces are identical in every respect but their
@@ -361,6 +368,10 @@ class Composition {
     bool _settled = false;
     bool _targetValid = false;
     float _reprojScale = 1.0f;
+    float _answerAge = 1.0f;
+    // Frames since the picture the estimate is measured against was recorded: the round trip the
+    // answer took, plus one for every frame it has been held since.
+    float _ageFrames = 1.0f;
     bool _flightValid = false;
 
     // The motion field for the answer being held, uploaded from the helper's shared region. Says

@@ -38,7 +38,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // decision are carried here. From this branch: the pipelined path's settle, ghost bound, edit split
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 15;
+static constexpr uint32_t kShmVersion = 16;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 // Eight bytes a pixel: the float16 proxy needs them, and the 8-bit path simply uses the first half of
@@ -573,6 +573,26 @@ struct ShmHeader {
     // the next multiple at which the helper is free, so the cadence stays a multiple of N rather than
     // drifting off it.
     std::atomic<uint32_t> publishStride;
+
+    // How hard the measured displacement is filtered over time, in hundredths. 0 applies the estimate
+    // exactly as measured, which is what happened before this existed; 100 is the full filter.
+    //
+    // The estimate scatters by a few pixels from frame to frame however it is tuned -- the search can
+    // only name a cell, and the gradient solve refines within one rather than removing the cell-to-
+    // cell instability. The edit is warped by that number, so the scatter shows up as the whole
+    // picture shaking a different way each frame. Neither of the two obvious culprits was it: halving
+    // the staleness did not reduce the scatter, and pinning the cadence the answers arrive on did not
+    // either.
+    //
+    // Camera motion is smooth, so the scatter is noise on a smooth signal and a low-pass filter is
+    // the standard answer. It is applied to the velocity rather than to the displacement, because the
+    // displacement steps every time a new answer moves the reference and only the velocity is
+    // continuous across that. See PASS_SMOOTH in globalmotion.comp.
+    //
+    // Measured on a 2 px/frame pan, the frame-to-frame scatter in the estimate falls from 1.70 px to
+    // 0.37 with this at 100, and the estimate tracks the true speed instead of stepping 0, 1, 3, 4
+    // pixels at a time to average it.
+    std::atomic<uint32_t> motionSmoothPercent;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -588,7 +608,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2024, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2032, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -699,6 +719,7 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->ghostSlackPercent.store(50);
     h->editBlurMilli.store(0);
     h->publishStride.store(0);
+    h->motionSmoothPercent.store(100);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);

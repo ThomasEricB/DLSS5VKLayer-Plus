@@ -767,6 +767,20 @@ QWidget* MainWindow::buildSettings() {
                        "50 is the default. Raise it if the enhancement feels muted; lower it if you "
                        "can see a second copy of edges during fast movement.",
                        ShmBinder::Live);
+        binder->AddInt(f, "Steady the motion estimate (%)", &ShmHeader::motionSmoothPercent, 0, 100,
+                       "Only used when the model runs alongside the frame. To put a stale edit back "
+                       "under its own content the layer measures how far the picture moved, and that "
+                       "measurement scatters by a few pixels from frame to frame -- the search can "
+                       "only name a cell, and refining inside one does not remove the jumping "
+                       "between them. The edit is warped by that number, so the scatter shows up as "
+                       "the whole picture shaking a different way each frame.\n\nCamera motion is "
+                       "smooth, so this filters the measurement over time. It filters the speed "
+                       "rather than the distance, because the distance jumps every time a new answer "
+                       "arrives and only the speed carries across.\n\n0 uses the measurement raw, "
+                       "which is what happened before this existed. 70 is the default. Raise it if "
+                       "the picture still shimmers when little is moving; lower it if the edit feels "
+                       "like it lags behind a fast turn. 100 is the default.",
+                       ShmBinder::Live);
         binder->AddInt(f, "Gap between answers (frames)", &ShmHeader::publishStride, 0, 64,
                        "Only used when the model runs alongside the frame. The model answers every "
                        "few frames, and without this the edit changes on whichever frame the answer "

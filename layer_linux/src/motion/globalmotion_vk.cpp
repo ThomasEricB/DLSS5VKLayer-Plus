@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "globalmotion_vk.h"
 
 #include "GlobalMotion_Shaders.h"
@@ -133,6 +134,11 @@ GlobalMotionVk::GlobalMotionVk(const DeviceTable* vk, const InstanceTable* insta
         if (_readMap[i]) std::memcpy(_readMap[i], init, sizeof(init));
     }
 
+    if (!MakeImg(_state, 1, 1, VK_FORMAT_R32G32B32A32_SFLOAT) ||
+        !MakeImg(_smoothed, 1, 1, VK_FORMAT_R32G32B32A32_SFLOAT,
+                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+        return;
+
     _reduce = std::make_unique<GmPass>(
         "dlssnr-gm-reduce", vk, instance, device, physicalDevice, gm_reduce_spv, sizeof(gm_reduce_spv),
         std::vector<VkDescriptorType>{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -159,7 +165,14 @@ GlobalMotionVk::GlobalMotionVk(const DeviceTable* vk, const InstanceTable* insta
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
         8 * sizeof(uint32_t), true);
 
-    _ok = _reduce->CanRender() && _match->CanRender() && _pick->CanRender() && _lk->CanRender();
+    _smooth = std::make_unique<GmPass>(
+        "dlssnr-gm-smooth", vk, instance, device, physicalDevice, gm_smooth_spv, sizeof(gm_smooth_spv),
+        std::vector<VkDescriptorType>{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+        4 * sizeof(float), false);
+
+    _ok = _reduce->CanRender() && _match->CanRender() && _pick->CanRender() && _lk->CanRender() &&
+          _smooth->CanRender();
     uint32_t mapped = 0;
     for (uint32_t i = 0; i < kReadSlots; ++i) if (_readMap[i]) ++mapped;
     if (_ok) Log("[gm] readback ring: %u of %u slots mapped", mapped, kReadSlots);
@@ -173,6 +186,9 @@ GlobalMotionVk::~GlobalMotionVk() {
     _match.reset();
     _pick.reset();
     _lk.reset();
+    _smooth.reset();
+    DropImg(_state);
+    DropImg(_smoothed);
     for (int lvl = 0; lvl < 2; ++lvl) {
         DropImg(_now[lvl]);
         DropImg(_then[lvl]);
@@ -243,7 +259,8 @@ void GlobalMotionVk::Barrier(VkCommandBuffer cb, Img& img, VkImageLayout to) {
     img.layout = to;
 }
 
-bool GlobalMotionVk::Record(VkCommandBuffer cb, VkImageView now, VkImageView then, bool reset) {
+bool GlobalMotionVk::Record(VkCommandBuffer cb, VkImageView now, VkImageView then, bool reset,
+                            float age, float smooth) {
     if (!_ok || now == VK_NULL_HANDLE || then == VK_NULL_HANDLE) return false;
     ++_frameNo;
     (void) reset;
@@ -376,17 +393,70 @@ bool GlobalMotionVk::Record(VkCommandBuffer cb, VkImageView now, VkImageView the
         _vk->vkCmdDispatch(cb, 1, 1, 1);
         flush();
     }
+
+    // Low-pass the estimate before anyone reads it. See PASS_SMOOTH for why this is done on the
+    // velocity rather than on the displacement: the displacement steps every time a new answer moves
+    // the reference, and filtering across that step would smear it instead of the noise.
+    {
+        Barrier(cb, _result[1], VK_IMAGE_LAYOUT_GENERAL);
+        Barrier(cb, _state, VK_IMAGE_LAYOUT_GENERAL);
+        Barrier(cb, _smoothed, VK_IMAGE_LAYOUT_GENERAL);
+        // minCutoff and beta are the one-euro filter's two knobs. The cutoff at rest is low, because
+        // a camera that is not moving is where the scatter is visible; beta is what stops that low
+        // cutoff turning into lag the moment the camera does move.
+        //
+        // The units matter and got these wrong the first time. The sampling period here is one
+        // frame, not one second, so a cutoff is in cycles per frame and 0.5 is Nyquist -- the 0.30
+        // this started with was almost no filter at all. And the speed beta multiplies is in pixels
+        // per frame, which reaches single digits on an ordinary pan, so a beta of order one opens the
+        // cutoff to Nyquist the moment anything moves. Both are now small, and sweepable, because
+        // that is how they were found to be wrong.
+        //
+        // Chosen by sweep on a 2 px/frame pan, against a raw scatter of 1.70 px/frame: .02/.02 gave
+        // 0.46, .005/.05 gave 0.37, and .005/.002 gave 0.13. The last is the smoothest and is not the
+        // default, because a cutoff that low with almost no beta is a thirty-frame time constant --
+        // lovely on a constant pan and lagging badly the moment the camera changes direction. .005
+        // with a beta of .05 keeps most of the reduction and still opens the cutoff about tenfold
+        // when the velocity actually changes. The lag half of that trade is reasoned, not measured:
+        // the reproducer only pans at a constant speed, so it cannot show it.
+        static const float kCutoff = [] {
+            const char* v = getenv("DLSSNR_GM_CUTOFF");
+            return v && *v ? float(atof(v)) : 0.005f;
+        }();
+        static const float kBeta = [] {
+            const char* v = getenv("DLSSNR_GM_BETA");
+            return v && *v ? float(atof(v)) : 0.05f;
+        }();
+        struct SC { float age, strength, minCutoff, beta; } sc{
+            age < 1.0f ? 1.0f : age, smooth, kCutoff, kBeta
+        };
+        VkDescriptorBufferInfo ubo{};
+        VkDescriptorSet set = _smooth->Begin(&sc, sizeof(sc), &ubo);
+        VkDescriptorImageInfo ri{ VK_NULL_HANDLE, _result[1].view, VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo si{ VK_NULL_HANDLE, _state.view, VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo oi{ VK_NULL_HANDLE, _smoothed.view, VK_IMAGE_LAYOUT_GENERAL };
+        write(set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &ubo);
+        write(set, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ri, nullptr);
+        write(set, 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &si, nullptr);
+        write(set, 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &oi, nullptr);
+        _vk->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _smooth->Pipeline());
+        _vk->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _smooth->Layout(), 0, 1, &set, 0,
+                                     nullptr);
+        _vk->vkCmdDispatch(cb, 1, 1, 1);
+        flush();
+    }
+    (void) reset;
     return true;
 }
 
 void GlobalMotionVk::RecordReadback(VkCommandBuffer cb) {
     const uint32_t slot = uint32_t(_frameNo % kReadSlots);
     if (!_ok || !_readBuf[slot]) return;
-    Barrier(cb, _result[1], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    Barrier(cb, _smoothed, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy r{};
     r.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     r.imageExtent = { 1, 1, 1 };
-    _vk->vkCmdCopyImageToBuffer(cb, _result[1].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _readBuf[slot],
+    _vk->vkCmdCopyImageToBuffer(cb, _smoothed.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _readBuf[slot],
                                 1, &r);
 }
 
@@ -414,7 +484,7 @@ bool GlobalMotionVk::ReadLast(float out[4], uint32_t* frameOut, uint32_t* age) c
 }
 
 void GlobalMotionVk::BarrierResultForRead(VkCommandBuffer cb) {
-    if (_ok) Barrier(cb, _result[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (_ok) Barrier(cb, _smoothed, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 }  // namespace dlssnr

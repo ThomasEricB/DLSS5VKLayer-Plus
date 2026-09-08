@@ -156,6 +156,7 @@ struct ShmMap {
     // threshold can gate away because the edit is genuinely misplaced rather than merely doubtful.
     uint64_t frames = 0;
     uint64_t publishedAtFrame = 0;
+    uint32_t lastAge = 1;  // presented frames the last collected answer spent in flight
     uint64_t prevPublishedAtFrame = 0;
     // How much of one round trip of motion the stale edit actually has to be moved by.
     //
@@ -417,6 +418,7 @@ static void ShmNoteAge(ShmMap& s) {
             ++s.rtCount;
         }
     }
+    s.lastAge = uint32_t(age);
     s.ageSum += age;
     s.ageMax = age > s.ageMax ? uint32_t(age) : s.ageMax;
     if (++s.ageCount >= 300) {
@@ -1714,6 +1716,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         // Composed before the encode's proxy is claimed as "sent", so the pair kept aside is still
         // the one this answer was computed from.
         sc.comp->SetReprojScale(dc->shm.reprojScale);
+        sc.comp->SetAnswerAge(float(dc->shm.lastAge));
         if (willCompose && !sc.comp->RecordCompose(cb, swapchainImage, fs, haveAnswer)) {
             dc->vkEndCommandBuffer(cb);
             return false;

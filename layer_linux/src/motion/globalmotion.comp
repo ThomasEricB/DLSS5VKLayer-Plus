@@ -284,4 +284,77 @@ void main() {
                             imageLoad(uResult, ivec2(0, 0)).zw));
     }
 }
+#elif defined(PASS_SMOOTH)
+// Filter the estimate over time, in the one space where it is continuous.
+//
+// The search plus the gradient solve still leave the displacement scattering by a few pixels from
+// frame to frame -- measured at roughly six on a 2560-wide frame, in every configuration tried. The
+// edit is warped by that number, so the scatter is a few pixels of the whole picture shaking a
+// different way each frame, which is what gets reported as judder. Two things it is not: it is not
+// staleness, because halving the staleness did not reduce it, and it is not the cadence the answers
+// arrive on, because pinning that did not reduce it either.
+//
+// Camera motion is physical and therefore smooth, and a smooth signal carrying white scatter is what
+// a low-pass filter is for. The catch is that the displacement itself is *not* smooth: it is measured
+// from the current frame back to the frame the answer belongs to, so every time a new answer lands
+// the reference jumps and the displacement collapses back toward zero. Filtering that directly would
+// smear across the discontinuity and lag every refresh.
+//
+// Velocity has no such discontinuity. Dividing by the age turns "how far since that frame" into "how
+// far per frame", which is the same number before and after a refresh, so the filter runs across
+// refreshes without ever being reset -- and multiplying back by the age reconstructs a displacement
+// that agrees with the new reference immediately.
+//
+// The filter is the one-euro filter (Casiez, Roussel, Vogel), because the alternative to scatter is
+// lag and a fixed cutoff has to choose one. Its cutoff rises with the measured rate of change, so a
+// camera holding still is filtered hard and a camera being flicked is barely filtered at all -- which
+// is the right way round: scatter is visible when nothing is moving, and hidden when everything is.
+layout(binding = 0) uniform Params {
+    float age;        // presented frames between the answer's frame and this one, at least 1
+    float strength;   // 0 passes the estimate through untouched, 1 is the full filter
+    float minCutoff;  // cutoff in Hz-equivalents at rest: lower is smoother and laggier
+    float beta;       // how fast the cutoff opens up with speed
+} pc;
+layout(rgba32f, binding = 1) uniform readonly image2D uRaw;
+layout(rgba32f, binding = 2) uniform image2D uState;
+layout(rgba32f, binding = 3) uniform writeonly image2D uOut;
+
+void main() {
+    const vec4 raw = imageLoad(uRaw, ivec2(0, 0));
+    const float age = max(pc.age, 1.0);
+
+    if (pc.strength <= 0.0) {
+        imageStore(uOut, ivec2(0, 0), raw);
+        imageStore(uState, ivec2(0, 0), vec4(raw.xy / age, 0.0, raw.w));
+        return;
+    }
+
+    const vec2 vRaw = raw.xy / age;
+    vec4 st = imageLoad(uState, ivec2(0, 0));
+    vec2 vPrev = st.xy;
+    float dPrev = st.z;
+
+    // No usable history: a first frame, a resize, or a stamp that did not advance the way a running
+    // stream does. Start from the measurement rather than filtering toward it from nothing.
+    const bool fresh = st.w <= 0.0 || abs(raw.w - st.w) > 240.0 || any(isnan(st.xy)) || any(isinf(st.xy));
+    if (fresh) { vPrev = vRaw; dPrev = 0.0; }
+
+    // One frame per step, so the sampling period is 1 and the alpha for a cutoff f is
+    // 1 / (1 + 1/(2*pi*f)). Written that way to keep the constants readable as cutoffs.
+    const float kTwoPi = 6.28318530718;
+    const float aD = 1.0 / (1.0 + 1.0 / (kTwoPi * 1.0));
+    const float dRaw = length(vRaw - vPrev);
+    const float dFilt = mix(dPrev, dRaw, aD);
+
+    const float cutoff = max(pc.minCutoff, 1e-4) + max(pc.beta, 0.0) * dFilt;
+    const float alpha = clamp(1.0 / (1.0 + 1.0 / (kTwoPi * cutoff)), 0.0, 1.0);
+    const vec2 vFilt = mix(vPrev, vRaw, alpha);
+
+    // strength blends the filtered velocity back toward the raw one, so the control is continuous and
+    // 0 is exactly the old behaviour rather than approximately it.
+    const vec2 vOut = mix(vRaw, vFilt, clamp(pc.strength, 0.0, 1.0));
+
+    imageStore(uState, ivec2(0, 0), vec4(vOut, dFilt, raw.w));
+    imageStore(uOut, ivec2(0, 0), vec4(vOut * age, raw.z, raw.w));
+}
 #endif

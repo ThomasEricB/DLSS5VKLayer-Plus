@@ -45,12 +45,18 @@ class GlobalMotionVk {
     // reads. Both views must be the frame's own size; they are reduced internally.
     // `reset` says a new answer has been adopted, so the reference changed and the tracker's
     // history describes nothing.
-    bool Record(VkCommandBuffer cb, VkImageView now, VkImageView then, bool reset);
+    // `age` is how many presented frames separate `then` from `now`, and is what turns the
+    // displacement into a velocity for the temporal filter -- see PASS_SMOOTH. `smooth` is 0 to pass
+    // the estimate straight through and 1 for the full filter.
+    bool Record(VkCommandBuffer cb, VkImageView now, VkImageView then, bool reset, float age,
+                float smooth);
 
     // A one-by-one image holding (dx, dy, confidence, 1) in pixels of the frame. Sampled as a motion
     // field by the composition, where a single texel reads as one vector for the whole picture.
-    VkImageView ResultView() const { return _result[1].view; }
-    VkImage ResultImage() const { return _result[1].image; }
+    // The filtered estimate, which is the one actually applied -- so the readback reports what the
+    // composition used rather than what the search proposed before it was smoothed.
+    VkImageView ResultView() const { return _smoothed.view; }
+    VkImage ResultImage() const { return _smoothed.image; }
 
   private:
     struct Img {
@@ -115,6 +121,9 @@ class GlobalMotionVk {
     // Two levels. The coarse one finds the displacement at all; the fine one pins it down to about a
     // pixel, which is what fine detail needs to stay correlated.
     Img _now[2]{}, _then[2]{}, _result[2]{};
+    // The filter's carried state (filtered velocity, filtered rate of change, the stamp it was last
+    // advanced on) and its output. Both one by one, like the result they follow.
+    Img _state{}, _smoothed{};
     // One deeper than the layer's command-buffer ring, so the slot being read was recorded by work
     // that has necessarily completed: by the time frame F+3 begins, the layer has waited on the fence
     // for the slot frame F used.
@@ -127,7 +136,7 @@ class GlobalMotionVk {
     VkBuffer _costBuf = VK_NULL_HANDLE;
     VkDeviceMemory _costMem = VK_NULL_HANDLE;
 
-    std::unique_ptr<GmPass> _reduce, _match, _pick, _lk;
+    std::unique_ptr<GmPass> _reduce, _match, _pick, _lk, _smooth;
     bool _ok = false;
 };
 
