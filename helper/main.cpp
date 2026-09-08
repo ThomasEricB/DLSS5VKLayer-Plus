@@ -2921,6 +2921,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
             // Reset only on the first answer: after that the history is the point.
             NgxSetDlssgEval(ns.fg, ns.fgFrames == 0, 1);
             NgxSetDlssgResources(ns.fg, &rBack, &rMv, &rDepth, &rInterp, &rReal, 60u);
+            NgxDlssgQuerySettings(ns.fg);
             const bool ok = NgxEvaluatePass(ns.fg, 0, ns.vk.cmdEval);
             SubmitAndWait(ns.vk, ns.vk.cmdEval);
             ++ns.fgFrames;

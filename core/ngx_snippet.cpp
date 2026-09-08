@@ -119,6 +119,9 @@ static bool ParamSetF(NVSDK_NGX_Parameter* p, const char* n, float v, DWORD* seh
     Guarded([&] { p->Set(n, v); return true; }, false, seh);
     return *seh == 0;
 }
+static bool ParamGetPtr(NVSDK_NGX_Parameter* p, const char* n, void** v, DWORD* seh) {
+    return Guarded([&] { return NVSDK_NGX_SUCCEED(p->Get(n, v)); }, false, seh);
+}
 static bool ParamSetPtr(NVSDK_NGX_Parameter* p, const char* n, void* v, DWORD* seh) {
     Guarded([&] { p->Set(n, v); return true; }, false, seh);
     return *seh == 0;
@@ -522,6 +525,15 @@ static void ApplyHdrContract(NgxSnippet& s) {
 // find, so the first create attempt named its own requirements -- Width, Height, BackbufferFormat and
 // UseReflexMatrices -- and each round of filling them in reveals the next. That log is why this can
 // be written at all without the DLSS-G headers.
+// Answers the snippet's memory question. Flat, like the reference project's.
+static NVSDK_NGX_Result NVSDK_CONV DlssgEstimateVram(unsigned int, unsigned int, unsigned int,
+                                                     unsigned int, unsigned int, unsigned int,
+                                                     unsigned int, unsigned int, unsigned int,
+                                                     size_t* estimated) {
+    if (estimated) *estimated = size_t(300) * 1024 * 1024;
+    return NVSDK_NGX_Result_Success;
+}
+
 static void ApplyDlssgContract(NgxSnippet& s, uint32_t width, uint32_t height) {
     if (!s.params) return;
     DWORD seh = 0;
@@ -907,6 +919,36 @@ void NgxSetDlssgResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK* backbuffer
     // Interpolation is the whole point, so it is not disabled.
     ParamSetUI(s.params, "DLSSG.OutputDisableInterpolation", 0u, &seh);
 
+    // The flag that says the evaluation is real.
+    //
+    // Found in the reference project, which implements the other side of this: its frame generation
+    // provider answers the settings callback by setting MustCallEval, and that is how the caller
+    // learns the evaluate must actually be performed. Driving the snippet directly, nobody was
+    // setting it, and the DLL took the default -- which is why every evaluate returned success and
+    // both output surfaces stayed exactly as they were created.
+    ParamSetUI(s.params, "DLSSG.MustCallEval", 1u, &seh);
+    ParamSetUI(s.params, "DLSSG.BurstCaptureRunning", 0u, &seh);
+
+    // The ceiling, which nothing here had published.
+    //
+    // This is the number the reference project's binary patch exists to raise, and it turns out the
+    // caller is expected to state it as well -- its own frame generation provider sets it. A snippet
+    // asked to generate against a ceiling it cannot read has an obvious answer, and the answer it was
+    // giving is MustCallEval=0.
+    static const unsigned int ceiling = [] {
+        const char* v = getenv("DLSSNR_MFG_FRAMES");
+        const int n = v && *v ? atoi(v) : 1;
+        return (unsigned int)(n < 1 ? 1 : (n > 8 ? 8 : n));
+    }();
+    ParamSetUI(s.params, "DLSSG.MultiFrameCountMax", ceiling, &seh);
+    ParamSetUI(s.params, "DLSSG.DispatchFlags", 0u, &seh);
+    ParamSetUI(s.params, "DLSSG.ShowDebug", 0u, &seh);
+
+    // How much memory it may assume. The reference project answers a flat 300 MB rather than
+    // computing anything, so the number is clearly not load-bearing; what matters is that something
+    // answers at all.
+    ParamSetPtr(s.params, "DLSSG.EstimateVRAMCallback", (void*)&DlssgEstimateVram, &seh);
+
     // A subrect per resource, each the whole surface.
     //
     // Nothing here renders to a corner of a larger target, so every one of these is the full raster
@@ -928,6 +970,61 @@ void NgxSetDlssgResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK* backbuffer
     Log("[mfg] resources bound: backbuffer=%p mvec=%p depth=%p outInterp=%p outReal=%p targetFps=%u",
         (const void*)backbuffer, (const void*)mvec, (const void*)depth,
         (const void*)outInterpolated, (const void*)outReal, targetFrameRate);
+}
+
+// The snippet's own settings call, which the caller is expected to make before evaluating.
+//
+// nvngx_dlssg.dll exports it as NVSDK_NGX_VULKAN_DLSSG_GetCurrentSettingsCallback_Impl. In a normal
+// stack Streamline calls this to learn what the feature wants for the coming frame -- MustCallEval
+// among it -- and only then evaluates. Driving the snippet directly means making that call here.
+void NgxDlssgQuerySettings(NgxSnippet& s) {
+    static bool said = false;
+    if (!said) {
+        said = true;
+        Log("[mfg] settings query entered: snippet=%p params=%p feature0=%p",
+            (void*)s.snippet, (void*)s.params, (void*)s.features[0]);
+    }
+    if (!s.snippet || !s.params || !s.features[0]) return;
+    using FnSettings = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*);
+    static FnSettings fn = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        // Not an export: the name is a key the snippet writes into the parameter block itself,
+        // which is what the _Impl suffix means throughout this API. It only appears there once
+        // PopulateParameters has been called, which is the step that was missing -- the loader
+        // allocated a parameter block and never gave the snippet the chance to fill it.
+        DWORD sehp = 0;
+        auto populate = reinterpret_cast<NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter*)>(
+            GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_PopulateParameters_Impl"));
+        if (populate) {
+            NVSDK_NGX_Result pr = NVSDK_NGX_Result_Fail;
+            Guarded([&] { pr = populate(s.params); return true; }, false, &sehp);
+            Log("[mfg] PopulateParameters -> %#x seh=%#x", (uint32_t)pr, sehp);
+            if (s.ownParams) static_cast<OwnParam*>(s.params)->Persist();
+        } else {
+            Log("[mfg] PopulateParameters not exported");
+        }
+        void* cb = nullptr;
+        DWORD sehc = 0;
+        if (ParamGetPtr(s.params, "NVSDK_NGX_VULKAN_DLSSG_GetCurrentSettingsCallback_Impl", &cb, &sehc) && cb)
+            fn = reinterpret_cast<FnSettings>(cb);
+        else if (ParamGetPtr(s.params, "DLSSG.GetCurrentSettingsCallback", &cb, &sehc) && cb)
+            fn = reinterpret_cast<FnSettings>(cb);
+        Log("[mfg] settings callback %s", fn ? "found in the parameter block" : "absent");
+    }
+    if (!fn) return;
+    DWORD seh = 0;
+    NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
+    Guarded([&] { r = fn(s.features[0], s.params); return true; }, false, &seh);
+    unsigned int must = 0;
+    DWORD seh2 = 0;
+    ParamGetUI(s.params, "DLSSG.MustCallEval", &must, &seh2);
+    static unsigned int lastLogged = 0xFFFFFFFFu;
+    if (must != lastLogged) {
+        lastLogged = must;
+        Log("[mfg] settings callback -> %#x seh=%#x, MustCallEval=%u", (uint32_t)r, seh, must);
+    }
 }
 
 bool NgxEvaluatePass(NgxSnippet& s, uint32_t pass, VkCommandBuffer recordingCmd) {

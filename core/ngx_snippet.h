@@ -139,6 +139,8 @@ void NgxSetDlssgResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK* backbuffer
 void NgxSetSharpness(NgxSnippet& s, float sharpness);
 // How the motion field's units are read. Written every evaluate, because it goes with the field.
 void NgxSetMotionScale(NgxSnippet& s, float scaleX, float scaleY);
+// See NgxDlssgQuerySettings: the snippet is asked what it wants before it is evaluated.
+void NgxDlssgQuerySettings(NgxSnippet& s);
 bool NgxEvaluatePass(NgxSnippet& s, uint32_t pass, VkCommandBuffer recordingCmd);
 void NgxTeardown(NgxSnippet& s, VkDevice device);
 
