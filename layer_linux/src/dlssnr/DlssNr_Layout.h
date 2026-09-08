@@ -57,5 +57,6 @@ DLSSNR_PIN(MotionConfident, 108);
 DLSSNR_PIN(HdrProxy, 112);
 DLSSNR_PIN(HdrTransfer, 116);
 DLSSNR_PIN(ColourTrust, 120);
+DLSSNR_PIN(RatioSmooth, 124);
 
 #undef DLSSNR_PIN

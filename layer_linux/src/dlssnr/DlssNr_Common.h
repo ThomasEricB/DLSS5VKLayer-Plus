@@ -217,6 +217,9 @@ struct alignas(256) DlssNrConstants
     // How much of the chroma-agreement gate to apply, 0..1. See colourTrustPercent.
     float ColourTrust;
 
+    // How much of the relighting ratio comes from the neighbourhood. See ratioSmoothPercent.
+    float RatioSmooth;
+
 };
 
 class DlssNr_Common

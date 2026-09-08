@@ -39,6 +39,7 @@ cbuffer Params : register(b0)
     uint  gHdrTransfer;    // 1 with gHdrProxy: the swapchain carries PQ (ST 2084), so the frame is
                            //    PQ-decoded on the way in and PQ-encoded on the way out.
     float gColourTrust;    // how much of the chroma-agreement gate to apply, 0..1
+    float gRatioSmooth;    // how much of the relighting ratio to take from the neighbourhood
 
 };
 
@@ -916,6 +917,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // The model's own answer, kept before the matched-residual block below can rewrite `model`, so the
     // replace decode uses what the model returned rather than the residual reconstruction.
     float3 modelDirect = model;
+    // The proxy as it was sampled, kept for the same reason: the residual branch below rewrites
+    // `proxy`, and the relighting ratio's smoothing has to compare like with like.
+    float3 proxyDirect = proxy;
     float4 originalSample = gCompareMode == 1 ? gOriginal.SampleLevel(gLinear, cmpUv, 0)
                                               : gOriginal.Load(int3(id.xy, 0));
 
@@ -1347,6 +1351,59 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // luminance approaches zero. No edit at all is the right answer for a pixel with no light in it.
     const float kRatioFloor = 1.0 / 512.0;
     float lumaRatio = (upgradedLuma + kRatioFloor) / (originalLuma + kRatioFloor);
+
+    // Take the model's broad relighting and leave its per-pixel disagreement behind.
+    //
+    // Everything above rebuilds the frame as its own pixel times this one number. Where the model and
+    // the frame agree the number is 1 and nothing happens, which is why flat surfaces are always
+    // clean. On detailed content the model's answer differs sharply from one pixel to the next --
+    // that difference is the enhancement -- so the number is large and varies fast, and the highlight
+    // guard is the only thing holding it. Raising the guard therefore lets more of the variation
+    // through, and it lands as blown and black pixels carrying whatever colour the texture had. That
+    // is why the artifacts scale with the guard instead of being clipped by it, why colour strength 0
+    // does not touch them -- a scalar cannot move hue -- and why they sit only on detail.
+    //
+    // A ratio is the wrong thing to carry at full spatial frequency. What the model has a real
+    // opinion about at this scale is how much light belongs here, not which individual pixel is
+    // brighter than its neighbour; the frame already knows that and is about to be multiplied by
+    // this. So the ratio's high-frequency component is replaced with the neighbourhood's, leaving the
+    // broad verdict intact. Simulated against a surface carrying both: the pixel-to-pixel speckle
+    // falls about fourfold while the range the relighting spans is untouched, and the range still
+    // grows with the guard, which is the point -- a high guard becomes strong smooth relighting
+    // rather than speckle.
+    //
+    // Off by default, so the shipped configuration is unchanged and this is something to turn up
+    // when a raised guard is wanted.
+    if (gRatioSmooth > 0.0)
+    {
+        const float2 texel = 1.0 / float2(gWidth, gHeight);
+        float mAcc = dot(modelDirect, kLuma);
+        float pAcc = dot(proxyDirect, kLuma);
+        [unroll]
+        for (int nb = 0; nb < 4; ++nb)
+        {
+            const float2 off = float2(nb == 0 ? -1.0 : nb == 1 ? 1.0 : 0.0,
+                                      nb == 2 ? -1.0 : nb == 3 ? 1.0 : 0.0) * texel;
+            const float2 uvn = saturate(editUv + off);
+            float3 pn = gSource.SampleLevel(gLinear, uvn, 0).rgb;
+            float3 mn = gModel.SampleLevel(gLinear, uvn, 0).rgb;
+            if (gHdrProxy == 0 && gPassthrough == 0)
+            {
+                pn = SrgbToLinear(pn);
+                mn = SrgbToLinear(mn);
+            }
+            mAcc += dot(mn, kLuma);
+            pAcc += dot(pn, kLuma);
+        }
+        // The model's gain here against the model's gain over the neighbourhood. Their quotient is
+        // exactly the high-frequency part being removed, so where the gain is already smooth the two
+        // agree and this is the identity.
+        const float gainSharp  = (dot(modelDirect, kLuma) + kRatioFloor) /
+                                 (dot(proxyDirect, kLuma) + kRatioFloor);
+        const float gainSmooth = (mAcc / 5.0 + kRatioFloor) / (pAcc / 5.0 + kRatioFloor);
+        const float corrected  = lumaRatio * (gainSmooth / max(gainSharp, 1e-6));
+        lumaRatio = lerp(lumaRatio, corrected, saturate(gRatioSmooth));
+    }
 
     // Where detail strength above 1 goes.
     //

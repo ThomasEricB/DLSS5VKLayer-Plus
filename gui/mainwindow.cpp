@@ -908,6 +908,23 @@ QWidget* MainWindow::buildSettings() {
                                             0.0, 4.0, 0.05,
                                             "How much of the model's color comes with its light. At "
                                             "zero the frame keeps the game's hue exactly.");
+        compositionRows << binder->AddInt(f, "Smooth the relighting (%)", &ShmHeader::ratioSmoothPercent,
+                       0, 100,
+                       "What lets the Highlight guard be raised without the picture going patchy.\n\n"
+                       "Classic and Matched residual rebuild the frame as its own pixel times one "
+                       "number. Where the model and the frame agree that number is 1 and nothing "
+                       "happens, which is why flat surfaces are always clean. On detailed content the "
+                       "model's answer differs sharply from pixel to pixel -- that difference is the "
+                       "enhancement -- so the number varies fast, and the guard is the only thing "
+                       "holding it. Raise the guard and that variation lands as blown and black "
+                       "pixels wearing whatever colour the texture had.\n\nThis takes the number "
+                       "from the pixel's neighbourhood instead of the pixel. What the model knows at "
+                       "this scale is how much light belongs here, not which pixel is brighter than "
+                       "its neighbour -- the frame already knows that, and is what gets "
+                       "multiplied.\n\n0 is the old per-pixel behaviour. Raise it toward 100 if you "
+                       "want a high guard: the relighting keeps its full range and stops "
+                       "speckling.",
+                       ShmBinder::Live);
         compositionRows << binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.0, 30.0,
                                             0.5,
                                             "The most the pass may brighten or darken a pixel. A "

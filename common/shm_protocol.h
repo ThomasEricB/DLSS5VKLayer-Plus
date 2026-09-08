@@ -38,7 +38,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // decision are carried here. From this branch: the pipelined path's settle, ghost bound, edit split
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 17;
+static constexpr uint32_t kShmVersion = 18;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 // Eight bytes a pixel: the float16 proxy needs them, and the 8-bit path simply uses the first half of
@@ -608,6 +608,17 @@ struct ShmHeader {
     // removes detail", and it was never separable from the colour strength control, because the gate
     // multiplies that control rather than being one.
     std::atomic<uint32_t> colourTrustPercent;
+
+    // How much of the relighting ratio is taken from the pixel's neighbourhood instead of the pixel,
+    // in hundredths. 0 is the behaviour that shipped before it existed.
+    //
+    // The composition rebuilds the frame as its own pixel times one per-pixel number. On detailed
+    // content that number varies sharply, because the model's answer differs sharply there, and the
+    // highlight guard is all that holds it -- so raising the guard lets the variation through as
+    // blown and black pixels wearing whatever colour the texture had. Carrying a ratio at full
+    // spatial frequency is the mistake: what the model knows at this scale is how much light belongs
+    // here, not which pixel is brighter than its neighbour, and the frame already knows that.
+    std::atomic<uint32_t> ratioSmoothPercent;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -623,7 +634,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2032, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2040, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -736,6 +747,7 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->publishStride.store(0);
     h->motionSmoothPercent.store(100);
     h->colourTrustPercent.store(100);
+    h->ratioSmoothPercent.store(0);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);
