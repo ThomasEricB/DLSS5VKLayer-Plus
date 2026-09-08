@@ -498,11 +498,31 @@ static void ApplyHdrContract(NgxSnippet& s) {
     ParamSetUI(s.params, "DLSSNR.SDR", s.hdrActive ? 0u : 1u, &seh);
 }
 
+// The create-time block frame generation asks for.
+//
+// Discovered rather than guessed: the parameter object logs every key the DLL reads and does not
+// find, so the first create attempt named its own requirements -- Width, Height, BackbufferFormat and
+// UseReflexMatrices -- and each round of filling them in reveals the next. That log is why this can
+// be written at all without the DLSS-G headers.
+static void ApplyDlssgContract(NgxSnippet& s, uint32_t width, uint32_t height) {
+    if (!s.params) return;
+    DWORD seh = 0;
+    ParamSetUI(s.params, "DLSSG.Width", width, &seh);
+    ParamSetUI(s.params, "DLSSG.Height", height, &seh);
+    // The transport's format. The chain crosses as R8G8B8A8_UNORM, which is VkFormat 37.
+    ParamSetUI(s.params, "DLSSG.BackbufferFormat", 37u, &seh);
+    // No Reflex here: there is no game presenting through this device, so there are no camera
+    // matrices to hand over and nothing to align them to.
+    ParamSetUI(s.params, "DLSSG.UseReflexMatrices", 0u, &seh);
+    Log("[mfg] create contract: %ux%u backbufferFormat=37 reflexMatrices=0", width, height);
+}
+
 bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height,
                    VkCommandBuffer recordingCmd) {
     if (s.disabled || !s.params || pass >= kMaxPasses) return false;
     if (s.features[pass]) return true;
 
+    if (s.featureId == 11) ApplyDlssgContract(s, width, height);
     ApplyHdrContract(s);
 
     DWORD seh = 0;
