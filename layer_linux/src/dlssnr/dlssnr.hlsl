@@ -1568,7 +1568,19 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // identical, so this cannot touch content the model had a real opinion about.
     //
     // Only where the transport quantises. A float16 proxy has no such floor and needs no guard.
-    const float kQuantFloor = 0.0018;  // SrgbToLinear(6/255), in the same normalised units as model
+    // Raised from 6/255 to 25/255, from the range the fault actually occupies.
+    //
+    // Six was chosen as "a couple of code values", which is where hue is purely quantisation. But the
+    // pixels still arriving blue after the pass chain was widened to sixteen bits sit at a luminance
+    // of 6 to 18 in 255 -- median 13 -- and only a seventh of them are anywhere the colour bound
+    // engages, so on the rest the model's hue was passing through untouched. Below about 25 there are
+    // too few levels for the model to have a colour opinion worth more than the frame's own, and the
+    // frame's is the game's actual render rather than something reconstructed from three or four
+    // codes.
+    //
+    // It tapers rather than switching, so a pixel at the median is damped to about 40% and one at 32
+    // and above is untouched entirely.
+    const float kQuantFloor = 0.0097;  // SrgbToLinear(25/255), in the same normalised units as model
     const float hueTrust = gHdrProxy != 0 ? 1.0
                                           : smoothstep(0.0, kQuantFloor, dot(modelDirect, kLuma));
 
