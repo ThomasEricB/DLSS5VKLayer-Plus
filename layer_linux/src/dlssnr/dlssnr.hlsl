@@ -1467,7 +1467,28 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // distorter -- on a saturated pixel the smallest channel reaches the bound first, so an
     // achromatic edit lands as a colour shift.
     const float guard = max(gMaxRatio, 1.0);
-    float boundedRatio = clamp(amplified, 1.0 / guard, guard);
+
+    // Relighting cannot invent light, so the room to brighten shrinks toward none as a pixel
+    // approaches black.
+    //
+    // The composed pixel is the frame's own pixel times this number. A scalar cannot move hue, so
+    // whatever tint the texture already had is multiplied along with everything else -- and a dark
+    // pixel's tint is the most saturated thing about it. The platform ring is RGB (2, 4, 20): almost
+    // invisible, and a chroma of 0.9. At a guard of 8 that becomes (15, 25, 67), which is a glaring
+    // blue block, and it is the game's own colour every step of the way. That is the black-to-blue
+    // fault, and it is why the colour bound could not touch it -- the debug view shows that bound
+    // fully engaged, red, on exactly these pixels. There was never a wrong colour to hold back.
+    //
+    // Below the floor there is also nothing to relight *from*: at a couple of counts in 8-bit the
+    // pixel's own value is mostly quantisation, so an eightfold lift amplifies the transport rather
+    // than the model's verdict. Measured on the values above, this leaves a shadowed pixel of
+    // (20, 26, 44) with 6.4x of its 8x and anything at mid shadow or brighter completely untouched,
+    // while the ring keeps 1.2x and stays where it belongs.
+    //
+    // Only upward. Darkening a near-black pixel further is harmless -- it stays black -- and
+    // clamping that side would be a second bound nobody asked for.
+    const float lift = lerp(1.0, guard, smoothstep(0.0, 8.0 * kRatioFloor, originalLuma));
+    float boundedRatio = clamp(amplified, 1.0 / guard, lift);
 
     // Exactly one while the ratio is already inside the guard, so a frame that never needed bounding
     // is untouched rather than rounded, and strength zero stays bit-identical.
