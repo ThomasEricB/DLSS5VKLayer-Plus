@@ -27,7 +27,7 @@ void ShmBinder::Write(Field field, uint32_t raw, Latch latch) {
 QCheckBox* ShmBinder::AddBool(QFormLayout* form, const QString& label, Field field, const QString& tip,
                               Latch latch, bool invert) {
     auto* w = new QCheckBox(label, _parent);
-    w->setToolTip(tip);
+    w->setToolTip(FormatTip(tip));
     form->addRow(w);
     connect(w, &QCheckBox::toggled, this, [this, field, latch, invert](bool on) {
         const bool v = invert ? !on : on;
@@ -47,7 +47,7 @@ QSpinBox* ShmBinder::AddInt(QFormLayout* form, const QString& label, Field field
                             const QString& tip, Latch latch) {
     auto* w = new QSpinBox(_parent);
     w->setRange(lo, hi);
-    w->setToolTip(tip);
+    w->setToolTip(FormatTip(tip));
     form->addRow(label, w);
     connect(w, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this, field, latch](int v) { Write(field, uint32_t(v < 0 ? 0 : v), latch); });
@@ -66,7 +66,7 @@ QDoubleSpinBox* ShmBinder::AddFloat(QFormLayout* form, const QString& label, Fie
     w->setRange(lo, hi);
     w->setSingleStep(step);
     w->setDecimals(step < 0.01 ? 3 : 2);
-    w->setToolTip(tip);
+    w->setToolTip(FormatTip(tip));
     form->addRow(label, w);
     connect(w, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             [this, field, latch](double v) { Write(field, FloatToBits(float(v)), latch); });
@@ -83,7 +83,7 @@ QComboBox* ShmBinder::AddChoice(QFormLayout* form, const QString& label, Field f
                                 const QStringList& options, const QString& tip, Latch latch) {
     auto* w = new QComboBox(_parent);
     w->addItems(options);
-    w->setToolTip(tip);
+    w->setToolTip(FormatTip(tip));
     form->addRow(label, w);
     connect(w, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this, field, latch](int i) { Write(field, uint32_t(i < 0 ? 0 : i), latch); });
@@ -103,7 +103,7 @@ QSpinBox* ShmBinder::AddPercent(QFormLayout* form, const QString& label, Field f
     w->setRange(lo, hi);
     w->setSuffix("%");
     w->setSingleStep(5);
-    w->setToolTip(tip);
+    w->setToolTip(FormatTip(tip));
     form->addRow(label, w);
     connect(w, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this, field, latch](int v) { Write(field, FloatToBits(float(v) / 100.0f), latch); });

@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 3
+%global pkg_release 5
 
 Name:           dlssnr-personal
 Version:        0.2.5
@@ -80,6 +80,27 @@ fi
 /sbin/ldconfig || :
 
 %changelog
+* Tue Sep 08 2026 DLSS5VKLayer - 0.2.5-5
+- Runner discovery: system-wide compatibility tools are now found. On top of the per-user dirs, every
+  directory in $XDG_DATA_DIRS and the XDG defaults /usr/local/share and /usr/share are scanned -- the
+  defaults always, not merely as a fallback, because Steam Runtime rewrites XDG_DATA_DIRS inside its
+  container. This is where CachyOS ships Proton-CachyOS (/usr/share/steam/compatibilitytools.d), and
+  the XDG_DATA_DIRS scan covers other distro layouts (NixOS, custom prefixes) without further edits.
+  User dirs are scanned first and the sort is stable, so a user-installed tool wins a name/score tie
+  against a system copy. runner_probe and the dlssnr-helper shell fallback were updated in lockstep.
+- Helper: detect_steam_root now honours $XDG_DATA_HOME and also checks ~/.steam/root.
+
+* Tue Sep 08 2026 DLSS5VKLayer - 0.2.5-4
+- Helper: the nvapi64.dll load is now exception-guarded and skipped when the runner already supplies
+  NVAPI (the launcher sets DLSSNR_SKIP_NVAPI for Proton, where DXVK-NVAPI answers NVAPI). Forcing the
+  vendored nvapi64.dll on top of DXVK-NVAPI faulted inside its DllMain with no guard around it, which
+  took the whole helper down before nvngx.dll was ever reached; a bad nvapi64 now degrades to "no
+  NVAPI" instead. The nvngx.dll core load is guarded for the same reason.
+- GUI: import the NVIDIA NGX DLLs from the interface instead of the CLI. A "NGX binaries" submenu in
+  the gear menu imports (copy nvngx_dlssnr.dll/nvngx.dll/nvapi64.dll/sl.*.dll/*.license.txt into the
+  data dir) and opens the target folder; the GUI prompts on startup when nvngx_dlssnr.dll is missing.
+- GUI: long tooltips are now multi-line rather than one unbroken line.
+
 * Mon Sep 07 2026 DLSS5VKLayer - 0.2.5-3
 - Install ~/.config/environment.d/dlssnr.conf (per user) pinning
   VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present", so the layer orders correctly alongside

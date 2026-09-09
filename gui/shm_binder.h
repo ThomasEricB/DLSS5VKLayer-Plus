@@ -13,9 +13,27 @@
 #include "../common/shm_protocol.h"
 
 #include <QObject>
+#include <QString>
 #include <QStringList>
 #include <functional>
 #include <vector>
+
+// Tooltips carry real prose, and a single unbroken sentence reads as one gigantic line that runs off
+// the side of the screen. Callers write the natural break points as '\n'; this turns those into hard
+// breaks the tooltip will honour, escaping the text first so a stray '&' or '<' in the prose cannot be
+// mistaken for markup once the string becomes rich text. A tooltip with no '\n' is left as plain text,
+// so short one-liners are untouched and single-line.
+inline QString FormatTip(const QString& text) {
+    if (text.isEmpty() || !text.contains(QLatin1Char('\n'))) return text;
+    QString out = text;
+    out.replace(QLatin1Char('&'), QLatin1String("&amp;"))
+       .replace(QLatin1Char('<'), QLatin1String("&lt;"))
+       .replace(QLatin1Char('>'), QLatin1String("&gt;"));
+    out.replace(QLatin1String("\r\n"), QLatin1String("\n"))
+       .replace(QLatin1Char('\r'), QLatin1String("\n"))
+       .replace(QLatin1Char('\n'), QLatin1String("<br>"));
+    return out;
+}
 
 class QCheckBox;
 class QComboBox;

@@ -224,15 +224,39 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
 
     if (!InstallCallerSpoof(s.snippet, g_snippetSpoof)) { s.disabled = true; return false; }
 
-    s.nvapi = LoadLibraryExW((s.binDir + L"\\nvapi64.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (s.nvapi) RegisterPeRange("nvapi64.dll", s.nvapi);
+    // NVAPI. The handle is never called into by this code -- nvapi64.dll is loaded only so a snippet
+    // that resolves NVAPI by name finds this copy rather than failing -- so when the runner already
+    // supplies NVAPI (Proton/DXVK-NVAPI, which the launcher announces with DLSSNR_SKIP_NVAPI) we skip
+    // it outright: forcing the vendored nvapi64.dll in there bypasses the DXVK-NVAPI override and
+    // faults inside its DllMain. The load is guarded either way, because a bad nvapi64 has to degrade
+    // to "no NVAPI", not take the whole helper down -- Guarded() is the only thing standing between a
+    // faulting DllMain and an unhandled exception, and the old bare LoadLibraryExW had no such cover.
+    wchar_t nvenv[MAX_PATH];
+    const bool skipNvapi = GetEnvironmentVariableW(L"DLSSNR_SKIP_NVAPI", nvenv, MAX_PATH) > 0 &&
+                           nvenv[0] != L'\0' && nvenv[0] != L'0';
+    if (skipNvapi) {
+        Log("[ngx] nvapi64.dll load skipped (runner supplies NVAPI)");
+    } else {
+        DWORD seh2 = 0;
+        s.nvapi = Guarded([&] {
+            return LoadLibraryExW((s.binDir + L"\\nvapi64.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        }, (HMODULE)nullptr, &seh2);
+        if (s.nvapi) RegisterPeRange("nvapi64.dll", s.nvapi);
+        else Log("[ngx] nvapi64.dll not loaded (seh=%#x); continuing without it", seh2);
+    }
 
-    // Core (nvngx.dll): libmgr prerequisite for snippet init; also param allocator.
+    // Core (nvngx.dll): libmgr prerequisite for snippet init; also param allocator. Optional -- the
+    // parameter allocator falls back to the snippet's own, then to an in-house implementation. Guarded
+    // for the same reason as nvapi64: a faulting DllMain here must degrade, not kill the helper.
     std::wstring corePath = s.binDir + L"\\nvngx.dll";
     if (FileExists(corePath)) {
-        s.core = LoadLibraryExW(corePath.c_str(), nullptr,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        DWORD seh2 = 0;
+        s.core = Guarded([&] {
+            return LoadLibraryExW(corePath.c_str(), nullptr,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        }, (HMODULE)nullptr, &seh2);
         if (s.core) InstallCallerSpoof(s.core, g_coreSpoof);
+        else Log("[core] nvngx.dll load faulted (seh=%#x); continuing without core", seh2);
     }
     if (s.core) {
         const char* projectId = "7c134ab9-9677-4af5-a2b2-bca943350861";
