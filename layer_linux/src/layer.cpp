@@ -738,6 +738,15 @@ struct SwapchainState {
         float lastDx = 0.0f, lastDy = 0.0f;
         bool motionValid = false;
 
+        // The climb that decides how many frames actually fit in the gap. See MfgDynamicFactor.
+        uint32_t active = 0;          // what is being generated per real frame right now
+        uint32_t windowFrames = 0;    // real presents counted into this measurement window
+        uint32_t windowMissed = 0;    // acquires that found nothing, this window
+        double windowStartMs = 0.0;
+        double baseRate = 0.0;        // the game's real frame rate with nothing generated
+        uint32_t windowsSinceBase = 0;
+        uint32_t coolWindows = 0;    // after a step down, how long before trying again
+
     } fg;
 };
 
@@ -1593,6 +1602,88 @@ static uint32_t MfgFactorFor(DeviceChain* dc, const SwapchainState& sc, uint32_t
 }
 
 
+// How many frames to generate this present, found by measurement rather than set.
+//
+// The question "how many generated frames fit between two real ones" has no answer a layer can look
+// up. It depends on the refresh rate, on how far below it the game is running, and on how readily the
+// presentation engine lets an image go -- and the first two are exactly what a game changes from one
+// scene to the next. What a layer can see is the consequence, so that is what this measures: add a
+// frame, and watch whether the game's own frame rate survives it.
+//
+// The distinction being drawn is between generation and displacement, and it is not academic. On a
+// display already receiving a new frame every vertical blank there is no gap, and a generated frame
+// takes a real frame's slot: measured on a 144 Hz display, adding one took the game from 2866 real
+// frames to 1475 over twenty seconds. The total presented was unchanged. That is not frame
+// generation and no fixed count can tell it apart from the case where it works -- but the real frame
+// rate falling by a third says it plainly, one window later.
+//
+// So: measure the baseline with nothing generated, then climb while the real rate holds and step back
+// when it does not. The baseline is re-measured every so often, because a scene that gets cheaper
+// moves the answer and a number decided once would sit there being wrong.
+static uint32_t MfgDynamicFactor(DeviceChain* dc, SwapchainState& sc, uint32_t ceiling) {
+    ShmHeader* h = dc->shm.hdr;
+    if (!h || h->mfgAuto.load(std::memory_order_relaxed) == 0) {
+        sc.fg.active = ceiling;
+        return ceiling;
+    }
+
+    // Long enough to average out a hitch, short enough to follow a scene change.
+    static constexpr uint32_t kWindow = 120;
+    static constexpr uint32_t kRebaseEvery = 12;
+
+    const double now = NowMs();
+    if (sc.fg.windowStartMs == 0.0) {
+        sc.fg.windowStartMs = now;
+        sc.fg.active = 0;  // the first window measures the game on its own
+    }
+    ++sc.fg.windowFrames;
+    if (sc.fg.windowFrames < kWindow) return sc.fg.active > ceiling ? ceiling : sc.fg.active;
+
+    const double elapsed = now - sc.fg.windowStartMs;
+    const double rate = elapsed > 0.0 ? double(sc.fg.windowFrames) * 1000.0 / elapsed : 0.0;
+
+    if (sc.fg.active == 0) {
+        // Nothing was generated this window, so this is what the game does unaided.
+        sc.fg.baseRate = sc.fg.baseRate > 0.0 ? (sc.fg.baseRate * 0.5 + rate * 0.5) : rate;
+        sc.fg.windowsSinceBase = 0;
+        // Wait before trying again after a refusal, rather than retrying every window.
+        //
+        // Without this it oscillates, and the oscillation is not free: measured on a saturated
+        // display it stepped 0, 1, 0, 1 and still generated 1693 frames over 45 seconds -- half the
+        // windows spent displacing real frames to re-learn an answer it already had. A game that has
+        // no gap now usually still has none in two seconds, so the retry is cheap to delay and
+        // expensive to repeat.
+        if (sc.fg.coolWindows > 0) --sc.fg.coolWindows;
+        else if (ceiling > 0) sc.fg.active = 1;
+    } else {
+        ++sc.fg.windowsSinceBase;
+        // A real rate materially below the baseline means the generated frames were taking the
+        // game's slots rather than filling gaps. Eight per cent is wider than the run-to-run spread
+        // measured with generation off (2846 against 2858 frames, well under one per cent) and far
+        // narrower than displacement, which halves it.
+        if (sc.fg.baseRate > 0.0 && rate < sc.fg.baseRate * 0.92) {
+            sc.fg.active = sc.fg.active > 1 ? sc.fg.active - 1 : 0;
+            if (sc.fg.active == 0) sc.fg.coolWindows = 30;
+            Log("[mfg] real frame rate fell to %.0f from %.0f: generating %u per frame%s", rate,
+                sc.fg.baseRate, sc.fg.active,
+                sc.fg.active == 0 ? "; not trying again for a while" : "");
+        } else if (sc.fg.windowMissed == 0 && sc.fg.active < ceiling) {
+            ++sc.fg.active;
+            Log("[mfg] room for another: generating %u per frame at %.0f fps", sc.fg.active, rate);
+        }
+        // Re-measure the baseline now and then, so a scene that gets cheaper or dearer is followed
+        // rather than compared against a number from minutes ago.
+        if (sc.fg.windowsSinceBase >= kRebaseEvery) sc.fg.active = 0;
+    }
+
+    if (sc.fg.active > ceiling) sc.fg.active = ceiling;
+    sc.fg.windowFrames = 0;
+    sc.fg.windowMissed = 0;
+    sc.fg.windowStartMs = now;
+    h->mfgActiveFactor.store(sc.fg.active, std::memory_order_relaxed);
+    return sc.fg.active;
+}
+
 // Retire finished slots, decide whether a generated frame is wanted, and take an image for one.
 //
 // The acquire does not happen here, and that is the whole point. It was measured: a zero-timeout
@@ -1690,6 +1781,7 @@ static void MfgAcquireAhead(DeviceChain* dc, SwapchainState& sc, VkSwapchainKHR 
             MfgMiss(acq == VK_NOT_READY || acq == VK_TIMEOUT ? "nothing free to acquire"
                                                              : "acquire failed");
             ++sc.fg.missed;
+            ++sc.fg.windowMissed;
             return;
         }
         if (index >= sc.images.size()) { ++sc.fg.missed; return; }
@@ -2466,14 +2558,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             // Decided before the pass records, because it is what asks the estimator to read its
             // displacement back to the CPU, and that has to be in the same command buffer.
             uint32_t mfgState = 0;
-            const uint32_t mfgFactor = MfgFactorFor(dc, sc, &mfgState);
+            uint32_t mfgFactor = MfgFactorFor(dc, sc, &mfgState);
+            // The setting is the ceiling; how much of it is used is measured. A ceiling reached and
+            // held is the answer "all of it fits", not a number nobody checked.
+            if (mfgFactor) mfgFactor = MfgDynamicFactor(dc, sc, mfgFactor);
             sc.comp->SetMotionReadback(mfgFactor != 0);
             if (dc->shm.hdr) dc->shm.hdr->mfgState.store(mfgState, std::memory_order_relaxed);
             // A present early, so the image has a vertical blank in which to become free.
             if (mfgFactor) MfgAcquireAhead(dc, sc, pPresentInfo->pSwapchains[i], mfgFactor);
             const bool composed = ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]],
                                                  waitCount, pPresentInfo->pWaitSemaphores, &consumed);
-            if (mfgFactor && composed) {
+            // Not conditional on the frame having been composed, and that was a starvation bug
+            // rather than a missed opportunity. The image is acquired a present early; if generation
+            // is then skipped, that image is still held -- and the only way to release one is to
+            // present it. On the pipelined path a frame passes through uncomposed whenever no answer
+            // is ready, which is most of them, so the held images accumulated and the game ran out:
+            // measured at 30 fps under a 60 fps cap, with 95 generated frames to show for it.
+            //
+            // Composition has nothing to do with it in any case. What is carried forward is whatever
+            // was just presented, composed or not.
+            if (mfgFactor) {
                 fgSwapchain = pPresentInfo->pSwapchains[i];
                 fgImage = sc.images[pPresentInfo->pImageIndices[i]];
                 fgFactor = mfgFactor;

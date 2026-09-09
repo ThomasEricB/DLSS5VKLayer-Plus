@@ -673,10 +673,23 @@ void MainWindow::updateStatus() {
             ((unsigned long long)hdr->mfgGeneratedHi.load() << 32) | hdr->mfgGeneratedLo.load();
         const unsigned long long missed =
             ((unsigned long long)hdr->mfgMissedHi.load() << 32) | hdr->mfgMissedLo.load();
-        QString text = QString("<b>%1</b>").arg(QString(kState[st < 5 ? st : 0]));
+        QString text;
+        // Said here as well as in the state, because the state is only written while a game is
+        // running and this is the moment someone ticks the box with no game open at all. It is the
+        // same mistake every time: generation on, pipelined path off, nothing happens, no clue.
+        if (hdr->mfgEnabled.load() != 0 && hdr->pipeline.load() == 0) {
+            text += "<span style=\"color:#ef6c00;\"><b>Will not run:</b> this needs "
+                    "\u201cRun the model alongside the frame\u201d switched on, under Cost. "
+                    "The displacement it carries a frame forward along is measured against the "
+                    "frame an outstanding answer belongs to, and waiting for the model means "
+                    "there is never one in flight to measure against.</span><br>";
+        }
+        text += QString("<b>%1</b>").arg(QString(kState[st < 5 ? st : 0]));
         if (st != 0) {
-            text += QString(" &mdash; %1 generated, %2 gaps left unfilled")
-                        .arg(gen).arg(missed);
+            const bool measured = hdr->mfgAuto.load() != 0;
+            const unsigned per = measured ? hdr->mfgActiveFactor.load() : hdr->mfgFactor.load();
+            text += QString(" &mdash; %1 per frame (%2), %3 generated, %4 gaps left unfilled")
+                        .arg(per).arg(measured ? "measured" : "fixed").arg(gen).arg(missed);
             if (gen == 0 && missed > 32)
                 text += "<br><span style=\"color:#ef6c00;\">No image was ever free at the moment of "
                         "asking. Raise the wait above, or the game may already be at your refresh "
@@ -801,9 +814,24 @@ QWidget* MainWindow::buildSettings() {
                         "can fill, camera matrices and depth and motion vectors and a HUD-less "
                         "colour buffer, none of which exist below a swapchain.",
                         ShmBinder::Live);
-        binder->AddInt(f, "Generated frames per real frame", &ShmHeader::mfgFactor, 1, 3,
-                       "How many extra frames to place in each gap. Each one needs a swapchain image "
-                       "of its own, so more of them are refused more often.",
+        connect(mfgCheck, &QCheckBox::toggled, this, [this](bool) { updateStatus(); });
+        binder->AddBool(f, "Find the number by measuring", &ShmHeader::mfgAuto,
+                        "On, the count below is a ceiling rather than an instruction, and how much "
+                        "of it gets used is measured.\n\nHow many generated frames fit between two "
+                        "real ones depends on your refresh rate, on how far below it the game is "
+                        "running, and on how readily the display lets a swapchain image go -- none "
+                        "of which a layer can look up, and the first two change from scene to scene. "
+                        "So it measures the game's frame rate with nothing generated, adds a frame, "
+                        "and keeps it only while the real rate holds up. If the rate falls the "
+                        "frames were taking the game's slots rather than filling gaps, and it steps "
+                        "back down.\n\nThat distinction is the whole point: on a display already "
+                        "receiving a new frame every vertical blank there is no gap, and adding one "
+                        "measured 2866 real frames down to 1475 with the total presented unchanged.",
+                        ShmBinder::Live);
+        binder->AddInt(f, "At most, per real frame", &ShmHeader::mfgFactor, 1, 3,
+                       "The ceiling on the count. Each generated frame needs a swapchain image of "
+                       "its own, and the images are requested when the game creates its swapchain, "
+                       "so raising this takes effect at the next one rather than at once.",
                        ShmBinder::Live);
         binder->AddInt(f, "Wait for a free image (\xc2\xb5s)", &ShmHeader::mfgAcquireWaitUs, 0, 20000,
                        "The one setting here with a real cost, and the reason generation is usually "
@@ -853,6 +881,7 @@ QWidget* MainWindow::buildSettings() {
         // happening -- the state the composition checkbox itself was in before it was fixed.
         connect(pipelineCheck, &QCheckBox::toggled, this, [this](bool on) {
             if (on && hdr) hdr->compositionBypass.store(1);
+            updateStatus();
             if (on && bypassCheck) {
                 QSignalBlocker block(bypassCheck);
                 bypassCheck->setChecked(false);  // inverted: "Enabled" off means bypassed

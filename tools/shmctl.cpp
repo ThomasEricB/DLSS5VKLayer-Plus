@@ -75,6 +75,8 @@ const Setting kSettings[] = {
       "generated frames per real frame, 1-3" },
     { "mfgmode", &ShmHeader::mfgMode, false,
       "0 only under a paced present mode (fifo), 1 under any" },
+    { "mfgauto", &ShmHeader::mfgAuto, false,
+      "find how many frames fit by measuring, using mfgfactor as the ceiling, 0 or 1" },
     { "mfgwait", &ShmHeader::mfgAcquireWaitUs, false,
       "microseconds the present may wait for a free image, 0 = never wait (see the header note)" },
     { "mvec", &ShmHeader::mvecEnabled, false, "estimate motion vectors from the frames, 0 or 1" },
@@ -206,8 +208,11 @@ void PrintStatus(const ShmHeader* h) {
                                            "unavailable on this swapchain",
                                            "waiting: needs pipeline=1" };
         const unsigned st = h->mfgState.load();
-        std::printf("mfg_state=%s\nmfg_generated=%llu\nmfg_missed=%llu\nmfg_motion=%.2f,%.2f\n",
-                    kMfgState[st < 5 ? st : 0], gen, missed,
+        std::printf("mfg_state=%s\nmfg_per_frame=%u%s\nmfg_generated=%llu\nmfg_missed=%llu\n"
+                    "mfg_motion=%.2f,%.2f\n",
+                    kMfgState[st < 5 ? st : 0],
+                    h->mfgAuto.load() ? h->mfgActiveFactor.load() : h->mfgFactor.load(),
+                    h->mfgAuto.load() ? " (measured)" : " (fixed)", gen, missed,
                     BitsToFloat(h->mfgMotionXBits.load()), BitsToFloat(h->mfgMotionYBits.load()));
     }
     std::printf("layer_composition_up=%u\nlayer_frames=%llu\nlayer_ms=%.2f\n",
@@ -223,6 +228,19 @@ void PrintStatus(const ShmHeader* h) {
 }
 
 }  // namespace
+
+// Frame generation is not a thing that can be switched on by itself, and the shape of the mistake is
+// always the same: mfg goes to 1, nothing happens, and the only clue is a status field nobody looks
+// at until they are told to. So say it at the moment the setting changes, in both directions.
+static void WarnAboutPipeline(ShmHeader* h) {
+    if (h->mfgEnabled.load() == 0 || h->pipeline.load() != 0) return;
+    std::fprintf(stderr,
+        "warning: frame generation will not run while pipeline=0.\n"
+        "  It measures how far the picture moved by comparing the frame being encoded against the\n"
+        "  frame an outstanding answer belongs to, and with the model waited on there is never an\n"
+        "  answer in flight to measure against.\n"
+        "  Fix:  dlssnr-shmctl <shm> set pipeline 1\n");
+}
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -301,6 +319,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "unknown setting: %s\n", argv[3]);
                 rc = 2;
             }
+            WarnAboutPipeline(h);
         }
     } else if (std::strcmp(cmd, "set") == 0) {
         if (argc != 5) { Usage(); rc = 2; }
@@ -309,6 +328,8 @@ int main(int argc, char** argv) {
             if (!ApplySetting(h, argv[3], argv[4])) {
                 std::fprintf(stderr, "unknown setting: %s\n", argv[3]);
                 rc = 2;
+            } else {
+                WarnAboutPipeline(h);
             }
         }
     } else {

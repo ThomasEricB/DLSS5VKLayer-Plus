@@ -677,6 +677,23 @@ struct ShmHeader {
     // -- a game already at the refresh rate loses a real frame for every generated one. 0 by default:
     // no wait and no risk, generating only when an image happens to be free at the moment of asking.
     std::atomic<uint32_t> mfgAcquireWaitUs;
+
+    // Whether the number of generated frames is found by measurement rather than fixed.
+    //
+    // A fixed count is a guess about a gap nobody has measured. How many generated frames fit between
+    // two real ones depends on the refresh rate, on how far below it the game is running, and on how
+    // many swapchain images the presentation engine will let go of -- and a layer can read none of
+    // those directly. What it can read is the consequence: put a generated frame in and see whether
+    // the game's own frame rate survives it.
+    //
+    // So it climbs. It starts at none and measures the game's real frame rate, adds one and measures
+    // again, and keeps the addition only while the real rate holds up; when the rate falls, the
+    // frames were being displaced rather than added and it steps back down. mfgFactor becomes the
+    // ceiling on that climb rather than the count itself, and the baseline is re-measured
+    // periodically so a scene that gets cheaper or dearer is followed rather than assumed.
+    std::atomic<uint32_t> mfgAuto;
+    // What the climb settled on, for the display. 0 while it is measuring the baseline.
+    std::atomic<uint32_t> mfgActiveFactor;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -692,7 +709,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2104, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2112, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -823,6 +840,8 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->mfgMotionXBits.store(FloatToBits(0.0f));
     h->mfgMotionYBits.store(FloatToBits(0.0f));
     h->mfgAcquireWaitUs.store(0);
+    h->mfgAuto.store(1);
+    h->mfgActiveFactor.store(0);
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);
