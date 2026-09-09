@@ -94,6 +94,8 @@ private:
     QSpinBox* captureFrames = nullptr;
     QCheckBox* bypassCheck = nullptr;
     QCheckBox* pipelineCheck = nullptr;
+    QCheckBox* mfgCheck = nullptr;
+    QLabel* mfgStatusLabel = nullptr;
     QFormLayout* compositionForm = nullptr;
     QVector<QWidget*> compositionRows;
     bool helperRunning = false;

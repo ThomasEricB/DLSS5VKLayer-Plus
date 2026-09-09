@@ -1673,7 +1673,7 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
             if (globalMotion) {
                 // What the estimate actually said, reported rather than assumed. The gate that will
                 // read the confidence has to be calibrated against real values.
-                if (TimeEnabled()) {
+                if (TimeEnabled() || _motionReadback) {
                     float v[4] = {};
                     uint32_t at = 0, age = 0;
                     // Every reading names the frame it was computed on, so consecutive lines are
@@ -1681,7 +1681,7 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
                     // the numbering is a dropped reading and says so, instead of quietly repeating a
                     // value and passing it off as a new sample -- which is what the old readback did,
                     // and what made a series look smooth while the frames themselves were not.
-                    if (_globalMotion->ReadLast(v, &at, &age)) {
+                    if (TimeEnabled() && _globalMotion->ReadLast(v, &at, &age)) {
                         static uint32_t last = 0;
                         static int n = 0;
                         if (++n % TimeInterval() == 0) {
@@ -1858,6 +1858,28 @@ void Composition::ConsumeMeter() {
     const float* mirror = (const float*) _meterMirror.mapped;
     _measuredWhitePoint = mirror[1];
     _meterSteadiness = mirror[3];
+}
+
+}  // namespace dlssnr
+
+namespace dlssnr {
+
+// The last displacement the estimator read back, for a caller on the CPU.
+//
+// Guarded by age rather than trusted outright: the readback ring is three frames deep by design, so a
+// reading is normally a few frames old, and a much older one means readings stopped landing -- which
+// happens when the estimator is rebuilt or the game stalls. Extrapolating along a stale displacement
+// is worse than not extrapolating at all, so this says no instead.
+bool Composition::ReadGlobalMotion(float& dx, float& dy, float& confidence, uint32_t maxAge) const {
+    if (!_globalMotion) return false;
+    float v[4] = {};
+    uint32_t at = 0, age = 0;
+    if (!_globalMotion->ReadLast(v, &at, &age)) return false;
+    if (age > maxAge) return false;
+    dx = v[0];
+    dy = v[1];
+    confidence = v[2];
+    return true;
 }
 
 }  // namespace dlssnr

@@ -165,6 +165,15 @@ class Composition {
     // trip for nothing.
     bool HasGlobalMotion() const { return _globalMotion != nullptr; }
 
+    // Frame generation needs the measured displacement on the CPU, and the readback that puts it
+    // there was previously recorded only while timing was switched on -- so the estimate existed on
+    // the GPU every frame and reached no one unless someone was watching the log. This asks for it
+    // to be read back for its own sake.
+    void SetMotionReadback(bool want) { _motionReadback = want; }
+    // The last displacement read back, in pixels, and how much of it to believe. False when there is
+    // no estimator, no reading has landed yet, or the reading is older than the caller can use.
+    bool ReadGlobalMotion(float& dx, float& dy, float& confidence, uint32_t maxAge = 8) const;
+
     // How many round trips of motion the stale edit has to be moved by. The layer measures it; see
     // ShmMap::reprojScale.
     void SetReprojScale(float r) { _reprojScale = r; }
@@ -374,6 +383,7 @@ class Composition {
     bool _settled = false;
     bool _targetValid = false;
     float _reprojScale = 1.0f;
+    bool _motionReadback = false;
     float _answerAge = 1.0f;
     // Frames since the picture the estimate is measured against was recorded: the round trip the
     // answer took, plus one for every frame it has been held since.

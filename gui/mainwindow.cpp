@@ -848,6 +848,57 @@ void MainWindow::updateStatus() {
                                : QString("<span style=\"color:#9e9e9e;\">&#9675; Inactive</span>");
     statusLabel->setText(QString("Helper: %1&nbsp;&nbsp;&nbsp;%2").arg(state.toHtmlEscaped(), dot));
 
+    // What frame generation is actually doing, rather than what it was asked to do. The gap between
+    // the two is the whole story here: it is switched on far more often than it generates, and
+    // without this the only visible answer would be a ticked box and no extra frames.
+    if (mfgStatusLabel) {
+        static const char* kState[] = { "off", "on, not generating", "generating",
+                                        "unavailable on this swapchain",
+                                        "waiting: needs the model running alongside the frame" };
+        const unsigned st = hdr->mfgState.load();
+        const unsigned long long gen =
+            ((unsigned long long)hdr->mfgGeneratedHi.load() << 32) | hdr->mfgGeneratedLo.load();
+        const unsigned long long missed =
+            ((unsigned long long)hdr->mfgMissedHi.load() << 32) | hdr->mfgMissedLo.load();
+        QString text;
+        // Said here as well as in the state, because the state is only written while a game is
+        // running and this is the moment someone ticks the box with no game open at all. It is the
+        // same mistake every time: generation on, pipelined path off, nothing happens, no clue.
+        if (hdr->mfgEnabled.load() != 0 && hdr->pipeline.load() == 0) {
+            text += "<span style=\"color:#ef6c00;\"><b>Will not run:</b> this needs "
+                    "\u201cRun the model alongside the frame\u201d switched on, under Cost. "
+                    "The displacement it carries a frame forward along is measured against the "
+                    "frame an outstanding answer belongs to, and waiting for the model means "
+                    "there is never one in flight to measure against.</span><br>";
+        }
+        text += QString("<b>%1</b>").arg(QString(kState[st < 5 ? st : 0]));
+        if (st != 0) {
+            const bool measured = hdr->mfgAuto.load() != 0;
+            const unsigned per = measured ? hdr->mfgActiveFactor.load() : hdr->mfgFactor.load();
+            const unsigned long long noimg =
+                ((unsigned long long)hdr->mfgNoImageHi.load() << 32) | hdr->mfgNoImageLo.load();
+            text += QString(" &mdash; %1 per frame (%2), %3 generated, %4 gaps left unfilled")
+                        .arg(per).arg(measured ? "measured" : "fixed").arg(gen).arg(missed);
+            // The one reason among those that is nobody's fault, separated from the rest. Everything
+            // else in that total is the layer declining for a reason it could act on; this is the
+            // swapchain honestly having no spare image, which no amount of tuning changes.
+            text += QString("<br>of those, %1 found no free image in the swapchain").arg(noimg);
+            text += QString("<br>waiting %1 \xc2\xb5s for one, ceiling %2 \xc2\xb5s "
+                            "(both found by measuring)")
+                        .arg(hdr->mfgAcquireWaitUs.load()).arg(hdr->mfgWaitCeilingUs.load());
+            if (gen == 0 && missed > 32)
+                text += "<br><span style=\"color:#ef6c00;\">Nothing is being generated. If the game "
+                        "is already at your refresh rate there is no gap to fill, which is the "
+                        "expected answer rather than a fault.</span>";
+            const float dx = BitsToFloat(hdr->mfgMotionXBits.load());
+            const float dy = BitsToFloat(hdr->mfgMotionYBits.load());
+            if (dx != 0.0f || dy != 0.0f)
+                text += QString("<br>carrying forward by %1, %2 px")
+                            .arg(double(dx), 0, 'f', 1).arg(double(dy), 0, 'f', 1);
+        }
+        mfgStatusLabel->setText(text);
+    }
+
     saveSettingsIfChanged();
 }
 
@@ -945,6 +996,53 @@ QWidget* MainWindow::buildSettings() {
                          "The one strength the model reads every frame, so it takes effect at once.");
     }
     {
+        auto* f = group(col, "Frame generation");
+        mfgCheck = binder->AddBool(f, "Generate extra frames", &ShmHeader::mfgEnabled,
+                        "Presents an extra frame between the game's own, carrying the frame just "
+                        "presented forward along the displacement the layer measured. No real frame "
+                        "is replaced and none is held back, so it costs no latency -- unlike "
+                        "interpolation, which has to delay a real frame to have two to sit between."
+                        "\n\nIt needs the model running alongside the frame: the displacement is "
+                        "measured against the frame an outstanding answer belongs to, and waiting "
+                        "for the model means there is never one in flight to measure against."
+                        "\n\nThis is not DLSS-G. Frame generation through nvngx_dlssg.dll cannot be "
+                        "created from a layer at all -- it is built from a contract only the game "
+                        "can fill, camera matrices and depth and motion vectors and a HUD-less "
+                        "colour buffer, none of which exist below a swapchain.",
+                        ShmBinder::Live);
+        connect(mfgCheck, &QCheckBox::toggled, this, [this](bool) { updateStatus(); });
+        binder->AddBool(f, "Find the number by measuring", &ShmHeader::mfgAuto,
+                        "On, the count below is a ceiling rather than an instruction, and how much "
+                        "of it gets used is measured.\n\nHow many generated frames fit between two "
+                        "real ones depends on your refresh rate, on how far below it the game is "
+                        "running, and on how readily the display lets a swapchain image go -- none "
+                        "of which a layer can look up, and the first two change from scene to scene. "
+                        "So it measures the game's frame rate with nothing generated, adds a frame, "
+                        "and keeps it only while the real rate holds up. If the rate falls the "
+                        "frames were taking the game's slots rather than filling gaps, and it steps "
+                        "back down.\n\nThat distinction is the whole point: on a display already "
+                        "receiving a new frame every vertical blank there is no gap, and adding one "
+                        "measured 2866 real frames down to 1475 with the total presented unchanged.",
+                        ShmBinder::Live);
+        binder->AddInt(f, "At most, per real frame", &ShmHeader::mfgFactor, 1, 3,
+                       "The ceiling on the count. Each generated frame needs a swapchain image of "
+                       "its own, and the images are requested when the game creates its swapchain, "
+                       "so raising this takes effect at the next one rather than at once.",
+                       ShmBinder::Live);
+        binder->AddBool(f, "Generate under any present mode", &ShmHeader::mfgMode,
+                        "Off, generation only runs under FIFO (vsync), where the display shows "
+                        "queued frames one vertical blank apart -- which is what puts the generated "
+                        "frame in the gap rather than racing it there. On, it runs under any present "
+                        "mode, where the spacing is the driver's to decide: mailbox may discard the "
+                        "generated frame and immediate may show it at once, making the pair a "
+                        "stutter instead of a smoothing.",
+                        ShmBinder::Live);
+        mfgStatusLabel = new QLabel;
+        mfgStatusLabel->setWordWrap(true);
+        mfgStatusLabel->setTextFormat(Qt::RichText);
+        f->addRow(mfgStatusLabel);
+    }
+    {
         auto* f = group(col, "Cost");
         pipelineCheck = binder->AddBool(f, "Run the model alongside the frame", &ShmHeader::pipeline,
                         "The single biggest lever on frame rate. Off, the game waits for the model "
@@ -963,6 +1061,7 @@ QWidget* MainWindow::buildSettings() {
         // happening -- the state the composition checkbox itself was in before it was fixed.
         connect(pipelineCheck, &QCheckBox::toggled, this, [this](bool on) {
             if (on && hdr) hdr->compositionBypass.store(1);
+            updateStatus();
             if (on && bypassCheck) {
                 QSignalBlocker block(bypassCheck);
                 bypassCheck->setChecked(false);  // inverted: "Enabled" off means bypassed

@@ -243,19 +243,55 @@ void GlobalMotionVk::DropImg(Img& img) {
     img = Img{};
 }
 
+// What a layout means in terms of who touches the image and how.
+//
+// Every barrier here used to name the compute stage on both sides, which is right for the passes that
+// only ever read and write these images from compute -- and wrong the moment one is copied. A
+// transition into TRANSFER_SRC that says "available to compute" does not make the image available to
+// the copy that follows it, and the transition back out does not wait for that copy to finish.
+// Synchronisation validation names both, as READ_AFTER_WRITE on the vkCmdCopyImageToBuffer and
+// WRITE_AFTER_READ on the barrier after it.
+//
+// It went unnoticed because the only copy in here is the result readback, and that was recorded only
+// while timing was switched on. Frame generation reads the displacement every frame, so it is
+// recorded every frame now, and the latent bug became a real one.
+static void GmStageAccessFor(VkImageLayout layout, VkPipelineStageFlags& stage, VkAccessFlags& access) {
+    switch (layout) {
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            access = VK_ACCESS_TRANSFER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            access = VK_ACCESS_TRANSFER_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+            stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            access = 0;
+            break;
+        default:
+            stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            access = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+            break;
+    }
+}
+
 void GlobalMotionVk::Barrier(VkCommandBuffer cb, Img& img, VkImageLayout to) {
     if (img.layout == to) return;
+    VkPipelineStageFlags srcStage = 0, dstStage = 0;
+    VkAccessFlags srcAccess = 0, dstAccess = 0;
+    GmStageAccessFor(img.layout, srcStage, srcAccess);
+    GmStageAccessFor(to, dstStage, dstAccess);
     VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    b.srcAccessMask = srcAccess;
+    b.dstAccessMask = dstAccess;
     b.oldLayout = img.layout;
     b.newLayout = to;
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img.image;
     b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                              0, 0, nullptr, 0, nullptr, 1, &b);
+    _vk->vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
     img.layout = to;
 }
 
