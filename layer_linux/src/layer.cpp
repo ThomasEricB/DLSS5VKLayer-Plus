@@ -643,7 +643,8 @@ struct InstanceChain {
     X(vkMapMemory) X(vkUnmapMemory) X(vkCreateBuffer) X(vkDestroyBuffer) \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkCmdCopyBufferToImage) \
     X(vkCmdCopyImageToBuffer) X(vkCmdPipelineBarrier) X(vkDeviceWaitIdle) \
-    X(vkAcquireNextImageKHR) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
+    X(vkAcquireNextImageKHR) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) \
+    X(vkReleaseSwapchainImagesEXT)
 
 struct SwapchainState {
     std::vector<VkImage> images;
@@ -1514,19 +1515,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
     // for "no limit" and the driver is the authority either way, so the bumped count is attempted and
     // the game's own count used if it is refused. A game that would have got a swapchain always gets
     // one.
-    bool bumped = false;
-    if (!dc->inert && LayerEnabled() && SupportedFormat(pCreateInfo->imageFormat) &&
-        ShmOpen(dc->shm) && dc->shm.hdr &&
-        dc->shm.hdr->mfgEnabled.load(std::memory_order_relaxed)) {
-        // One image per generated frame, and one more so the game is never left waiting on the one
-        // being generated into. Measured: raising it further did not help -- six images and eight
-        // behaved the same as five -- because what limits the acquire is when the display releases an
-        // image, not how many exist.
-        const uint32_t f = dc->shm.hdr->mfgFactor.load(std::memory_order_relaxed);
-        m.minImageCount = pCreateInfo->minImageCount + (f < 1 ? 1u : (f > 3 ? 3u : f)) + 1u;
-        bumped = true;
-    }
-
+    // The image count is left exactly as the game asked for it.
+    //
+    // Extra images were requested so that a generated frame would have one to go into. They are not
+    // free: a swapchain is a contract between the application and the presentation engine about how
+    // many pictures are in flight, and widening it changes when the application's own acquire
+    // returns. With the holding removed there is nothing to hold them for anyway -- an image is taken
+    // and presented inside one call or not taken at all -- and this was the last thing that still
+    // behaved differently merely because generation was switched on, in runs that generated nothing
+    // and stalled regardless.
+    //
+    // Generation is rarer for it. That is the correct trade against a game that does not run.
+    const bool bumped = false;
     VkResult res = dc->vkCreateSwapchainKHR(device, &m, pAllocator, pSwapchain);
     if (res != VK_SUCCESS && bumped) {
         Log("[mfg] %u swapchain images refused; falling back to the game's %u (generation will not run)",
@@ -1814,16 +1814,22 @@ static uint32_t MfgDynamicFactor(DeviceChain* dc, SwapchainState& sc, uint32_t c
 // that makes reusing the semaphore legal. A ring that is entirely in flight means presents are
 // outstanding faster than the display retires them, and the answer to that is to generate nothing
 // this frame rather than to reuse something still in use.
+// Claimed on the way out, not at the end of the caller's loop.
+//
+// It used to be marked in flight only once the whole batch had been recorded, so two frames in the
+// same batch were handed the same pair: two presents waiting on one semaphore that is signalled once.
+// The second waits for a signal that never comes, and the same semaphore appears twice in one
+// submit's signal list, which is the VUID-00067 validation caught. Two generated frames per real one
+// was all it took, and that is the count the climb reaches first.
 static uint32_t TakePresentPair(DeviceChain* dc, SwapchainState& sc) {
     for (uint32_t i = 0; i < sc.fg.ring.size(); ++i) {
         auto& pp = sc.fg.ring[i];
         if (!pp.sem) continue;
-        if (!pp.inFlight) return i;
+        if (!pp.inFlight) { pp.inFlight = true; return i; }
 
         if (dc->presentFence && pp.fence) {
             if (dc->vkGetFenceStatus(dc->self, pp.fence) != VK_SUCCESS) continue;
             dc->vkResetFences(dc->self, 1, &pp.fence);
-            pp.inFlight = false;
             return i;
         }
 
@@ -1840,7 +1846,6 @@ static uint32_t TakePresentPair(DeviceChain* dc, SwapchainState& sc) {
         // wider than it needs to be and generation simply stops when nothing is old enough.
         const uint64_t margin = uint64_t(sc.images.size()) * 2 + 2;
         if (sc.fg.presentSerial < pp.serial + margin) continue;
-        pp.inFlight = false;
         return i;
     }
     return UINT32_MAX;
@@ -1969,6 +1974,52 @@ static void MfgAcquireAhead(DeviceChain* dc, SwapchainState& sc, VkSwapchainKHR 
 // and a global displacement is exactly the part of frame generation a translation can express. So the
 // warp is a blit with its source rectangle offset: linear filtering resamples, and there is no
 // shader, no history and nothing to get out of step.
+// Give back images that were acquired and will not be presented.
+//
+// An acquired image is released by presenting it and by nothing else, so every path that acquires and
+// then gives up leaks one -- and a swapchain leaks its way to a stall one image at a time. There were
+// four such paths in the recording loop below: a degenerate blit rectangle, an index out of range, a
+// command buffer that would not end, and a submit that failed. Each of them returned without
+// presenting, and the client was left one image poorer for good.
+//
+// vkReleaseSwapchainImagesEXT is the only thing that undoes an acquire. It requires the acquire's
+// semaphore to have been waited on first, so an empty batch does that before the release. Without the
+// extension there is nothing that can undo it, and the honest response is to stop generating on this
+// swapchain rather than to keep leaking.
+static void MfgReleaseAcquired(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
+                               VkSwapchainKHR swapchain, const uint32_t* slots,
+                               const uint32_t* indices, uint32_t count) {
+    if (!count) return;
+    if (!dc->vkReleaseSwapchainImagesEXT || !dc->presentFence) {
+        if (!sc.fg.unavailable) {
+            sc.fg.unavailable = true;
+            Log("[mfg] %u image(s) acquired and unusable, and nothing here can give them back; "
+                "generation stops on this swapchain", count);
+        }
+        return;
+    }
+    VkSemaphore sems[SwapchainState::FrameGen::kSlots] = {};
+    VkPipelineStageFlags stages[SwapchainState::FrameGen::kSlots] = {};
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count && i < SwapchainState::FrameGen::kSlots; ++i) {
+        sems[n] = sc.fg.acquired[slots[i]];
+        stages[n] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        ++n;
+    }
+    if (n) {
+        VkSubmitInfo drain{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        drain.waitSemaphoreCount = n;
+        drain.pWaitSemaphores = sems;
+        drain.pWaitDstStageMask = stages;
+        if (dc->vkQueueSubmit(queue, 1, &drain, VK_NULL_HANDLE) != VK_SUCCESS) return;
+    }
+    VkReleaseSwapchainImagesInfoEXT info{ VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_EXT };
+    info.swapchain = swapchain;
+    info.imageIndexCount = count;
+    info.pImageIndices = indices;
+    NoteVk(dc, dc->vkReleaseSwapchainImagesEXT(dc->self, &info), "vkReleaseSwapchainImagesEXT");
+}
+
 struct MfgPending {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     uint32_t count = 0;
@@ -2034,11 +2085,29 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     // made with a zero timeout, since by then an image is held and waiting would be the deadlock
     // again.
     const uint32_t n = sc.fg.wantFrames;
+    // Every image acquired in this loop that does not end up presented, so it can be given back.
+    uint32_t strandedSlot[SwapchainState::FrameGen::kSlots] = {};
+    uint32_t strandedIndex[SwapchainState::FrameGen::kSlots] = {};
+    uint32_t stranded = 0;
     for (uint32_t k = 0; k < n; ++k) {
         const uint32_t slot = k < SwapchainState::FrameGen::kSlots ? k : 0;
         if (sc.fg.state[slot] != SwapchainState::FrameGen::kFree) { ++sc.fg.missed; continue; }
         const uint32_t pair = TakePresentPair(dc, sc);
         if (pair == UINT32_MAX) { ++sc.fg.missed; continue; }
+
+        // The rectangle is decided before an image is taken. It depends only on the displacement and
+        // the frame size, both known here, and a degenerate one used to be discovered after the
+        // acquire -- at which point the image was already gone and nothing gave it back.
+        const float tPre = float(k + 1) / float(n + 1);
+        int32_t px0 = int32_t(-dx * tPre), py0 = int32_t(-dy * tPre);
+        int32_t px1 = w + px0, py1 = h + py0;
+        if (px0 < 0) { px1 -= px0; px0 = 0; }
+        if (py0 < 0) { py1 -= py0; py0 = 0; }
+        if (px1 > w) { px0 -= (px1 - w); px1 = w; }
+        if (py1 > h) { py0 -= (py1 - h); py1 = h; }
+        if (px0 < 0) px0 = 0;
+        if (py0 < 0) py0 = 0;
+        if (px1 <= px0 || py1 <= py0) { ++sc.fg.missed; continue; }
 
         const uint64_t waitNs = (k == 0) ? uint64_t(sc.fg.waitUs) * 1000ull : 0ull;
         uint32_t index = 0;
@@ -2051,34 +2120,25 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
             ++sc.fg.windowMissed;
             break;
         }
-        if (index >= sc.images.size() || sc.images[index] == presented) { ++sc.fg.missed; break; }
+        if (index >= sc.images.size() || sc.images[index] == presented) {
+            ++sc.fg.missed;
+            if (index < sc.images.size()) {
+                strandedSlot[stranded] = slot;
+                strandedIndex[stranded] = index;
+                ++stranded;
+            }
+            break;
+        }
         sc.fg.index[slot] = index;
-
-        // Evenly spaced through the gap: with one generated frame that is halfway, with two it is a
-        // third and two thirds.
-        const float t = float(k + 1) / float(n + 1);
 
         VkImage dst = sc.images[index];
         barrier(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
         // Shifting the source rectangle by -d*t moves the picture by +d*t, and the blit's linear
-        // filter resamples the fractional part.
-        //
-        // Clamped to the image rather than allowed off the edge, because a source rectangle outside
-        // the image is not merely empty, it is invalid. Clamping trades an exact translation for a
-        // slight stretch of a few pixels at the trailing edge, which at ordinary camera speeds is a
-        // fraction of a percent and cannot be seen; the alternative is refusing to generate whenever
-        // the camera moves quickly, which is when generation is worth having.
-        int32_t x0 = int32_t(-dx * t), y0 = int32_t(-dy * t);
-        int32_t x1 = w + x0, y1 = h + y0;
-        if (x0 < 0) { x1 -= x0; x0 = 0; }
-        if (y0 < 0) { y1 -= y0; y0 = 0; }
-        if (x1 > w) { x0 -= (x1 - w); x1 = w; }
-        if (y1 > h) { y0 -= (y1 - h); y1 = h; }
-        if (x0 < 0) x0 = 0;
-        if (y0 < 0) y0 = 0;
-        if (x1 <= x0 || y1 <= y0) { ++sc.fg.missed; continue; }
+        // filter resamples the fractional part. Clamped to the image, because a source rectangle
+        // outside it is not merely empty, it is invalid.
+        const int32_t x0 = px0, y0 = py0, x1 = px1, y1 = py1;
 
         VkImageBlit blit{};
         blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -2106,7 +2166,17 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     // Ended exactly once, whatever happens next. The first version of this ended it again when
     // nothing had been recorded, which is invalid use of a command buffer that had already ended.
     const bool ended = dc->vkEndCommandBuffer(cb) == VK_SUCCESS;
-    if (!ended || made == 0) return 0;
+    if (!ended || made == 0) {
+        for (uint32_t k = 0; k < made; ++k) {
+            strandedSlot[stranded] = out->slot[k];
+            strandedIndex[stranded] = out->index[k];
+            ++stranded;
+        }
+        MfgReleaseAcquired(dc, sc, queue, swapchain, strandedSlot, strandedIndex, stranded);
+        return 0;
+    }
+    MfgReleaseAcquired(dc, sc, queue, swapchain, strandedSlot, strandedIndex, stranded);
+    stranded = 0;
 
     // Signalled: one semaphore per generated image for its own present, and the presented image's own
     // semaphore for the real present, which is what stops the engine reading a frame this submit is
@@ -2130,7 +2200,14 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     si.signalSemaphoreCount = signalCount;
     si.pSignalSemaphores = signalSems;
     if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fg.fence[lead]), "vkQueueSubmit (mfg)")) {
+        // Nothing was signalled, so these cannot be presented -- they have to be handed back.
         sc.fg.missed += made;
+        for (uint32_t k = 0; k < made; ++k) {
+            strandedSlot[stranded] = out->slot[k];
+            strandedIndex[stranded] = out->index[k];
+            ++stranded;
+        }
+        MfgReleaseAcquired(dc, sc, queue, swapchain, strandedSlot, strandedIndex, stranded);
         return 0;
     }
 
@@ -2151,12 +2228,10 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     if (realPair != UINT32_MAX) {
         out->realWait = sc.fg.ring[realPair].sem;
         out->realFence = sc.fg.ring[realPair].fence;
-        sc.fg.ring[realPair].inFlight = true;
         sc.fg.ring[realPair].serial = ++sc.fg.presentSerial;
     }
     for (uint32_t k = 0; k < made; ++k) {
         out->fence[k] = sc.fg.ring[out->ring[k]].fence;
-        sc.fg.ring[out->ring[k]].inFlight = true;
         sc.fg.ring[out->ring[k]].serial = ++sc.fg.presentSerial;
     }
     return made;
