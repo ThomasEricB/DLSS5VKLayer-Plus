@@ -77,8 +77,6 @@ const Setting kSettings[] = {
       "0 only under a paced present mode (fifo), 1 under any" },
     { "mfgauto", &ShmHeader::mfgAuto, false,
       "find how many frames fit by measuring, using mfgfactor as the ceiling, 0 or 1" },
-    { "mfgwait", &ShmHeader::mfgAcquireWaitUs, false,
-      "microseconds the present may wait for a free image, 0 = never wait (see the header note)" },
     { "mvec", &ShmHeader::mvecEnabled, false, "estimate motion vectors from the frames, 0 or 1" },
     { "mvecquality", &ShmHeader::mvecQuality, false, "0 fast, 1 balanced, 2 quality" },
     { "mvecunits", &ShmHeader::mvecScaleMode, false, "0 normalised, 1 pixels, 2 uv 0..1" },
@@ -208,11 +206,12 @@ void PrintStatus(const ShmHeader* h) {
                                            "unavailable on this swapchain",
                                            "waiting: needs pipeline=1" };
         const unsigned st = h->mfgState.load();
-        std::printf("mfg_state=%s\nmfg_per_frame=%u%s\nmfg_generated=%llu\nmfg_missed=%llu\n"
-                    "mfg_motion=%.2f,%.2f\n",
+        std::printf("mfg_state=%s\nmfg_per_frame=%u%s\nmfg_wait_us=%u\nmfg_generated=%llu\n"
+                    "mfg_missed=%llu\nmfg_motion=%.2f,%.2f\n",
                     kMfgState[st < 5 ? st : 0],
                     h->mfgAuto.load() ? h->mfgActiveFactor.load() : h->mfgFactor.load(),
-                    h->mfgAuto.load() ? " (measured)" : " (fixed)", gen, missed,
+                    h->mfgAuto.load() ? " (measured)" : " (fixed)", h->mfgAcquireWaitUs.load(),
+                    gen, missed,
                     BitsToFloat(h->mfgMotionXBits.load()), BitsToFloat(h->mfgMotionYBits.load()));
     }
     std::printf("layer_composition_up=%u\nlayer_frames=%llu\nlayer_ms=%.2f\n",

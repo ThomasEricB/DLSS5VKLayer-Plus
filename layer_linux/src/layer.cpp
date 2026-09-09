@@ -756,6 +756,11 @@ struct SwapchainState {
         // order too.
         uint32_t queue[kSlots] = {};
         uint32_t queued = 0;
+        uint32_t wantFrames = 0;
+        // How long the first acquire of a batch may wait, in microseconds. Not a setting and never
+        // was a good one: the right value is a property of what the display is doing, which nobody
+        // can know in advance and the layer can measure. See MfgDynamicFactor.
+        uint32_t waitUs = 0;
 
         bool ready = false;
         bool unavailable = false;
@@ -1755,16 +1760,38 @@ static uint32_t MfgDynamicFactor(DeviceChain* dc, SwapchainState& sc, uint32_t c
         // game's slots rather than filling gaps. Eight per cent is wider than the run-to-run spread
         // measured with generation off (2846 against 2858 frames, well under one per cent) and far
         // narrower than displacement, which halves it.
+        // The wait moves before the count does, in both directions.
+        //
+        // Waiting for an image is the thing that can hurt, so it is the first thing given up and the
+        // last thing taken. Its ceiling is a quarter of the frame the application is actually
+        // achieving -- not a number anyone chose, but the only budget that exists: spend more than
+        // that inside a present and the frame rate is being paid out of, not filled in.
+        const uint32_t budgetUs = rate > 1.0 ? uint32_t((1000000.0 / rate) * 0.25) : 0u;
         if (sc.fg.baseRate > 0.0 && rate < sc.fg.baseRate * 0.92) {
-            sc.fg.active = sc.fg.active > 1 ? sc.fg.active - 1 : 0;
-            if (sc.fg.active == 0) sc.fg.coolWindows = 30;
-            Log("[mfg] real frame rate fell to %.0f from %.0f: generating %u per frame%s", rate,
-                sc.fg.baseRate, sc.fg.active,
-                sc.fg.active == 0 ? "; not trying again for a while" : "");
+            if (sc.fg.waitUs > 0) {
+                sc.fg.waitUs /= 2;
+                Log("[mfg] real frame rate fell to %.0f from %.0f: waiting %u us for an image", rate,
+                    sc.fg.baseRate, sc.fg.waitUs);
+            } else {
+                sc.fg.active = sc.fg.active > 1 ? sc.fg.active - 1 : 0;
+                if (sc.fg.active == 0) sc.fg.coolWindows = 30;
+                Log("[mfg] real frame rate fell to %.0f from %.0f: generating %u per frame%s", rate,
+                    sc.fg.baseRate, sc.fg.active,
+                    sc.fg.active == 0 ? "; not trying again for a while" : "");
+            }
+        } else if (sc.fg.windowMissed > sc.fg.windowFrames / 4 && sc.fg.waitUs < budgetUs) {
+            // Missing most of the time means images are not free at the moment of asking, which is
+            // what a wait is for. Raised a step at a time so the cost of each step is measured before
+            // the next is taken.
+            const uint32_t step = budgetUs / 8 ? budgetUs / 8 : 1u;
+            sc.fg.waitUs = sc.fg.waitUs + step > budgetUs ? budgetUs : sc.fg.waitUs + step;
+            Log("[mfg] %u of %u presents found nothing free: waiting %u us of a %u us budget",
+                sc.fg.windowMissed, sc.fg.windowFrames, sc.fg.waitUs, budgetUs);
         } else if (sc.fg.windowMissed == 0 && sc.fg.active < ceiling) {
             ++sc.fg.active;
             Log("[mfg] room for another: generating %u per frame at %.0f fps", sc.fg.active, rate);
         }
+        if (dc->shm.hdr) dc->shm.hdr->mfgAcquireWaitUs.store(sc.fg.waitUs, std::memory_order_relaxed);
         // Re-measure the baseline now and then, so a scene that gets cheaper or dearer is followed
         // rather than compared against a number from minutes ago.
         if (sc.fg.windowsSinceBase >= kRebaseEvery) sc.fg.active = 0;
@@ -1888,58 +1915,26 @@ static void MfgAcquireAhead(DeviceChain* dc, SwapchainState& sc, VkSwapchainKHR 
         // a second copy of the real one. Compared squared, so no square root is needed to ask it.
         else if (dx * dx + dy * dy < 1.0f) { MfgMiss("the picture is not moving"); want = false; }
     }
+    sc.fg.wantFrames = 0;
     if (want) {
         sc.fg.lastDx = dx;
         sc.fg.lastDy = dy;
         sc.fg.motionValid = true;
+        sc.fg.wantFrames = factor;
     }
 
-    if (!want) return;
-
-    while (sc.fg.queued < factor) {
-        uint32_t slot = SwapchainState::FrameGen::kSlots;
-        for (uint32_t i = 0; i < SwapchainState::FrameGen::kSlots; ++i)
-            if (sc.fg.state[i] == SwapchainState::FrameGen::kFree) { slot = i; break; }
-        if (slot == SwapchainState::FrameGen::kSlots) { MfgMiss("every slot still in flight"); return; }
-
-        // How long to wait for a free image, in microseconds, and why the default is not to wait.
-        //
-        // Measured on a 144 Hz display with a game already presenting at the refresh rate: at a zero
-        // timeout the acquire succeeds about once in three hundred, at 4 ms about one time in
-        // twenty-five, and at 12 ms every time -- 1387 generated frames with a single miss. An image
-        // is released when the presentation engine finishes with it, which happens at a vertical
-        // blank, so the wait is really a wait for the next blank and the numbers are just the frame
-        // interval showing through.
-        //
-        // The wait is paid on the game's own thread inside vkQueuePresentKHR, so it is only free when
-        // the game had slack to begin with. A game already at the refresh rate has none: waiting
-        // there took its real frames from 2866 to 1475 in twenty seconds while adding 1387 generated
-        // ones, which is not frame generation, it is frame replacement. A game running well below the
-        // refresh rate has a whole frame of slack and the same wait costs it nothing.
-        //
-        // Nothing in a layer can tell those two apart reliably, so it is a number rather than a
-        // guess, and it defaults to 0 -- no wait, no risk, and generation only when an image happens
-        // to be free at the moment of asking.
-        const uint32_t waitUs = dc->shm.hdr
-            ? dc->shm.hdr->mfgAcquireWaitUs.load(std::memory_order_relaxed) : 0u;
-        uint32_t index = 0;
-        const VkResult acq = dc->vkAcquireNextImageKHR(dc->self, swapchain, uint64_t(waitUs) * 1000ull,
-                                                       sc.fg.acquired[slot], VK_NULL_HANDLE, &index);
-        if (acq != VK_SUCCESS) {
-            // NOT_READY and TIMEOUT are the ordinary answers when the swapchain has nothing spare and
-            // are not failures. SUBOPTIMAL is left alone: a resize is under way and a generated frame
-            // is the last thing that should chase it.
-            MfgMiss(acq == VK_NOT_READY || acq == VK_TIMEOUT ? "nothing free to acquire"
-                                                             : "acquire failed");
-            ++sc.fg.missed;
-            ++sc.fg.windowMissed;
-            return;
-        }
-        if (index >= sc.images.size()) { ++sc.fg.missed; return; }
-        sc.fg.state[slot] = SwapchainState::FrameGen::kHeld;
-        sc.fg.index[slot] = index;
-        sc.fg.queue[sc.fg.queued++] = slot;
-    }
+    // No image is taken here, and that is the correction.
+    //
+    // This used to acquire "a present early" so that a zero-timeout acquire would have had a vertical
+    // blank in which to succeed. It worked, and it starved the application: an image held across
+    // frames is one the client cannot have, and a client that expects to acquire freely -- zink, and
+    // every translation layer like it -- stops dead. Measured at one image held: the test app stalled
+    // almost immediately, having generated exactly one frame and missed nothing, because the single
+    // image it took never came back.
+    //
+    // So the image is taken at the moment it is used, in MfgRecordFrames, and presented in the same
+    // call. Nothing is held between frames, and there is nothing the client can be starved of.
+    (void)factor;
 }
 
 // Record the generated frames and submit them, before the real frame is presented.
@@ -1983,9 +1978,10 @@ struct MfgPending {
     VkFence realFence = VK_NULL_HANDLE;
 };
 
-static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue queue, VkImage presented,
-                                uint32_t presentedIndex, MfgPending* out) {
-    if (!sc.fg.queued || !sc.comp || !dc->vkCmdBlitImage) return 0;
+static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
+                                VkSwapchainKHR swapchain, VkImage presented, uint32_t presentedIndex,
+                                MfgPending* out) {
+    if (!sc.fg.wantFrames || !sc.comp || !dc->vkCmdBlitImage || !dc->vkAcquireNextImageKHR) return 0;
     if (!sc.fg.motionValid) return 0;
     if (sc.fg.ring.empty()) return 0;
 
@@ -1995,7 +1991,8 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     const float dx = sc.fg.lastDx, dy = sc.fg.lastDy;
 
     // The slot whose command buffer and fence carry the whole batch.
-    const uint32_t lead = sc.fg.queue[0];
+    const uint32_t lead = 0;
+    if (sc.fg.state[lead] != SwapchainState::FrameGen::kFree) return 0;
     VkCommandBuffer cb = sc.fg.cb[lead];
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2025,13 +2022,34 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     uint32_t made = 0;
     VkSemaphore waitSems[SwapchainState::FrameGen::kSlots] = {};
     uint32_t waitCount = 0;
-    const uint32_t n = sc.fg.queued;
+    // How many to try for, and the wait each may spend.
+    //
+    // mfgwait is no longer a timeout handed to every acquire. Blocking while holding an image is what
+    // deadlocked the client -- it waits inside the client's own present for something only the client
+    // can release. Only the first acquire may wait, because at that moment this layer holds nothing:
+    // the wait then costs the frame some latency and cannot starve anyone. Every acquire after it is
+    // made with a zero timeout, since by then an image is held and waiting would be the deadlock
+    // again.
+    const uint32_t n = sc.fg.wantFrames;
     for (uint32_t k = 0; k < n; ++k) {
-        const uint32_t slot = sc.fg.queue[k];
-        const uint32_t index = sc.fg.index[slot];
-        if (index >= sc.images.size() || sc.images[index] == presented) { ++sc.fg.missed; continue; }
+        const uint32_t slot = k < SwapchainState::FrameGen::kSlots ? k : 0;
+        if (sc.fg.state[slot] != SwapchainState::FrameGen::kFree) { ++sc.fg.missed; continue; }
         const uint32_t pair = TakePresentPair(dc, sc);
         if (pair == UINT32_MAX) { ++sc.fg.missed; continue; }
+
+        const uint64_t waitNs = (k == 0) ? uint64_t(sc.fg.waitUs) * 1000ull : 0ull;
+        uint32_t index = 0;
+        const VkResult acq = dc->vkAcquireNextImageKHR(dc->self, swapchain, waitNs,
+                                                       sc.fg.acquired[slot], VK_NULL_HANDLE, &index);
+        if (acq != VK_SUCCESS) {
+            MfgMiss(acq == VK_NOT_READY || acq == VK_TIMEOUT ? "nothing free to acquire"
+                                                             : "acquire failed");
+            ++sc.fg.missed;
+            ++sc.fg.windowMissed;
+            break;
+        }
+        if (index >= sc.images.size() || sc.images[index] == presented) { ++sc.fg.missed; break; }
+        sc.fg.index[slot] = index;
 
         // Evenly spaced through the gap: with one generated frame that is halfway, with two it is a
         // third and two thirds.
@@ -2125,11 +2143,6 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
         sc.fg.state[out->slot[k]] = SwapchainState::FrameGen::kSubmitted;
         sc.fg.guardedBy[out->slot[k]] = lead;
     }
-    // Anything still held goes back on the queue and is tried again next present.
-    uint32_t keep = 0;
-    for (uint32_t i = 0; i < SwapchainState::FrameGen::kSlots; ++i)
-        if (sc.fg.state[i] == SwapchainState::FrameGen::kHeld) sc.fg.queue[keep++] = i;
-    sc.fg.queued = keep;
     sc.fg.generated += made;
     out->count = made;
     if (realPair != UINT32_MAX) {
@@ -2803,7 +2816,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             // presented.
             if (mfgFactor && singleSwapchain) {
                 fgPending.swapchain = pPresentInfo->pSwapchains[i];
-                MfgRecordFrames(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]],
+                MfgRecordFrames(dc, sc, queue, pPresentInfo->pSwapchains[i],
+                                sc.images[pPresentInfo->pImageIndices[i]],
                                 pPresentInfo->pImageIndices[i], &fgPending);
                 if (dc->shm.hdr) {
                     dc->shm.hdr->mfgGeneratedLo.store((uint32_t)(sc.fg.generated & 0xFFFFFFFFu),

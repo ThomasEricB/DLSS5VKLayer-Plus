@@ -697,7 +697,9 @@ void MainWindow::updateStatus() {
             const float dx = BitsToFloat(hdr->mfgMotionXBits.load());
             const float dy = BitsToFloat(hdr->mfgMotionYBits.load());
             if (dx != 0.0f || dy != 0.0f)
-                text += QString("<br>carrying forward by %1, %2 px")
+                text += QString("<br>waiting %1 \xc2\xb5s for a free image (found by measuring)")
+                        .arg(hdr->mfgAcquireWaitUs.load());
+            text += QString("<br>carrying forward by %1, %2 px")
                             .arg(double(dx), 0, 'f', 1).arg(double(dy), 0, 'f', 1);
         }
         mfgStatusLabel->setText(text);
@@ -832,22 +834,6 @@ QWidget* MainWindow::buildSettings() {
                        "The ceiling on the count. Each generated frame needs a swapchain image of "
                        "its own, and the images are requested when the game creates its swapchain, "
                        "so raising this takes effect at the next one rather than at once.",
-                       ShmBinder::Live);
-        binder->AddInt(f, "Wait for a free image (\xc2\xb5s)", &ShmHeader::mfgAcquireWaitUs, 0, 20000,
-                       "The one setting here with a real cost, and the reason generation is usually "
-                       "quiet at the default.\n\nA generated frame needs a swapchain image the game "
-                       "did not ask for, and an image only comes free when the display finishes with "
-                       "it at a vertical blank. Measured on a 144 Hz display: at 0 the request "
-                       "succeeds about once in three hundred, at 4000 about one time in twenty-five, "
-                       "at 12000 every time.\n\nThe wait is paid inside the game's own present call, "
-                       "so it is free only if the game had slack. A game already running at the "
-                       "refresh rate has none, and waiting there took its real frames from 2866 to "
-                       "1475 over twenty seconds while adding 1387 generated ones -- frame "
-                       "replacement rather than frame generation. A game well below the refresh rate "
-                       "has a whole frame of slack and the same wait costs it nothing.\n\n"
-                       "0 never waits, which cannot harm the game and generates only when an image "
-                       "happens to be free. Raise it if the game is comfortably below your refresh "
-                       "rate; drop it back to 0 if the frame rate falls.",
                        ShmBinder::Live);
         binder->AddBool(f, "Generate under any present mode", &ShmHeader::mfgMode,
                         "Off, generation only runs under FIFO (vsync), where the display shows "
