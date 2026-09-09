@@ -38,7 +38,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // decision are carried here. From this branch: the pipelined path's settle, ghost bound, edit split
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 20;
+static constexpr uint32_t kShmVersion = 21;
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
 // Eight bytes a pixel: the float16 proxy needs them, and the 8-bit path simply uses the first half of
@@ -677,6 +677,15 @@ struct ShmHeader {
     // -- a game already at the refresh rate loses a real frame for every generated one. 0 by default:
     // no wait and no risk, generating only when an image happens to be free at the moment of asking.
     std::atomic<uint32_t> mfgAcquireWaitUs;
+    // Of the gaps left unfilled, how many were simply because the swapchain had no spare image at
+    // that moment. It is the one reason that is not a fault: everything else in that total is the
+    // layer declining, and this is the display honestly being busy. Worth separating, because the
+    // two call for opposite responses -- one is tuning, the other is nothing anyone can do.
+    std::atomic<uint32_t> mfgNoImageLo;
+    std::atomic<uint32_t> mfgNoImageHi;
+    // The ceiling the wait has learned it must stay under, in microseconds. Distinct from the wait
+    // itself: the wait climbs toward this, and this is what a collapse in frame rate pushes down.
+    std::atomic<uint32_t> mfgWaitCeilingUs;
 
     // Whether the number of generated frames is found by measurement rather than fixed.
     //
@@ -709,7 +718,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2112, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2120, "the header layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -840,6 +849,9 @@ inline void ShmDefaultSettings(ShmHeader* h) {
     h->mfgMotionXBits.store(FloatToBits(0.0f));
     h->mfgMotionYBits.store(FloatToBits(0.0f));
     h->mfgAcquireWaitUs.store(0);
+    h->mfgNoImageLo.store(0);
+    h->mfgNoImageHi.store(0);
+    h->mfgWaitCeilingUs.store(0);
     h->mfgAuto.store(1);
     h->mfgActiveFactor.store(0);
 

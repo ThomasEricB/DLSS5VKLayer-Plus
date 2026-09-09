@@ -770,6 +770,13 @@ struct SwapchainState {
         // was a good one: the right value is a property of what the display is doing, which nobody
         // can know in advance and the layer can measure. See MfgDynamicFactor.
         uint32_t waitUs = 0;
+        // The ceiling the wait has learned. Additive increase, multiplicative decrease: the wait
+        // climbs a step a window and is halved the moment the frame rate suffers, and the ceiling
+        // remembers where that happened so the next climb stops short of it instead of walking into
+        // the same wall. Without the memory it oscillated -- Half-Life went 100 fps, then 46 as the
+        // wait reached 2 ms, then back, over and over, which is worse for pacing than never waiting.
+        uint32_t waitCeilingUs = 0;
+        uint64_t noImage = 0;   // gaps unfilled because the swapchain had nothing spare
 
         bool ready = false;
         bool unavailable = false;
@@ -1771,19 +1778,37 @@ static uint32_t MfgDynamicFactor(DeviceChain* dc, SwapchainState& sc, uint32_t c
     // The wait, always. Its ceiling is a quarter of the frame the game is actually achieving: not a
     // number anyone chose, but the only budget there is -- spend more than that inside a present and
     // the frame rate is being paid out of rather than filled in.
-    const uint32_t budgetUs = rate > 1.0 ? uint32_t((1000000.0 / rate) * 0.25) : 0u;
+    // A twentieth of the frame, not a quarter.
+    //
+    // A quarter was picked as "surely harmless" and is not: waiting happens inside the game's own
+    // present, so in a game that is not vsync-bound it comes off the frame rate close to one for one.
+    // Measured in Half-Life, a 2 ms wait against a 10 ms frame took 100 fps to 46 -- far more than
+    // the 20% the arithmetic suggests, because the wait also delays the work behind it.
+    const uint32_t hardCapUs = rate > 1.0 ? uint32_t((1000000.0 / rate) * 0.05) : 0u;
+    if (sc.fg.waitCeilingUs == 0 || sc.fg.waitCeilingUs > hardCapUs) sc.fg.waitCeilingUs = hardCapUs;
     const bool missingALot = sc.fg.windowMissed > sc.fg.windowFrames / 4;
     if (!healthy) {
+        // Multiplicative decrease, and the ceiling remembers. Halving the wait alone let it walk
+        // straight back up to the value that hurt, which is the oscillation the frame rate showed.
         if (sc.fg.waitUs > 0) {
-            sc.fg.waitUs /= 2;
-            Log("[mfg] %.0f fps against %.0f: waiting %u us for an image", rate, sc.fg.baseRate,
-                sc.fg.waitUs);
+            sc.fg.waitCeilingUs = sc.fg.waitUs / 2;
+            sc.fg.waitUs = sc.fg.waitUs / 2;
+            Log("[mfg] %.0f fps against %.0f: waiting %u us, ceiling now %u us", rate, sc.fg.baseRate,
+                sc.fg.waitUs, sc.fg.waitCeilingUs);
         }
-    } else if (missingALot && sc.fg.waitUs < budgetUs) {
-        const uint32_t step = budgetUs / 8 ? budgetUs / 8 : 1u;
-        sc.fg.waitUs = sc.fg.waitUs + step > budgetUs ? budgetUs : sc.fg.waitUs + step;
-        Log("[mfg] %u of %u presents found nothing free: waiting %u us of a %u us budget",
-            sc.fg.windowMissed, sc.fg.windowFrames, sc.fg.waitUs, budgetUs);
+    } else if (missingALot && sc.fg.waitUs < sc.fg.waitCeilingUs) {
+        // Additive increase, a sixteenth of the ceiling at a time, so the cost of each step is
+        // measured before the next is taken.
+        const uint32_t step = sc.fg.waitCeilingUs / 16 ? sc.fg.waitCeilingUs / 16 : 1u;
+        sc.fg.waitUs = sc.fg.waitUs + step > sc.fg.waitCeilingUs ? sc.fg.waitCeilingUs
+                                                                 : sc.fg.waitUs + step;
+        Log("[mfg] %u of %u presents found nothing free: waiting %u us, ceiling %u us",
+            sc.fg.windowMissed, sc.fg.windowFrames, sc.fg.waitUs, sc.fg.waitCeilingUs);
+    } else if (healthy && sc.fg.waitCeilingUs < hardCapUs) {
+        // And the ceiling relaxes slowly while nothing is hurting, so a scene that got cheaper is
+        // not judged forever by the one that did not.
+        sc.fg.waitCeilingUs += sc.fg.waitCeilingUs / 64 + 1;
+        if (sc.fg.waitCeilingUs > hardCapUs) sc.fg.waitCeilingUs = hardCapUs;
     }
 
     // The count, only when it is being measured. The wait is given up before the count is, because
@@ -1809,6 +1834,9 @@ static uint32_t MfgDynamicFactor(DeviceChain* dc, SwapchainState& sc, uint32_t c
     sc.fg.windowStartMs = now;
     h->mfgActiveFactor.store(sc.fg.active, std::memory_order_relaxed);
     h->mfgAcquireWaitUs.store(sc.fg.waitUs, std::memory_order_relaxed);
+    h->mfgWaitCeilingUs.store(sc.fg.waitCeilingUs, std::memory_order_relaxed);
+    h->mfgNoImageLo.store((uint32_t)(sc.fg.noImage & 0xFFFFFFFFu), std::memory_order_relaxed);
+    h->mfgNoImageHi.store((uint32_t)(sc.fg.noImage >> 32), std::memory_order_relaxed);
     return sc.fg.active;
 }
 
@@ -2139,6 +2167,7 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
         if (acq != VK_SUCCESS) {
             MfgMiss(acq == VK_NOT_READY || acq == VK_TIMEOUT ? "nothing free to acquire"
                                                              : "acquire failed");
+            if (acq == VK_NOT_READY || acq == VK_TIMEOUT) ++sc.fg.noImage;
             ReturnPresentPair(sc, pair);
             ++sc.fg.missed;
             ++sc.fg.windowMissed;

@@ -206,12 +206,15 @@ void PrintStatus(const ShmHeader* h) {
                                            "unavailable on this swapchain",
                                            "waiting: needs pipeline=1" };
         const unsigned st = h->mfgState.load();
-        std::printf("mfg_state=%s\nmfg_per_frame=%u%s\nmfg_wait_us=%u\nmfg_generated=%llu\n"
-                    "mfg_missed=%llu\nmfg_motion=%.2f,%.2f\n",
+        const unsigned long long noimg =
+            ((unsigned long long)h->mfgNoImageHi.load() << 32) | h->mfgNoImageLo.load();
+        std::printf("mfg_state=%s\nmfg_per_frame=%u%s\nmfg_wait_us=%u (ceiling %u)\n"
+                    "mfg_generated=%llu\nmfg_missed=%llu\nmfg_no_image=%llu\n"
+                    "mfg_motion=%.2f,%.2f\n",
                     kMfgState[st < 5 ? st : 0],
                     h->mfgAuto.load() ? h->mfgActiveFactor.load() : h->mfgFactor.load(),
                     h->mfgAuto.load() ? " (measured)" : " (fixed)", h->mfgAcquireWaitUs.load(),
-                    gen, missed,
+                    h->mfgWaitCeilingUs.load(), gen, missed, noimg,
                     BitsToFloat(h->mfgMotionXBits.load()), BitsToFloat(h->mfgMotionYBits.load()));
     }
     std::printf("layer_composition_up=%u\nlayer_frames=%llu\nlayer_ms=%.2f\n",

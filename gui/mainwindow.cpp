@@ -688,18 +688,25 @@ void MainWindow::updateStatus() {
         if (st != 0) {
             const bool measured = hdr->mfgAuto.load() != 0;
             const unsigned per = measured ? hdr->mfgActiveFactor.load() : hdr->mfgFactor.load();
+            const unsigned long long noimg =
+                ((unsigned long long)hdr->mfgNoImageHi.load() << 32) | hdr->mfgNoImageLo.load();
             text += QString(" &mdash; %1 per frame (%2), %3 generated, %4 gaps left unfilled")
                         .arg(per).arg(measured ? "measured" : "fixed").arg(gen).arg(missed);
+            // The one reason among those that is nobody's fault, separated from the rest. Everything
+            // else in that total is the layer declining for a reason it could act on; this is the
+            // swapchain honestly having no spare image, which no amount of tuning changes.
+            text += QString("<br>of those, %1 found no free image in the swapchain").arg(noimg);
+            text += QString("<br>waiting %1 \xc2\xb5s for one, ceiling %2 \xc2\xb5s "
+                            "(both found by measuring)")
+                        .arg(hdr->mfgAcquireWaitUs.load()).arg(hdr->mfgWaitCeilingUs.load());
             if (gen == 0 && missed > 32)
-                text += "<br><span style=\"color:#ef6c00;\">No image was ever free at the moment of "
-                        "asking. Raise the wait above, or the game may already be at your refresh "
-                        "rate, in which case there is no gap to fill.</span>";
+                text += "<br><span style=\"color:#ef6c00;\">Nothing is being generated. If the game "
+                        "is already at your refresh rate there is no gap to fill, which is the "
+                        "expected answer rather than a fault.</span>";
             const float dx = BitsToFloat(hdr->mfgMotionXBits.load());
             const float dy = BitsToFloat(hdr->mfgMotionYBits.load());
             if (dx != 0.0f || dy != 0.0f)
-                text += QString("<br>waiting %1 \xc2\xb5s for a free image (found by measuring)")
-                        .arg(hdr->mfgAcquireWaitUs.load());
-            text += QString("<br>carrying forward by %1, %2 px")
+                text += QString("<br>carrying forward by %1, %2 px")
                             .arg(double(dx), 0, 'f', 1).arg(double(dy), 0, 'f', 1);
         }
         mfgStatusLabel->setText(text);
