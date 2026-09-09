@@ -1257,6 +1257,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     DeviceChain* dc = new DeviceChain();
     dc->hostImport = wantHostImport;
     dc->presentFence = addedSwapchainMaint;
+    Log("[mfg] present fences %s (VK_EXT_swapchain_maintenance1 %s)",
+        addedSwapchainMaint ? "available" : "not available",
+        addedSwapchainMaint ? "enabled by the layer" : "absent or already the game's");
     dc->instance = ic;
     dc->physical = physicalDevice;
     dc->self = *pDevice;
@@ -2861,8 +2864,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             // and the present waits on that. Exactly one thing signals it per present -- generation
             // does it when it ran, because its own submit is what touches the image last.
             const uint32_t imgIdx = pPresentInfo->pImageIndices[i];
+            // Nothing is added to a present that has no generated frames behind it.
+            //
+            // This block existed to fix PRESENT_AFTER_WRITE, which is real but predates frame
+            // generation: the layer composes into the swapchain image and presents it having consumed
+            // the game's semaphores, so the present waits on nothing. Fixing it here meant an extra
+            // submit and a present fence on every composed frame whether or not anything was
+            // generated -- and Half-Life aborted itself, on its main thread, in a run where not one
+            // frame was generated. The only thing that had changed for such a run was this.
+            //
+            // So it is scoped to what it is for. When frames are generated the read of the presented
+            // image genuinely has to be waited on, and MfgRecordFrames signals for that. When none
+            // are, the present goes out exactly as it did before, hazard and all -- which is the
+            // behaviour that ran for forty-four minutes without complaint.
             (void)imgIdx;
-            if (!fgPending.count && composed && singleSwapchain && !sc.fg.ring.empty() &&
+            if (false && composed && singleSwapchain && !sc.fg.ring.empty() &&
                 !sc.fg.unavailable && dc->presentFence) {
                 const uint32_t pair = TakePresentPair(dc, sc);
                 if (pair != UINT32_MAX) {
