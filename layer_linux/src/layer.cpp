@@ -1541,19 +1541,39 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(VkDevice device,
         if (dc->vkDeviceWaitIdle) dc->vkDeviceWaitIdle(device);
         lk.lock();
         SwapchainState& sc = it->second;
+
+        // The swapchain goes first, and the order is load-bearing.
+        //
+        // Frame generation leaves two kinds of operation outstanding that vkDeviceWaitIdle does not
+        // cover, because neither is queue work: a present waiting on this swapchain's semaphore, and
+        // an acquire that has signalled one for an image still held. Destroying those semaphores
+        // while the presentation engine still refers to them is what it sounds like. It never showed
+        // up on vkcube because vkcube keeps one swapchain for its whole life; Half-Life builds three
+        // during startup and throws two away, and crashed there.
+        //
+        // vkDestroySwapchainKHR is what actually retires those references. After it returns, nothing
+        // of the presentation engine's can be pointing at anything below.
+        std::vector<VkSemaphore> retiredSemaphores;
+        for (VkSemaphore sem : sc.fg.acquired)
+            if (sem) retiredSemaphores.push_back(sem);
+        for (VkSemaphore sem : sc.fg.donePerImage)
+            if (sem) retiredSemaphores.push_back(sem);
+        sc.fg.donePerImage.clear();
+
+        if (dc->vkDestroySwapchainKHR) dc->vkDestroySwapchainKHR(device, swapchain, pAllocator);
+
         sc.comp.reset();
         for (VkFence f : sc.fence)
             if (f) dc->vkDestroyFence(device, f, nullptr);
         for (VkFence f : sc.fg.fence)
             if (f) dc->vkDestroyFence(device, f, nullptr);
-        for (VkSemaphore sem : sc.fg.acquired)
-            if (sem) dc->vkDestroySemaphore(device, sem, nullptr);
-        for (VkSemaphore sem : sc.fg.donePerImage)
-            if (sem) dc->vkDestroySemaphore(device, sem, nullptr);
+        for (VkSemaphore sem : retiredSemaphores) dc->vkDestroySemaphore(device, sem, nullptr);
         if (sc.fenceLeg1) dc->vkDestroyFence(device, sc.fenceLeg1, nullptr);
         if (sc.fenceLeg2) dc->vkDestroyFence(device, sc.fenceLeg2, nullptr);
         if (sc.pool) dc->vkDestroyCommandPool(device, sc.pool, nullptr);
         dc->swapchains.erase(it);
+        lk.unlock();
+        return;
     }
     lk.unlock();
     if (dc->vkDestroySwapchainKHR) dc->vkDestroySwapchainKHR(device, swapchain, pAllocator);
@@ -1960,10 +1980,10 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     barrier(presented, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT);
 
-    if (dc->vkEndCommandBuffer(cb) != VK_SUCCESS || made == 0) {
-        if (made == 0) dc->vkEndCommandBuffer(cb);
-        return 0;
-    }
+    // Ended exactly once, whatever happens next. The first version of this ended it again when
+    // nothing had been recorded, which is invalid use of a command buffer that had already ended.
+    const bool ended = dc->vkEndCommandBuffer(cb) == VK_SUCCESS;
+    if (!ended || made == 0) return 0;
 
     // Signalled: one semaphore per generated image for its own present, and the presented image's own
     // semaphore for the real present, which is what stops the engine reading a frame this submit is
@@ -2681,6 +2701,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             if (gap > 0.0) dc->pace.Add(gap, now - tHookStart, dc->fenceWaitMs);
             if (TimeEnabled() && dc->pace.n && dc->pace.n % (TimeInterval() * 4) == 0) dc->pace.Report();
 
+            // Give the present something to wait on, so the display cannot read a frame the layer
+            // is still writing.
+            //
+            // This layer composes into the swapchain image and then presents it having consumed the
+            // game's own semaphores, so the present goes out with nothing to wait on at all and the
+            // ordering rests on queue submission order -- which orders commands against each other
+            // and says nothing about the presentation engine. Synchronisation validation calls it
+            // PRESENT_AFTER_WRITE, and it is the one hazard that was already there before frame
+            // generation existed.
+            //
+            // An empty batch is enough: a semaphore signal is ordered after everything already
+            // submitted to the queue, so signalling one here signals it after the composition's work,
+            // and the present waits on that. Exactly one thing signals it per present -- generation
+            // does it when it ran, because its own submit is what touches the image last.
+            const uint32_t imgIdx = pPresentInfo->pImageIndices[i];
+            if (!fgPending.count && composed && imgIdx < sc.fg.donePerImage.size() &&
+                sc.fg.donePerImage[imgIdx]) {
+                VkSubmitInfo ssi{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                ssi.signalSemaphoreCount = 1;
+                ssi.pSignalSemaphores = &sc.fg.donePerImage[imgIdx];
+                if (dc->vkQueueSubmit(queue, 1, &ssi, VK_NULL_HANDLE) == VK_SUCCESS) {
+                    fgPending.realWait = sc.fg.donePerImage[imgIdx];
+                }
+            }
+
             if (!composed) ++dc->framesPassedThrough;
             if (VerboseEnabled()) {
                 Log("[present] swapchain=%p image=%u seq=%u composed=%d",
@@ -2712,12 +2757,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             pi.waitSemaphoreCount = 0;
             pi.pWaitSemaphores = nullptr;
         }
-        if (fgPending.count && fgPending.realWait) {
+        if (fgPending.realWait) {
             pi.waitSemaphoreCount = 1;
             pi.pWaitSemaphores = &fgPending.realWait;
         }
-        res = (waitsConsumed || fgPending.count) ? dc->vkQueuePresentKHR(queue, &pi)
-                                                 : dc->vkQueuePresentKHR(queue, pPresentInfo);
+        res = (waitsConsumed || fgPending.realWait) ? dc->vkQueuePresentKHR(queue, &pi)
+                                                    : dc->vkQueuePresentKHR(queue, pPresentInfo);
     }
 
     // And the generated frames follow it into the gap, in the order they were recorded. Only after a
