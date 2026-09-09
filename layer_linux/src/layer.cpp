@@ -2717,7 +2717,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             // does it when it ran, because its own submit is what touches the image last.
             const uint32_t imgIdx = pPresentInfo->pImageIndices[i];
             if (!fgPending.count && composed && imgIdx < sc.fg.donePerImage.size() &&
-                sc.fg.donePerImage[imgIdx]) {
+                sc.fg.donePerImage[imgIdx] && !sc.fg.unavailable) {
+                fgPending.swapchain = pPresentInfo->pSwapchains[i];
                 VkSubmitInfo ssi{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
                 ssi.signalSemaphoreCount = 1;
                 ssi.pSignalSemaphores = &sc.fg.donePerImage[imgIdx];
@@ -2765,9 +2766,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                                                     : dc->vkQueuePresentKHR(queue, pPresentInfo);
     }
 
-    // And the generated frames follow it into the gap, in the order they were recorded. Only after a
-    // successful real present: if the swapchain is out of date there is no gap to fill.
-    if (fgPending.count && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
+    // And the generated frames follow it into the gap, in the order they were recorded.
+    //
+    // Every semaphore signalled above has to be waited on exactly once, and a present is the only
+    // thing that waits on these. A present that fails leaves its semaphore signalled with nothing to
+    // consume it, and from then on every wait is answered by the previous frame's signal -- each
+    // present handed a semaphore that was already consumed, which is the same undefined territory as
+    // reusing one that is still pending.
+    //
+    // A failing present is not a rare case here either. It is what a resize produces, and the game
+    // that keeps crashing resizes twice during startup while vkcube, which never does, has never
+    // reproduced any of this.
+    //
+    // There is no way to put the signals back, and draining them by submitting a wait would hang if
+    // the failed present did consume them -- the specification leaves that unsaid. So generation
+    // stops on this swapchain instead. That costs nothing: a present failing with OUT_OF_DATE means
+    // the swapchain is about to be replaced, and the replacement starts with fresh semaphores.
+    bool presentFailed = (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR);
+    if (fgPending.count && !presentFailed) {
         for (uint32_t k = 0; k < fgPending.count; ++k) {
             VkPresentInfoKHR gp{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
             gp.waitSemaphoreCount = 1;
@@ -2778,8 +2794,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             const VkResult pr = dc->vkQueuePresentKHR(queue, &gp);
             if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) {
                 NoteVk(dc, pr, "vkQueuePresentKHR (mfg)");
+                presentFailed = true;
                 break;
             }
+        }
+    }
+    if (presentFailed && fgPending.swapchain != VK_NULL_HANDLE) {
+        std::lock_guard<std::mutex> lk(dc->lock);
+        auto it = dc->swapchains.find(fgPending.swapchain);
+        if (it != dc->swapchains.end() && !it->second.fg.unavailable) {
+            it->second.fg.unavailable = true;
+            Log("[mfg] a present failed; generation stops on this swapchain until it is rebuilt");
         }
     }
     return res;
