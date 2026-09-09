@@ -733,7 +733,15 @@ struct SwapchainState {
         };
         // Presents this layer has made on this swapchain, real and generated.
         uint64_t presentSerial = 0;
-        static constexpr uint32_t kRing = 8;
+        // Wide enough that presents in flight are never the limit.
+        //
+        // Eight was a guess and the wrong one: a frame takes one pair for the real present and one
+        // for each generated frame, so at three per frame the ring turns over every two frames --
+        // far faster than a present fence signals, which happens a vertical blank or more later. The
+        // log said so plainly once it was asked, "no present pair has come back yet" a thousand times
+        // against a few hundred frames generated. A semaphore and a fence are cheap; being unable to
+        // generate is not.
+        static constexpr uint32_t kRing = 32;
         std::vector<PresentPair> ring;
 
         // A slot's life: free, then holding an image acquired ahead of time, then submitted and
@@ -1724,96 +1732,86 @@ static uint32_t MfgFactorFor(DeviceChain* dc, const SwapchainState& sc, uint32_t
 // moves the answer and a number decided once would sit there being wrong.
 static uint32_t MfgDynamicFactor(DeviceChain* dc, SwapchainState& sc, uint32_t ceiling) {
     ShmHeader* h = dc->shm.hdr;
-    if (!h || h->mfgAuto.load(std::memory_order_relaxed) == 0) {
-        sc.fg.active = ceiling;
-        return ceiling;
-    }
+    if (!h) return ceiling;
+    const bool autoCount = h->mfgAuto.load(std::memory_order_relaxed) != 0;
 
-    // Long enough to average out a hitch, short enough to follow a scene change.
+    // The window runs whether or not the count is being measured.
+    //
+    // It used to return early when the count was pinned, and the wait is measured in here -- so
+    // pinning the count silently switched off the only thing that finds a wait, the wait stayed at
+    // zero, and almost every gap went unfilled. Two settings that look independent were not: 64
+    // frames generated against 4419 missed, with "waiting 0 us" underneath a count the user had
+    // deliberately fixed at three.
     static constexpr uint32_t kWindow = 120;
-    static constexpr uint32_t kRebaseEvery = 12;
 
     const double now = NowMs();
-    if (sc.fg.windowStartMs == 0.0) {
-        sc.fg.windowStartMs = now;
-        sc.fg.active = 0;  // the first window measures the game on its own
-    }
+    if (sc.fg.windowStartMs == 0.0) sc.fg.windowStartMs = now;
     ++sc.fg.windowFrames;
-    if (sc.fg.windowFrames < kWindow) return sc.fg.active > ceiling ? ceiling : sc.fg.active;
+    if (sc.fg.windowFrames < kWindow) {
+        const uint32_t use = autoCount ? sc.fg.active : ceiling;
+        return use > ceiling ? ceiling : use;
+    }
 
     const double elapsed = now - sc.fg.windowStartMs;
     const double rate = elapsed > 0.0 ? double(sc.fg.windowFrames) * 1000.0 / elapsed : 0.0;
 
-    if (sc.fg.active == 0) {
-        // Nothing was generated this window, so this is what the game does unaided.
-        sc.fg.baseRate = sc.fg.baseRate > 0.0 ? (sc.fg.baseRate * 0.5 + rate * 0.5) : rate;
-        sc.fg.windowsSinceBase = 0;
-        // Wait before trying again after a refusal, rather than retrying every window.
-        //
-        // Without this it oscillates, and the oscillation is not free: measured on a saturated
-        // display it stepped 0, 1, 0, 1 and still generated 1693 frames over 45 seconds -- half the
-        // windows spent displacing real frames to re-learn an answer it already had. A game that has
-        // no gap now usually still has none in two seconds, so the retry is cheap to delay and
-        // expensive to repeat.
-        if (sc.fg.coolWindows > 0) --sc.fg.coolWindows;
-        else if (ceiling > 0) sc.fg.active = 1;
-    } else {
-        ++sc.fg.windowsSinceBase;
-        // A real rate materially below the baseline means the generated frames were taking the
-        // game's slots rather than filling gaps. Eight per cent is wider than the run-to-run spread
-        // measured with generation off (2846 against 2858 frames, well under one per cent) and far
-        // narrower than displacement, which halves it.
-        // The wait moves before the count does, in both directions.
-        //
-        // Waiting for an image is the thing that can hurt, so it is the first thing given up and the
-        // last thing taken. Its ceiling is a quarter of the frame the application is actually
-        // achieving -- not a number anyone chose, but the only budget that exists: spend more than
-        // that inside a present and the frame rate is being paid out of, not filled in.
-        const uint32_t budgetUs = rate > 1.0 ? uint32_t((1000000.0 / rate) * 0.25) : 0u;
-        if (sc.fg.baseRate > 0.0 && rate < sc.fg.baseRate * 0.92) {
-            if (sc.fg.waitUs > 0) {
-                sc.fg.waitUs /= 2;
-                Log("[mfg] real frame rate fell to %.0f from %.0f: waiting %u us for an image", rate,
-                    sc.fg.baseRate, sc.fg.waitUs);
-            } else {
-                sc.fg.active = sc.fg.active > 1 ? sc.fg.active - 1 : 0;
-                if (sc.fg.active == 0) sc.fg.coolWindows = 30;
-                Log("[mfg] real frame rate fell to %.0f from %.0f: generating %u per frame%s", rate,
-                    sc.fg.baseRate, sc.fg.active,
-                    sc.fg.active == 0 ? "; not trying again for a while" : "");
+    // The reference is the best rate seen lately rather than a rate measured with generation
+    // switched off.
+    //
+    // Measuring a baseline meant forcing the count to zero every so often, which stopped generation
+    // for a whole window to re-learn something it already knew, and on a game that is merely
+    // expensive it settled at zero and stayed there. The best recent rate answers the same question
+    // -- "is this costing the game anything" -- without giving up a window to ask it, and it decays
+    // slowly so a scene that gets genuinely heavier moves the reference instead of looking like a
+    // regression forever.
+    if (rate > sc.fg.baseRate) sc.fg.baseRate = rate;
+    else sc.fg.baseRate *= 0.995;
+    const bool healthy = sc.fg.baseRate <= 0.0 || rate >= sc.fg.baseRate * 0.92;
+
+    // The wait, always. Its ceiling is a quarter of the frame the game is actually achieving: not a
+    // number anyone chose, but the only budget there is -- spend more than that inside a present and
+    // the frame rate is being paid out of rather than filled in.
+    const uint32_t budgetUs = rate > 1.0 ? uint32_t((1000000.0 / rate) * 0.25) : 0u;
+    const bool missingALot = sc.fg.windowMissed > sc.fg.windowFrames / 4;
+    if (!healthy) {
+        if (sc.fg.waitUs > 0) {
+            sc.fg.waitUs /= 2;
+            Log("[mfg] %.0f fps against %.0f: waiting %u us for an image", rate, sc.fg.baseRate,
+                sc.fg.waitUs);
+        }
+    } else if (missingALot && sc.fg.waitUs < budgetUs) {
+        const uint32_t step = budgetUs / 8 ? budgetUs / 8 : 1u;
+        sc.fg.waitUs = sc.fg.waitUs + step > budgetUs ? budgetUs : sc.fg.waitUs + step;
+        Log("[mfg] %u of %u presents found nothing free: waiting %u us of a %u us budget",
+            sc.fg.windowMissed, sc.fg.windowFrames, sc.fg.waitUs, budgetUs);
+    }
+
+    // The count, only when it is being measured. The wait is given up before the count is, because
+    // waiting is the part that can cost the game anything.
+    if (autoCount) {
+        if (!healthy && sc.fg.waitUs == 0) {
+            if (sc.fg.active > 0) {
+                --sc.fg.active;
+                Log("[mfg] %.0f fps against %.0f: generating %u per frame", rate, sc.fg.baseRate,
+                    sc.fg.active);
             }
-        } else if (sc.fg.windowMissed > sc.fg.windowFrames / 4 && sc.fg.waitUs < budgetUs) {
-            // Missing most of the time means images are not free at the moment of asking, which is
-            // what a wait is for. Raised a step at a time so the cost of each step is measured before
-            // the next is taken.
-            const uint32_t step = budgetUs / 8 ? budgetUs / 8 : 1u;
-            sc.fg.waitUs = sc.fg.waitUs + step > budgetUs ? budgetUs : sc.fg.waitUs + step;
-            Log("[mfg] %u of %u presents found nothing free: waiting %u us of a %u us budget",
-                sc.fg.windowMissed, sc.fg.windowFrames, sc.fg.waitUs, budgetUs);
-        } else if (sc.fg.windowMissed == 0 && sc.fg.active < ceiling) {
+        } else if (healthy && !missingALot && sc.fg.active < ceiling) {
             ++sc.fg.active;
             Log("[mfg] room for another: generating %u per frame at %.0f fps", sc.fg.active, rate);
         }
-        if (dc->shm.hdr) dc->shm.hdr->mfgAcquireWaitUs.store(sc.fg.waitUs, std::memory_order_relaxed);
-        // Re-measure the baseline now and then, so a scene that gets cheaper or dearer is followed
-        // rather than compared against a number from minutes ago.
-        if (sc.fg.windowsSinceBase >= kRebaseEvery) sc.fg.active = 0;
+        if (sc.fg.active > ceiling) sc.fg.active = ceiling;
+    } else {
+        sc.fg.active = ceiling;
     }
 
-    if (sc.fg.active > ceiling) sc.fg.active = ceiling;
     sc.fg.windowFrames = 0;
     sc.fg.windowMissed = 0;
     sc.fg.windowStartMs = now;
     h->mfgActiveFactor.store(sc.fg.active, std::memory_order_relaxed);
+    h->mfgAcquireWaitUs.store(sc.fg.waitUs, std::memory_order_relaxed);
     return sc.fg.active;
 }
 
-// A present pair whose previous present has actually finished, or none.
-//
-// The fence is the whole point: it is signalled when the present completes, which is the one fact
-// that makes reusing the semaphore legal. A ring that is entirely in flight means presents are
-// outstanding faster than the display retires them, and the answer to that is to generate nothing
-// this frame rather than to reuse something still in use.
 // Claimed on the way out, not at the end of the caller's loop.
 //
 // It used to be marked in flight only once the whole batch had been recorded, so two frames in the
@@ -1849,6 +1847,17 @@ static uint32_t TakePresentPair(DeviceChain* dc, SwapchainState& sc) {
         return i;
     }
     return UINT32_MAX;
+}
+
+// A pair claimed and then not used goes straight back.
+//
+// Claiming on the way out fixed one bug and created this one: the claim happens before the acquire,
+// and every acquire that finds nothing free abandoned its pair still marked in flight, with no fence
+// ever attached to clear it. The ring drained within a few frames however wide it was -- widening it
+// from eight to thirty-two changed nothing, which is what said the pairs were being lost rather than
+// merely being slow to come back.
+static void ReturnPresentPair(SwapchainState& sc, uint32_t pair) {
+    if (pair < sc.fg.ring.size()) sc.fg.ring[pair].inFlight = false;
 }
 
 // Retire finished slots, decide whether a generated frame is wanted, and take an image for one.
@@ -2037,7 +2046,7 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
                                 MfgPending* out) {
     if (!sc.fg.wantFrames || !sc.comp || !dc->vkCmdBlitImage || !dc->vkAcquireNextImageKHR) return 0;
     if (!sc.fg.motionValid) return 0;
-    if (sc.fg.ring.empty()) return 0;
+    if (sc.fg.ring.empty()) { MfgMiss("no present ring"); return 0; }
 
     // The displacement the acquire already read and accepted. An image is only held because that
     // check passed, so there is nothing to decide here -- and re-reading would risk taking a
@@ -2046,7 +2055,11 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
 
     // The slot whose command buffer and fence carry the whole batch.
     const uint32_t lead = 0;
-    if (sc.fg.state[lead] != SwapchainState::FrameGen::kFree) return 0;
+    if (sc.fg.state[lead] != SwapchainState::FrameGen::kFree) {
+        MfgMiss("the batch before this one has not finished");
+        ++sc.fg.windowMissed;
+        return 0;
+    }
     VkCommandBuffer cb = sc.fg.cb[lead];
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2091,11 +2104,13 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     uint32_t stranded = 0;
     for (uint32_t k = 0; k < n; ++k) {
         const uint32_t slot = k < SwapchainState::FrameGen::kSlots ? k : 0;
-        if (sc.fg.state[slot] != SwapchainState::FrameGen::kFree) { ++sc.fg.missed; continue; }
-        const uint32_t pair = TakePresentPair(dc, sc);
-        if (pair == UINT32_MAX) { ++sc.fg.missed; continue; }
-
-        // The rectangle is decided before an image is taken. It depends only on the displacement and
+        if (sc.fg.state[slot] != SwapchainState::FrameGen::kFree) {
+            MfgMiss("a slot is still in flight");
+            ++sc.fg.missed;
+            ++sc.fg.windowMissed;
+            continue;
+        }
+        // The rectangle is decided before anything is claimed. It depends only on the displacement and
         // the frame size, both known here, and a degenerate one used to be discovered after the
         // acquire -- at which point the image was already gone and nothing gave it back.
         const float tPre = float(k + 1) / float(n + 1);
@@ -2107,7 +2122,15 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
         if (py1 > h) { py0 -= (py1 - h); py1 = h; }
         if (px0 < 0) px0 = 0;
         if (py0 < 0) py0 = 0;
-        if (px1 <= px0 || py1 <= py0) { ++sc.fg.missed; continue; }
+        if (px1 <= px0 || py1 <= py0) { MfgMiss("the warp would be degenerate"); ++sc.fg.missed; continue; }
+
+        const uint32_t pair = TakePresentPair(dc, sc);
+        if (pair == UINT32_MAX) {
+            MfgMiss("no present pair has come back yet");
+            ++sc.fg.missed;
+            ++sc.fg.windowMissed;
+            continue;
+        }
 
         const uint64_t waitNs = (k == 0) ? uint64_t(sc.fg.waitUs) * 1000ull : 0ull;
         uint32_t index = 0;
@@ -2116,11 +2139,13 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
         if (acq != VK_SUCCESS) {
             MfgMiss(acq == VK_NOT_READY || acq == VK_TIMEOUT ? "nothing free to acquire"
                                                              : "acquire failed");
+            ReturnPresentPair(sc, pair);
             ++sc.fg.missed;
             ++sc.fg.windowMissed;
             break;
         }
         if (index >= sc.images.size() || sc.images[index] == presented) {
+            ReturnPresentPair(sc, pair);
             ++sc.fg.missed;
             if (index < sc.images.size()) {
                 strandedSlot[stranded] = slot;
@@ -2167,6 +2192,7 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     // nothing had been recorded, which is invalid use of a command buffer that had already ended.
     const bool ended = dc->vkEndCommandBuffer(cb) == VK_SUCCESS;
     if (!ended || made == 0) {
+        for (uint32_t k = 0; k < made; ++k) ReturnPresentPair(sc, out->ring[k]);
         for (uint32_t k = 0; k < made; ++k) {
             strandedSlot[stranded] = out->slot[k];
             strandedIndex[stranded] = out->index[k];
@@ -2201,6 +2227,8 @@ static uint32_t MfgRecordFrames(DeviceChain* dc, SwapchainState& sc, VkQueue que
     si.pSignalSemaphores = signalSems;
     if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, sc.fg.fence[lead]), "vkQueueSubmit (mfg)")) {
         // Nothing was signalled, so these cannot be presented -- they have to be handed back.
+        for (uint32_t k = 0; k < made; ++k) ReturnPresentPair(sc, out->ring[k]);
+        if (realPair != UINT32_MAX) ReturnPresentPair(sc, realPair);
         sc.fg.missed += made;
         for (uint32_t k = 0; k < made; ++k) {
             strandedSlot[stranded] = out->slot[k];
