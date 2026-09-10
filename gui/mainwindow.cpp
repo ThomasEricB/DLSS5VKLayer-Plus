@@ -126,6 +126,11 @@ static const SettingEntry kSettingsTable[] = {
     {"set_compare_zoom", &ShmHeader::compareZoomBits, true},
     {"set_compare_swap", &ShmHeader::compareSwap, false},
     {"set_toggle_key", &ShmHeader::toggleKey, false},
+    {"set_pipeline", &ShmHeader::pipeline, false},
+    {"set_mfg", &ShmHeader::mfgEnabled, false},
+    {"set_mfg_auto", &ShmHeader::mfgAuto, false},
+    {"set_mfg_factor", &ShmHeader::mfgFactor, false},
+    {"set_mfg_mode", &ShmHeader::mfgMode, false},
 };
 
 static QString settingText(const SettingEntry& e, uint32_t raw) {
@@ -1026,8 +1031,11 @@ QWidget* MainWindow::buildSettings() {
                         ShmBinder::Live);
         binder->AddInt(f, "At most, per real frame", &ShmHeader::mfgFactor, 1, 3,
                        "The ceiling on the count. Each generated frame needs a swapchain image of "
-                       "its own, and the images are requested when the game creates its swapchain, "
-                       "so raising this takes effect at the next one rather than at once.",
+                       "its own, so when generation is on the layer asks for one spare image per "
+                       "frame allowed by this ceiling when the game creates its swapchain. If the "
+                       "driver refuses that many it tries one spare, then falls back to the game's "
+                       "own count, so raising this takes effect at the next swapchain rather than "
+                       "at once.",
                        ShmBinder::Live);
         binder->AddBool(f, "Generate under any present mode", &ShmHeader::mfgMode,
                         "Off, generation only runs under FIFO (vsync), where the display shows "

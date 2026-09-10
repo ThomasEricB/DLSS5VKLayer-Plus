@@ -24,7 +24,8 @@ namespace dlssnr {
     X(vkGetPhysicalDeviceQueueFamilyProperties)                                                    \
     X(vkEnumerateDeviceExtensionProperties)                                                        \
     X(vkGetPhysicalDeviceMemoryProperties2)                                                        \
-    X(vkGetPhysicalDeviceProperties2)
+    X(vkGetPhysicalDeviceProperties2)                                                              \
+    X(vkGetPhysicalDeviceFeatures2)
 
 #define DLSSNR_DEVICE_FN_LIST(X)                                                                   \
     X(vkDestroyDevice)                                                                             \
@@ -103,6 +104,12 @@ X(vkCmdBindPipeline)                                                            
 
 struct InstanceTable {
     PFN_vkGetInstanceProcAddr next_gipa = nullptr;
+
+    // Whether the 1.1-style vkGetPhysicalDevice*2 entry points may be called. The pointers can be
+    // non-null on a 1.0 instance that enabled VK_KHR_get_physical_device_properties2, but a 1.0
+    // application can still trip API-version validation, so only core 1.1+ is trusted here.
+    bool canUseGetPhysicalDeviceProperties2 = false;
+
 #define X(name) PFN_##name name = nullptr;
     DLSSNR_INSTANCE_FN_LIST(X)
 #undef X

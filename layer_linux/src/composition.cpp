@@ -409,17 +409,22 @@ bool Composition::MakeTransportBuffer(HostBuffer& buf, size_t bytes, VkBufferUsa
     // alignment; the alignment the extension demands is a physical-device property (64 KiB on
     // NVIDIA). The mappings are made at offsets that satisfy it, but the check stays: a mapping
     // that arrived misaligned falls back to staging rather than failing the allocation.
-    VkDeviceSize align = 0;
-    if (_instance->vkGetPhysicalDeviceProperties2) {
+    // The import alignment is a 1.1 property. On a 1.0 instance the mapping is already rounded to
+    // 64 KiB (ShmMapFrames), so use that rather than calling vkGetPhysicalDeviceProperties2 where
+    // validation may complain. If the driver wants more, the import fails and EnsureTransport falls
+    // back to staging.
+    VkDeviceSize align = 65536;
+    if (_instance->vkGetPhysicalDeviceProperties2 &&
+        _instance->canUseGetPhysicalDeviceProperties2) {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps{};
         hostProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
         VkPhysicalDeviceProperties2 props2{};
         props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
         props2.pNext = &hostProps;
         _instance->vkGetPhysicalDeviceProperties2(_physicalDevice, &props2);
-        align = hostProps.minImportedHostPointerAlignment;
+        if (hostProps.minImportedHostPointerAlignment)
+            align = hostProps.minImportedHostPointerAlignment;
     }
-    if (!align) align = 1;
     if (reinterpret_cast<uintptr_t>(hostPtr) % align) return false;
 
     VkMemoryHostPointerPropertiesEXT props{};

@@ -54,6 +54,7 @@ int main(int argc, char** argv) {
     float speed = 6.0f;
     float contrast = 1.0f;
     float noise = 0.0f;
+    bool fifo = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = uint32_t(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--speed") && i + 1 < argc) speed = float(atof(argv[++i]));
@@ -62,6 +63,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--load") && i + 1 < argc) load = uint32_t(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--contrast") && i + 1 < argc) contrast = float(atof(argv[++i]));
         else if (!strcmp(argv[i], "--noise") && i + 1 < argc) noise = float(atof(argv[++i]));
+        else if (!strcmp(argv[i], "--fifo")) fifo = true;
     }
 
     // ---- window -----------------------------------------------------------
@@ -163,7 +165,7 @@ int main(int argc, char** argv) {
     swci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     swci.preTransform = caps.currentTransform;
     swci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    swci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    swci.presentMode = fifo ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
     swci.clipped = VK_TRUE;
     VkSwapchainKHR swapchain{};
     CHECK(vkCreateSwapchainKHR(device, &swci, nullptr, &swapchain));

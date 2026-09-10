@@ -890,8 +890,38 @@ static VkBuffer UploadSource(VkCtx& c) {
     return c.transportIn ? c.transportIn : c.uploadStaging;
 }
 
+static void LogImageVkFailure(const char* stage, VkResult res, const char* what, VkFormat fmt,
+                              uint32_t w, uint32_t h, uint32_t usage, uint32_t ofUsage,
+                              VkDeviceSize size, uint32_t alignment, uint32_t memoryTypeBits,
+                              uint32_t memoryTypeIndex) {
+    if (ofUsage) {
+        Log("[vk] %s failed for %s: res=%d fmt=%d %ux%u usage=%#x ofUsage=%#x size=%llu align=%u memBits=%#x memType=%u",
+            stage, what, int(res), int(fmt), w, h, usage, ofUsage,
+            (unsigned long long)size, alignment, memoryTypeBits, memoryTypeIndex);
+    } else {
+        Log("[vk] %s failed for %s: res=%d fmt=%d %ux%u usage=%#x size=%llu align=%u memBits=%#x memType=%u",
+            stage, what, int(res), int(fmt), w, h, usage,
+            (unsigned long long)size, alignment, memoryTypeBits, memoryTypeIndex);
+    }
+}
+
+static void LogImageMemoryFailure(const char* what, VkFormat fmt, uint32_t w, uint32_t h,
+                                  uint32_t usage, uint32_t ofUsage, VkDeviceSize size,
+                                  uint32_t alignment, uint32_t memoryTypeBits) {
+    if (ofUsage) {
+        Log("[vk] no memory type for %s: fmt=%d %ux%u usage=%#x ofUsage=%#x size=%llu align=%u memBits=%#x",
+            what, int(fmt), w, h, usage, ofUsage,
+            (unsigned long long)size, alignment, memoryTypeBits);
+    } else {
+        Log("[vk] no memory type for %s: fmt=%d %ux%u usage=%#x size=%llu align=%u memBits=%#x",
+            what, int(fmt), w, h, usage,
+            (unsigned long long)size, alignment, memoryTypeBits);
+    }
+}
+
 static bool CreateImage2DUsage(VkCtx& c, VkFormat fmt, uint32_t w, uint32_t h,
-                               VkImageUsageFlags usage, GpuImage& out) {
+                               VkImageUsageFlags usage, GpuImage& out,
+                               const char* what = "image") {
     VkImageCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ci.imageType = VK_IMAGE_TYPE_2D;
@@ -902,33 +932,60 @@ static bool CreateImage2DUsage(VkCtx& c, VkFormat fmt, uint32_t w, uint32_t h,
     ci.usage = usage;
     ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(c.device, &ci, nullptr, &out.image) != VK_SUCCESS) return false;
+    VkResult res = vkCreateImage(c.device, &ci, nullptr, &out.image);
+    if (res != VK_SUCCESS) {
+        LogImageVkFailure("vkCreateImage", res, what, fmt, w, h, uint32_t(usage), 0,
+                          0, 0, 0, UINT32_MAX);
+        return false;
+    }
     out.format = fmt; out.width = w; out.height = h; out.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(c.device, out.image, &req);
     VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = FindMemoryType(c, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (mai.memoryTypeIndex == UINT32_MAX) return false;
-    if (vkAllocateMemory(c.device, &mai, nullptr, &out.memory) != VK_SUCCESS) return false;
-    if (vkBindImageMemory(c.device, out.image, out.memory, 0) != VK_SUCCESS) return false;
+    if (mai.memoryTypeIndex == UINT32_MAX) {
+        LogImageMemoryFailure(what, fmt, w, h, uint32_t(usage), 0, req.size, req.alignment,
+                              req.memoryTypeBits);
+        return false;
+    }
+    res = vkAllocateMemory(c.device, &mai, nullptr, &out.memory);
+    if (res != VK_SUCCESS) {
+        LogImageVkFailure("vkAllocateMemory", res, what, fmt, w, h, uint32_t(usage), 0,
+                          req.size, req.alignment, req.memoryTypeBits, mai.memoryTypeIndex);
+        return false;
+    }
+    res = vkBindImageMemory(c.device, out.image, out.memory, 0);
+    if (res != VK_SUCCESS) {
+        LogImageVkFailure("vkBindImageMemory", res, what, fmt, w, h, uint32_t(usage), 0,
+                          req.size, req.alignment, req.memoryTypeBits, mai.memoryTypeIndex);
+        return false;
+    }
     VkImageViewCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vi.image = out.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
     vi.subresourceRange = { out.aspect(), 0, 1, 0, 1 };
-    return vkCreateImageView(c.device, &vi, nullptr, &out.view) == VK_SUCCESS;
+    res = vkCreateImageView(c.device, &vi, nullptr, &out.view);
+    if (res != VK_SUCCESS) {
+        LogImageVkFailure("vkCreateImageView", res, what, fmt, w, h, uint32_t(usage), 0,
+                          req.size, req.alignment, req.memoryTypeBits, mai.memoryTypeIndex);
+        return false;
+    }
+    return true;
 }
 
-static bool CreateImage2D(VkCtx& c, VkFormat fmt, uint32_t w, uint32_t h, GpuImage& out) {
+static bool CreateImage2D(VkCtx& c, VkFormat fmt, uint32_t w, uint32_t h, GpuImage& out,
+                          const char* what = "image") {
     return CreateImage2DUsage(c, fmt, w, h,
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, out);
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, out, what);
 }
 
 static bool CreateImage2DOpticalFlow(VkCtx& c, VkFormat fmt, uint32_t w, uint32_t h,
-                                     VkOpticalFlowUsageFlagsNV ofUsage, GpuImage& out) {
+                                     VkOpticalFlowUsageFlagsNV ofUsage, GpuImage& out,
+                                     const char* what = "flow image") {
     VkOpticalFlowImageFormatInfoNV ofInfo{};
     ofInfo.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_IMAGE_FORMAT_INFO_NV;
     ofInfo.usage = ofUsage;
@@ -947,23 +1004,51 @@ static bool CreateImage2DOpticalFlow(VkCtx& c, VkFormat fmt, uint32_t w, uint32_
                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
     ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(c.device, &ci, nullptr, &out.image) != VK_SUCCESS) return false;
+    VkResult res = vkCreateImage(c.device, &ci, nullptr, &out.image);
+    if (res != VK_SUCCESS) {
+        LogImageVkFailure("vkCreateImage", res, what, fmt, w, h, uint32_t(ci.usage),
+                          uint32_t(ofUsage), 0, 0, 0, UINT32_MAX);
+        return false;
+    }
     out.format = fmt; out.width = w; out.height = h; out.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(c.device, out.image, &req);
     VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = FindMemoryType(c, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (mai.memoryTypeIndex == UINT32_MAX) return false;
-    if (vkAllocateMemory(c.device, &mai, nullptr, &out.memory) != VK_SUCCESS) return false;
-    if (vkBindImageMemory(c.device, out.image, out.memory, 0) != VK_SUCCESS) return false;
+    if (mai.memoryTypeIndex == UINT32_MAX) {
+        LogImageMemoryFailure(what, fmt, w, h, uint32_t(ci.usage), uint32_t(ofUsage), req.size,
+                              req.alignment, req.memoryTypeBits);
+        return false;
+    }
+    res = vkAllocateMemory(c.device, &mai, nullptr, &out.memory);
+    if (res != VK_SUCCESS) {
+        LogImageVkFailure("vkAllocateMemory", res, what, fmt, w, h, uint32_t(ci.usage),
+                          uint32_t(ofUsage), req.size, req.alignment, req.memoryTypeBits,
+                          mai.memoryTypeIndex);
+        return false;
+    }
+    res = vkBindImageMemory(c.device, out.image, out.memory, 0);
+    if (res != VK_SUCCESS) {
+        LogImageVkFailure("vkBindImageMemory", res, what, fmt, w, h, uint32_t(ci.usage),
+                          uint32_t(ofUsage), req.size, req.alignment, req.memoryTypeBits,
+                          mai.memoryTypeIndex);
+        return false;
+    }
     VkImageViewCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vi.image = out.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
     vi.subresourceRange = { out.aspect(), 0, 1, 0, 1 };
-    return vkCreateImageView(c.device, &vi, nullptr, &out.view) == VK_SUCCESS;
+    res = vkCreateImageView(c.device, &vi, nullptr, &out.view);
+    if (res != VK_SUCCESS) {
+        LogImageVkFailure("vkCreateImageView", res, what, fmt, w, h, uint32_t(ci.usage),
+                          uint32_t(ofUsage), req.size, req.alignment, req.memoryTypeBits,
+                          mai.memoryTypeIndex);
+        return false;
+    }
+    return true;
 }
 
 static void DestroyImage2D(VkCtx& c, GpuImage& img) {
@@ -1230,7 +1315,7 @@ struct NeuralState {
     // from a game that has one.
     OpticalFlowState flow{};
     bool firstFrame = true;
-    uint32_t mvecEnabled = 1;
+    uint32_t mvecEnabled = 0;
     uint32_t mvecScaleMode = kMVecPixels;
     uint32_t mvecQuality = kMVecBalanced;
     uint32_t appliedMvecScaleMode = 0xFFFFFFFFu;
@@ -1543,9 +1628,12 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
 
     const uint32_t ow = w / f.grid;
     const uint32_t oh = h / f.grid;
-    if (!CreateImage2DOpticalFlow(c, f.inputFormat, w, h, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, f.prev) ||
-        !CreateImage2DOpticalFlow(c, f.inputFormat, w, h, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, f.curr) ||
-        !CreateImage2DOpticalFlow(c, f.flowFormat, ow, oh, VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV, f.out)) {
+    if (!CreateImage2DOpticalFlow(c, f.inputFormat, w, h, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, f.prev,
+                                  "NVOF prev input") ||
+        !CreateImage2DOpticalFlow(c, f.inputFormat, w, h, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, f.curr,
+                                  "NVOF curr input") ||
+        !CreateImage2DOpticalFlow(c, f.flowFormat, ow, oh, VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV, f.out,
+                                  "NVOF output")) {
         Log("[mvec] NVOF image creation failed");
         DestroyOpticalFlow(c, f);
         return false;
@@ -2277,12 +2365,12 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     // it once, at the end, instead of once per pass.
     const VkFormat workFmt = ns.hdrBuilt ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R16G16B16A16_UNORM;
     ns.ngx.hdrActive = ns.hdrBuilt != 0;
-    if (!CreateImage2D(ns.vk, chainFmt, w, h, ns.colorIn) ||
-        !CreateImage2D(ns.vk, chainFmt, w, h, ns.colorOut) ||
-        !CreateImage2D(ns.vk, workFmt, w, h, ns.workA) ||
-        !CreateImage2D(ns.vk, workFmt, w, h, ns.workB) ||
-        !CreateImage2D(ns.vk, VK_FORMAT_R16G16_SFLOAT, w, h, ns.mv) ||
-        !CreateImage2D(ns.vk, VK_FORMAT_R32_SFLOAT, w, h, ns.depth)) {
+    if (!CreateImage2D(ns.vk, chainFmt, w, h, ns.colorIn, "neural colorIn") ||
+        !CreateImage2D(ns.vk, chainFmt, w, h, ns.colorOut, "neural colorOut") ||
+        !CreateImage2D(ns.vk, workFmt, w, h, ns.workA, "neural workA") ||
+        !CreateImage2D(ns.vk, workFmt, w, h, ns.workB, "neural workB") ||
+        !CreateImage2D(ns.vk, VK_FORMAT_R16G16_SFLOAT, w, h, ns.mv, "neural motion") ||
+        !CreateImage2D(ns.vk, VK_FORMAT_R32_SFLOAT, w, h, ns.depth, "neural depth")) {
         Log("[helper] image creation failed at %ux%u", w, h);
         ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
                        "could not allocate the model's surfaces");
@@ -2367,8 +2455,10 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
             // passed through. Created here rather than reused from the denoiser's chain because the
             // model writes them, and nothing else in this process owns a writable pair at this size.
             GpuImage outInterp{}, outReal{};
-            const bool madeOut = CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, outInterp) &&
-                                 CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, outReal);
+            const bool madeOut = CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, outInterp,
+                                                "mfg interp") &&
+                                     CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, outReal,
+                                                   "mfg real");
             if (!madeOut) Log("[mfg] could not create the output surfaces");
 
             if (madeOut && BeginCmd(ns.vk.cmdEval)) {
@@ -2733,6 +2823,14 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     // quality has to be answered by rebuilding the flow session rather than by writing a parameter.
     const uint32_t prevMvecEnabled = ns.mvecEnabled;
     ns.mvecEnabled = ShmMVecEnabled(shm.hdr) ? 1u : 0u;
+    static const bool forceFlow = [] {
+        const char* v = getenv("DLSSNR_MVEC_FORCE");
+        return v && v[0] == '1';
+    }();
+    if (!forceFlow && ShmPipelined(shm.hdr) && shm.hdr->mfgEnabled.load() != 0 && ns.mvecEnabled) {
+        if (prevMvecEnabled) Log("[mvec] pipeline generation needs the helper to keep up; optical flow off");
+        ns.mvecEnabled = 0;
+    }
     ns.mvecScaleMode = ShmMVecScaleMode(shm.hdr);
     ns.mvecQuality = ShmMVecQuality(shm.hdr);
     const bool mvecJustDisabled = prevMvecEnabled && !ns.mvecEnabled;
@@ -2891,8 +2989,8 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     // future frame and adds no latency of its own.
     if (MfgEnabled() && last) {
         if (!ns.fgReady && !ns.fg.disabled) {
-            if (CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.fgInterp) &&
-                CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.fgReal) &&
+            if (CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.fgInterp, "fg interp") &&
+                CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.fgReal, "fg real") &&
                 BeginCmd(ns.vk.cmdCreate)) {
                 ns.fg.snippetName = L"nvngx_dlssg.dll";
                 ns.fg.featureId = 11;
