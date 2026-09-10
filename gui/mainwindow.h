@@ -3,6 +3,10 @@
 #include <QString>
 #include <QVector>
 #include <QPair>
+#include <QStyledItemDelegate>
+#include <QModelIndex>
+#include <QPainter>
+#include <QStyleOptionViewItem>
 #include "../common/shm_protocol.h"
 
 class QProcess;
@@ -20,6 +24,15 @@ class QFormLayout;
 class QAction;
 class ShmBinder;
 
+class ProfileDelegate : public QStyledItemDelegate {
+public:
+    explicit ProfileDelegate(QObject* parent = nullptr) : QStyledItemDelegate(parent) {}
+    void paint(QPainter* painter, const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override;
+private:
+    QRect buttonRect(const QStyleOptionViewItem& option) const;
+};
+
 class MainWindow : public QWidget {
     Q_OBJECT
 public:
@@ -28,6 +41,7 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* event) override;
+    bool eventFilter(QObject* obj, QEvent* event) override;
 
 private slots:
     void startHelper();
@@ -40,6 +54,7 @@ private:
     QString findProjectDir() const;
     QString findHelperCli() const;
     QString configPath() const;
+    QString profilesDir() const;
     QString dataDir() const;
     QString defaultBinariesDir() const;
     QString effectiveBinariesDir() const;
@@ -54,6 +69,11 @@ private:
     void restoreSettings();
     void saveSettingsIfChanged();
     void resetAllSettings();
+    void applyDefaults();
+    void saveSettingsToFile();
+    void loadSettingsFromFile(const QString& path);
+    void refreshProfileList();
+    void updateReloadBtn();
     QString settingsBlob() const;
     void populateRunners();
     void applyRunnerSelection(int index);
@@ -81,6 +101,8 @@ private:
 
     QPushButton* startBtn = nullptr;
     QPushButton* stopBtn = nullptr;
+    QComboBox* profileCombo = nullptr;
+    QPushButton* profileSaveBtn = nullptr;
     QPushButton* passBtn = nullptr;
     QPushButton* captureBtn = nullptr;
     QPushButton* browseRunnerBtn = nullptr;
@@ -101,4 +123,8 @@ private:
 
     ShmBinder* binder = nullptr;
     QString lastSettingsBlob;
+    QString lastProfilePath;
+    QString profileBlob;
+    QString defaultsBlob;
+    QToolButton* profileReloadBtn = nullptr;
 };

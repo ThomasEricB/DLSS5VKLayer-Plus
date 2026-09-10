@@ -4,10 +4,13 @@
 #include "shm_binder.h"
 #include "../layer_linux/src/hotkey.h"
 
+#include <QAbstractItemView>
 #include <QAction>
 #include <QActionGroup>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QEvent>
+#include <QMouseEvent>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDesktopServices>
@@ -17,8 +20,10 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
 #include <QIcon>
 #include <QLineEdit>
@@ -32,6 +37,7 @@
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QStyle>
+#include <QStyleOptionComboBox>
 #include <QTabWidget>
 #include <QTextStream>
 #include <QTimer>
@@ -49,6 +55,44 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+// Hard ceiling on the profile combo's width, so even a capped name leaves the
+// reload and Save buttons room in the row.
+static constexpr int kProfileComboMaxWidth = 150;
+
+// Size the profile combo to its current entry, capped so a long profile
+// name can't crowd the buttons beside it.
+static void fitProfileCombo(QComboBox* combo) {
+    const QFontMetrics fm(combo->font());
+    const int w = fm.horizontalAdvance(combo->currentText());
+    QStyleOptionComboBox opt;
+    opt.initFrom(combo);
+    combo->setFixedWidth(qMin(
+        combo->style()->sizeFromContents(QStyle::CT_ComboBox, &opt,
+                                         QSize(w, fm.height()), combo).width(),
+        kProfileComboMaxWidth));
+}
+
+// Pixels of text width the profile combo leaves for a name inside its cap.
+static int profileTextPixelBudget(const QComboBox* combo) {
+    const QFontMetrics fm(combo->font());
+    QStyleOptionComboBox opt;
+    opt.initFrom(const_cast<QComboBox*>(combo));
+    const int chrome = combo->style()->sizeFromContents(
+        QStyle::CT_ComboBox, &opt, QSize(0, fm.height()), combo).width();
+    return qMax(fm.horizontalAdvance(QLatin1Char('W')), kProfileComboMaxWidth - chrome);
+}
+
+// Widen the dropdown so the longest entry is never elided: the popup's item rect
+// loses a little room to the frame and margins, so reserve that. The reserve is
+// deliberately small so the popup stays within the window's width.
+static void fitProfilePopup(QComboBox* combo) {
+    const QFontMetrics fm(combo->font());
+    int longest = 0;
+    for (int i = 0; i < combo->count(); ++i)
+        longest = qMax(longest, fm.horizontalAdvance(combo->itemText(i)));
+    combo->view()->setMinimumWidth(longest + 24);
+}
 
 static QIcon gearIcon(const QWidget* w) {
     QIcon icon = QIcon::fromTheme("preferences-system-symbolic", QIcon::fromTheme("preferences-system"));
@@ -133,6 +177,33 @@ static QString settingText(const SettingEntry& e, uint32_t raw) {
     return e.isFloat ? QString::number(BitsToFloat(raw), 'g', 9) : QString::number(raw);
 }
 
+// ── ProfileDelegate ──────────────────────────────────────────────────────
+static const int kButtonDiameter = 14;
+
+QRect ProfileDelegate::buttonRect(const QStyleOptionViewItem& option) const {
+    const int r = kButtonDiameter / 2;
+    return QRect(option.rect.right() - r * 2 - 2,
+                 option.rect.center().y() - r,
+                 kButtonDiameter, kButtonDiameter);
+}
+
+void ProfileDelegate::paint(QPainter* painter, const QStyleOptionViewItem& option,
+                            const QModelIndex& index) const {
+    QStyledItemDelegate::paint(painter, option, index);
+    if (index.row() == 0) return;
+
+    if (!(option.state & QStyle::State_MouseOver)) return;
+
+    const QRect br = buttonRect(option);
+    painter->save();
+    painter->setPen(option.palette.color(QPalette::Text));
+    QFont xFont = option.font;
+    xFont.setBold(true);
+    painter->setFont(xFont);
+    painter->drawText(br, Qt::AlignCenter, "x");
+    painter->restore();
+}
+
 MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     setWindowTitle("DLSS5VKLayer Helper");
 
@@ -197,9 +268,45 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     auto* buttons = new QHBoxLayout;
     startBtn = new QPushButton("Start helper", this);
     stopBtn = new QPushButton("Stop helper", this);
+    profileCombo = new QComboBox(this);
+    profileCombo->setToolTip("Select a saved profile to load, or choose '(default)' to reset.");
+    profileReloadBtn = new QToolButton(this);
+    profileReloadBtn->setText(QString::fromUtf8("\xe2\x86\xbb"));  // "clockwise open circle arrow"
+    profileReloadBtn->setToolTip("Settings changed since this selection was loaded. Click to reload it.");
+    profileSaveBtn = new QPushButton("Save", this);
+    profileSaveBtn->setToolTip("Save current settings to the selected profile.");
+    profileReloadBtn->setVisible(false);
     buttons->addWidget(startBtn);
     buttons->addWidget(stopBtn);
+    buttons->addStretch(1);
+    buttons->addWidget(profileReloadBtn);
+    buttons->addWidget(profileCombo);
+    buttons->addWidget(profileSaveBtn);
     root->addLayout(buttons);
+    connect(profileReloadBtn, &QToolButton::clicked, this, [this] {
+        const int idx = profileCombo->currentIndex();
+        if (idx > 0) loadSettingsFromFile(profileCombo->itemData(idx).toString());
+        else applyDefaults();
+    });
+
+    // Install custom delegate that renders a ✕ button next to each profile.
+    auto* delegate = new ProfileDelegate(this);
+    profileCombo->setItemDelegate(delegate);
+
+    // The QComboBox popup is a QAbstractItemView whose viewport handles the mouse.
+    // We install an event filter there so we can detect clicks on the ✕ button.
+    auto* listView = profileCombo->view();
+    listView->viewport()->installEventFilter(this);
+
+    refreshProfileList();
+    // Re-fit once the window is shown: the font (and thus the metrics) the style
+    // settles on can differ from the app default used during construction.
+    QTimer::singleShot(0, this, [this] {
+        fitProfileCombo(profileCombo);
+        const int h = profileSaveBtn->height();
+        profileCombo->setFixedHeight(h);
+        profileReloadBtn->setFixedHeight(h);
+    });
 
     root->addWidget(buildSettings(), 1);
 
@@ -276,6 +383,14 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
 
     connect(startBtn, &QPushButton::clicked, this, &MainWindow::startHelper);
     connect(stopBtn, &QPushButton::clicked, this, &MainWindow::stopHelper);
+    connect(profileSaveBtn, &QPushButton::clicked, this, &MainWindow::saveSettingsToFile);
+    connect(profileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
+        fitProfileCombo(profileCombo);
+        lastProfilePath = (idx == 0) ? QString() : profileCombo->itemData(idx).toString();
+        if (idx == 0) { applyDefaults(); return; }  // "(default)" — reset to defaults
+        const QString path = profileCombo->itemData(idx).toString();
+        loadSettingsFromFile(path);
+    });
     connect(runnerCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::applyRunnerSelection);
     connect(runnerPathEdit, &QLineEdit::editingFinished, this, [this] {
         runnerPath = runnerPathEdit->text().trimmed();
@@ -322,6 +437,51 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     QWidget::closeEvent(event);
 }
 
+bool MainWindow::eventFilter(QObject* obj, QEvent* event) {
+    // Intercept mouse release on the profile combo box's list view to detect
+    // clicks on the small ✕ delete button painted by ProfileDelegate.
+    if (event->type() != QEvent::MouseButtonRelease) return false;
+
+    auto* view = profileCombo->view();
+    if (obj != view->viewport()) return false;
+
+    const auto* me = static_cast<QMouseEvent*>(event);
+    const QPoint vpPos = me->pos();
+    const QModelIndex idx = view->indexAt(vpPos);
+    if (idx.isValid() && idx.row() > 0) {
+        // Build the same button rect the delegate uses.
+        QStyleOptionViewItem opt;
+        opt.rect = view->visualRect(idx);
+        const int r = kButtonDiameter / 2;
+        const QRect br(opt.rect.right() - r * 2 - 2,
+                       opt.rect.center().y() - r,
+                       kButtonDiameter, kButtonDiameter);
+        if (br.contains(vpPos)) {
+            const QString path = profileCombo->itemData(idx.row()).toString();
+            const QString name = profileCombo->itemText(idx.row());
+            if (path.isEmpty()) return false;
+
+            const int ret = QMessageBox::question(
+                this, "Delete profile",
+                QString("Delete profile \"%1\"?").arg(name),
+                QMessageBox::Yes | QMessageBox::No);
+            if (ret != QMessageBox::Yes) return false;
+
+            if (!QFile::remove(path)) {
+                QMessageBox::warning(this, "DLSS5VKLayer",
+                                     "Could not delete:\\n" + path);
+                return false;
+            }
+            if (lastProfilePath == path) {
+                applyDefaults();
+            }
+            refreshProfileList();
+            return true;
+        }
+    }
+    return false;
+}
+
 QString MainWindow::findProjectDir() const {
     QStringList candidates;
     candidates << QDir::currentPath() << QCoreApplication::applicationDirPath();
@@ -358,6 +518,14 @@ QString MainWindow::findHelperCli() const {
 QString MainWindow::configPath() const {
     const QString base = qEnvironmentVariable("XDG_CONFIG_HOME", QDir::homePath() + "/.config");
     return base + "/dlssnr/config.ini";
+}
+
+// Returns ~/.config/dlssnr/profiles/ for saving/loading setting profiles.
+QString MainWindow::profilesDir() const {
+    const QString dir = qEnvironmentVariable("XDG_CONFIG_HOME", QDir::homePath() + "/.config")
+                        + "/dlssnr/profiles";
+    QDir().mkpath(dir);
+    return dir;
 }
 
 // Must match DATA_DIR in dlssnr-helper, so the GUI and the CLI import into and read from the same
@@ -448,6 +616,7 @@ void MainWindow::loadConfig() {
         else if (key == "dxvk_device") dxvkDevice = value;
         else if (key == "window_width") windowW = value.toInt();
         else if (key == "window_height") windowH = value.toInt();
+        else if (key == "profile") lastProfilePath = value;
         else if (key.startsWith("set_")) pendingSettings.append({key, value});
     }
 }
@@ -469,6 +638,7 @@ void MainWindow::saveConfig() {
     out << "dxvk_device=" << dxvkDevice << "\n";
     out << "window_width=" << (isVisible() ? width() : windowW) << "\n";
     out << "window_height=" << (isVisible() ? height() : windowH) << "\n";
+    out << "profile=" << lastProfilePath << "\n";
     if (hdr) {
         for (const SettingEntry& e : kSettingsTable)
             out << e.key << "=" << settingText(e, (hdr->*e.field).load()) << "\n";
@@ -519,6 +689,17 @@ void MainWindow::saveSettingsIfChanged() {
     if (b == lastSettingsBlob) return;
     lastSettingsBlob = b;
     saveConfig();
+    updateReloadBtn();
+}
+
+// The reload button exists only while the live settings have drifted from what
+// the selection stands for -- the saved profile file, or the factory defaults
+// when "(default)" is selected -- the state where re-loading is meaningful.
+void MainWindow::updateReloadBtn() {
+    if (!profileReloadBtn) return;
+    if (!hdr) { profileReloadBtn->setVisible(false); return; }
+    const QString& baseline = profileCombo->currentIndex() > 0 ? profileBlob : defaultsBlob;
+    profileReloadBtn->setVisible(!baseline.isEmpty() && settingsBlob() != baseline);
 }
 
 void MainWindow::resetAllSettings() {
@@ -526,6 +707,11 @@ void MainWindow::resetAllSettings() {
                               "Reset every setting to its default? The helper will rebuild its "
                               "features from the defaults.") != QMessageBox::Yes)
         return;
+    applyDefaults();
+}
+
+// Apply factory defaults directly (no confirmation dialog).
+void MainWindow::applyDefaults() {
     if (!hdr) return;
     ShmInitDefaults(hdr);
     hdr->controlSeq.fetch_add(1);
@@ -538,6 +724,155 @@ void MainWindow::resetAllSettings() {
     }
     updateCompositionVisibility();
     lastSettingsBlob = settingsBlob();
+    profileBlob.clear();
+    defaultsBlob = lastSettingsBlob;
+    updateReloadBtn();
+    saveConfig();
+}
+
+// Refresh the profile combo box with all .ini files in the profiles directory.
+void MainWindow::refreshProfileList() {
+    const QSignalBlocker blocker(profileCombo);
+    profileCombo->clear();
+    profileCombo->addItem("(default)", QVariant());
+
+    const QDir dir(profilesDir());
+    const QStringList files = dir.entryList(QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString& f : files) {
+        if (f.endsWith(".ini", Qt::CaseInsensitive))
+            profileCombo->addItem(f.left(f.size() - 4), dir.absoluteFilePath(f));
+    }
+    // Reopen on the profile the last session had selected. The signal is blocked here, so this
+    // only moves the dropdown; the settings themselves come back via the config's set_* keys.
+    const int saved = lastProfilePath.isEmpty() ? -1 : profileCombo->findData(lastProfilePath);
+    if (saved > 0) {
+        profileCombo->setCurrentIndex(saved);
+        // The config's set_* keys are the profile's values as the last session left
+        // them, so the reopened session starts in sync with the profile.
+        profileBlob = settingsBlob();
+    } else {
+        defaultsBlob = settingsBlob();
+    }
+    fitProfileCombo(profileCombo);
+    fitProfilePopup(profileCombo);
+}
+
+// Save settings: always prompt for a profile name, pre-populated with the selected profile.
+void MainWindow::saveSettingsToFile() {
+    if (!hdr) {
+        QMessageBox::warning(this, "DLSS5VKLayer", "Shared memory not attached yet.");
+        return;
+    }
+
+    // Pre-populate with the current profile name; empty when "(default)" is selected.
+    const QString prompt = (profileCombo->currentIndex() == 0)
+                           ? "" : profileCombo->currentText();
+
+    QInputDialog dlg(this);
+    dlg.setWindowTitle("Save profile");
+    dlg.setLabelText("Profile name:");
+    dlg.setInputMode(QInputDialog::TextInput);
+    dlg.setTextValue(prompt);
+    if (auto* edit = dlg.findChild<QLineEdit*>()) {
+        // Cap by rendered width, not character count, and by whichever box is
+        // tighter: the entry field itself or the combo's 200px budget.
+        const QFontMetrics fm(edit->font());
+        const int comboAvail = profileTextPixelBudget(profileCombo);
+        edit->setMaxLength(200);
+        QString accepted = edit->text();
+        connect(edit, &QLineEdit::textChanged, edit,
+                [edit, fm, comboAvail, accepted](const QString& t) mutable {
+            const int avail = qMin(edit->contentsRect().width() - 8, comboAvail);
+            if (fm.horizontalAdvance(t) > avail) {
+                const QSignalBlocker block(edit);
+                edit->setText(accepted);
+                edit->end(false);
+                return;
+            }
+            accepted = t;
+        });
+    }
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString name = dlg.textValue();
+    if (name.trimmed().isEmpty()) return;
+
+    QString fileName = name.trimmed();
+    if (!fileName.endsWith(".ini", Qt::CaseInsensitive))
+        fileName += ".ini";
+    const QString path = profilesDir() + "/" + fileName;
+
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+        QMessageBox::warning(this, "DLSS5VKLayer",
+                             "Could not write to:\n" + path);
+        return;
+    }
+    QTextStream out(&f);
+    out << "# DLSS5VKLayer settings\n";
+    out << "# Generated by dlssnr_gui\n\n";
+    for (const SettingEntry& e : kSettingsTable)
+        out << e.key << "=" << settingText(e, (hdr->*e.field).load()) << "\n";
+
+    // Add or update the profile in the dropdown and select it. The dropdown shows the
+// bare name; the ".ini" suffix lives only in the file on disk.
+    const QString display = fileName.left(fileName.size() - 4);
+    int existing = profileCombo->findText(display);
+    if (existing < 0) {
+        profileCombo->addItem(display, path);
+        profileCombo->setCurrentIndex(profileCombo->count() - 1);
+    } else {
+        profileCombo->setItemData(existing, path);
+        profileCombo->setCurrentIndex(existing);
+    }
+    fitProfileCombo(profileCombo);
+    fitProfilePopup(profileCombo);
+    // The file now holds exactly what is live, profile and settings in sync.
+    profileBlob = settingsBlob();
+    updateReloadBtn();
+}
+
+// Load settings from a specific file path and apply them immediately.
+void MainWindow::loadSettingsFromFile(const QString& path) {
+    if (!hdr) {
+        QMessageBox::warning(this, "DLSS5VKLayer", "Shared memory not attached yet.");
+        return;
+    }
+
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "DLSS5VKLayer",
+                             "Could not read:\n" + path);
+        return;
+    }
+
+    QTextStream in(&f);
+    int loaded = 0, skipped = 0;
+    while (!in.atEnd()) {
+        QString line = in.readLine().trimmed();
+        if (line.isEmpty() || line.startsWith('#') || !line.contains('=')) continue;
+        const QString key = line.section('=', 0, 0).trimmed();
+        const QString value = line.section('=', 1).trimmed();
+        bool found = false;
+        for (const SettingEntry& e : kSettingsTable) {
+            if (QLatin1String(e.key) != key) continue;
+            const uint32_t raw = e.invert ? (value.toUInt() ? 0u : 1u)
+                                          : (e.isFloat ? FloatToBits(value.toFloat())
+                                                       : value.toUInt());
+            (hdr->*e.field).store(raw);
+            found = true;
+            ++loaded;
+            break;
+        }
+        if (!found) ++skipped;
+    }
+
+    hdr->controlSeq.fetch_add(1);
+    hdr->tuningSeq.fetch_add(1);
+    if (binder) binder->Reload();
+    updateCompositionVisibility();
+    lastSettingsBlob = settingsBlob();
+    profileBlob = lastSettingsBlob;
+    updateReloadBtn();
     saveConfig();
 }
 
