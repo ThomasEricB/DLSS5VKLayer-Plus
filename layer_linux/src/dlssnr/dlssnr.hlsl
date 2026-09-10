@@ -52,7 +52,7 @@ cbuffer Params : register(b0)
 //
 // Taken from RenoDX's DLSS 5 addon by clshortfuse (https://github.com/clshortfuse/renodx), whose
 // implementation this is -- the D65 adaptation state, the reversible scale and the LMS basis are
-// theirs. See Licenses/RenoDX_ATTRIBUTION.txt.
+// theirs. See third_party/optiscaler/RenoDX_ATTRIBUTION.txt.
 
 float SanitizeFinite(float v, float fallback) { return isfinite(v) ? v : fallback; }
 
@@ -139,7 +139,7 @@ float3 ClampAp1(float3 color)
 // The composition below (UpgradeToneMap's two-branch ratio, the OkLab hue correction, and the blend
 // between a luminance-only result and the model's own colour) is taken from RenoDX's DLSS 5 addon by
 // clshortfuse -- https://github.com/clshortfuse/renodx. It is their design, not ours; see
-// Licenses/RenoDX_LICENSE.txt. The OkLab matrices are Bjorn Ottosson's published constants and the
+// third_party/optiscaler/RenoDX_ATTRIBUTION.txt. The OkLab matrices are Bjorn Ottosson's published constants and the
 // AP1, sRGB and PQ transforms are standard colour science.
 // ---------------------------------------------------------------------------------------------
 
@@ -393,7 +393,7 @@ float3 SoftKnee(float3 display)
 //
 // Gamut nuance (RenoDX also compresses toward the D65 neutral axis first) is deferred: out-of-BT.709
 // negative channels are clamped to zero here, enough for the highlight question this measures. See
-// Licenses/RenoDX_LICENSE.txt.
+// third_party/optiscaler/RenoDX_ATTRIBUTION.txt.
 float Neutwo(float x) { return x * rsqrt(x * x + 1.0); } // [0, inf) -> [0, 1), no clip point
 
 float3 NeutwoEncode(float3 v)

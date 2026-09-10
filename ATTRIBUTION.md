@@ -1,72 +1,80 @@
 # Attribution
 
-This fork carries DLSS 5 Neural Rendering work from several upstream projects. Everything below is
-someone else's, and this file exists so that stays legible after the code has been adapted.
+This repository combines upstream code, adapted upstream techniques, vendored dependencies, and
+project-original work. The entries below distinguish those things so that upstream authors are
+credited without attributing project work to them.
 
-## The projects
+## Project provenance
 
-| Project | Licence | What is taken |
+The base DLSS5VKLayer project is by [bmitch87](https://github.com/bmitch87). The Vulkan layer,
+shared-memory protocol, helper integration, GUI, capture and frame-hold path, scaling and meter
+implementation, motion-vector implementation, packaging, and subsequent HDR/zero-copy work are
+project-specific implementations. They must not be attributed wholesale to the upstream projects
+listed below. The git history identifies the project contributors, including bmitch87 and Thomas
+Eric, for the respective changes.
+
+## Upstream Code And Techniques
+
+| Project | License | What is taken |
 |---|---|---|
-| [OptiScaler](https://github.com/cdozdil/OptiScaler) | GPL-3.0 | `Shader_Vk` (the compute-shader base class), the output-scaling downscaler, the pattern scanner |
-| [Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR) | GPL-3.0 | the DLSS-NR module: the composition shader and its constant block, the reversible proxy modes, frame hold, the apply-model toggle, supersampling, the white-point work |
-| [y4my4my4m/OptiScaler_DLSSNR_Multipass_MFG](https://github.com/y4my4my4m/OptiScaler_DLSSNR_Multipass_MFG) | GPL-3.0 | multipass and per-pass model settings, the native-Vulkan feature path, MFG unlock |
-| [RenoDX](https://github.com/clshortfuse/renodx) | MIT | the colour composition itself — see below |
-| [xenmods/DLSSNR-Cost-Scaler](https://github.com/xenmods/DLSSNR-Cost-Scaler) | MIT | the native + edit enlargement — technique only, no code |
-| [vkBasalt](https://github.com/DadSchoorse/vkBasalt) | zlib | referenced for correct layer structure; **no code taken** |
-| [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) | — | the base project this forks |
+| [OptiScaler](https://github.com/cdozdil/OptiScaler) | GPL-3.0 | `Shader_Vk` and the output-scaling shader lineage. The Vulkan dispatch-table port and current layer integration are project work. |
+| [Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR) | GPL-3.0 | The original DLSS-NR shader/module snapshot, imported from commit `97376162`. The current shader is a project-maintained derivative; its later HDR, controls, and Vulkan integration are not Dagherbou's work. |
+| [RenoDX](https://github.com/clshortfuse/renodx) | MIT | The DLSS 5 colour-composition design reimplemented in `dlssnr.hlsl`; see below. |
+| [xenmods/DLSSNR-Cost-Scaler](https://github.com/xenmods/DLSSNR-Cost-Scaler) | MIT | The native + edit enlargement technique only. No code was copied. |
+| [vkBasalt](https://github.com/DadSchoorse/vkBasalt) | zlib | Consulted for layer-structure and input-handling ideas. No vkBasalt code is identified in this repository. |
+| [DXVK](https://github.com/doitsujin/dxvk) | zlib | Vendored runtime `third_party/dxvk/2.7.1/x64/vulkan-1.dll`; its license is shipped as `third_party/dxvk/2.7.1/LICENSE.txt` and included in packages. |
+| [Khronos Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | Apache-2.0 / applicable header notices | Vendored Vulkan and video headers under `standalone_runner/third_party/`; the headers retain their Khronos copyright and SPDX notices. |
+| [stb](https://github.com/nothings/stb) | Public domain / applicable embedded notice | Vendored `stb_image.h` and `stb_image_write.h`; their author and license notices remain in the headers. |
 
-Licence texts are in `third_party/`.
+The GPL-3.0 text for the OptiScaler-derived material is in `third_party/optiscaler/LICENSE`.
+RenoDX's MIT notice is in `third_party/optiscaler/RenoDX_ATTRIBUTION.txt`. Other dependencies retain
+their notices at the paths given above; not every notice is a separate file in `third_party/`.
 
-## The colour composition is RenoDX's
+## What Is Derived From RenoDX
 
-The heart of the pass — the two-branch luminance ratio, the OkLab hue correction, the blend between a
-luminance-only result and the model's own colour, and the reversible neutral-axis gamut compression —
+The heart of the pass, including the two-branch luminance ratio, OkLab hue correction, blend between
+a luminance-only result and the model's own colour, and reversible neutral-axis gamut compression,
 is **clshortfuse's design**, from RenoDX's DLSS 5 addon. It reached this repository through
-OptiScaler, reimplemented there with different names, which does not make it anyone else's work.
+OptiScaler and was reimplemented here; different names do not make that design original work.
 
-`third_party/optiscaler/RenoDX_ATTRIBUTION.txt` is upstream's own account of exactly what is derived
-and what is not, and it carries the MIT licence text that must ship with any build.
+`third_party/optiscaler/RenoDX_ATTRIBUTION.txt` is upstream's own account of what is derived and what
+is not, and carries the MIT license text that must ship with any build.
 
-The OkLab conversion matrices are Björn Ottosson's published constants. The AP1 gamut matrices, the
-sRGB transfer functions and SMPTE ST.2084 are standard colour science and specific to nobody.
+The OkLab conversion matrices are Bjorn Ottosson's published constants. The AP1 gamut matrices,
+sRGB transfer functions, and SMPTE ST.2084 are standard colour science and are not specific to RenoDX.
 
 The matched residual and its cube scaling are **hhkbble's**, from a multi-pass pull request against
-the OptiScaler fork. It was reimplemented rather than merged, so there is no commit of theirs to
-carry the credit; it is recorded here and in the source instead.
+the OptiScaler fork. They were reimplemented rather than merged and are recorded here and in the
+source.
 
-The third enlargement mode, **native + edit**, is the technique from **xen's** DLSSNR-Cost-Scaler
-(MIT): its `CS_Resolve` is where the additive rule and the shape of the luminance guard come from. No
-code was copied — the branch in `dlssnr.hlsl` is y4my4my4m's writing of it, carried here from
-`nr-split-vulkan`.
+The third enlargement mode, **native + edit**, is the technique from **xen/xenmods'**
+DLSSNR-Cost-Scaler (MIT): its `CS_Resolve` is where the additive rule and the shape of the luminance
+guard come from. No code was copied; the branch in `dlssnr.hlsl` is a project implementation.
 
-## The vendored shader
+## The DLSS-NR Shader
 
-`layer_linux/src/dlssnr/` holds the composition shader as a pair: `dlssnr.hlsl` as source, and
-`DlssNr_Shader_Vk.spv` / `.h` as the compiled SPIR-V. **Editing the HLSL alone changes nothing** --
-the module is what runs. Rebuild it with the same command upstream uses:
+`layer_linux/src/dlssnr/` holds the composition shader as `dlssnr.hlsl`, plus its compiled SPIR-V
+and embedded header. **Editing the HLSL alone changes nothing**: the compiled module is what runs.
+Rebuild it with `tools/gen_dlssnr_spv.sh`, which invokes `dxc` and embeds the resulting SPIR-V:
 
-```
-dxc -spirv -T cs_6_0 -E CSMain -O3 -Qstrip_debug -D VK_MODE -Cc -Vi dlssnr.hlsl -Fo DlssNr_Shader_Vk.spv
-python create_header.py DlssNr_Shader_Vk.spv DlssNr_Shader_Vk.h dlssnr_spv
+```sh
+tools/gen_dlssnr_spv.sh
 ```
 
-`VK_MODE` is what strips the D3D12 game-exposure path, which is why this module has eight bindings
-and not nine. `dxc` is in `directx-shader-compiler`; the fxc note in upstream's README applies only
-to the Direct3D bytecode, which this project never builds.
+The checked-in shader and compiled module are a project-maintained derivative of the Dagherbou
+import, with RenoDX-derived composition and project-specific additions. Matching `dxc` versions are
+recommended because compiler versions may produce different but equivalent SPIR-V layouts.
 
 `DlssNr_Layout.h` pins the constant block's offsets against the compiled module. If a re-vendor
 changes the layout, that file stops compiling on purpose.
 
-The `.spv` was originally copied from Dagherbou's tree. It is now built here, because the native +
-edit branch came from a different fork than the rest of the shader and no upstream artifact contains
-both. The command above reproduces the committed module byte for byte with
-`dxc 1.9(1-0d3ee6b5)`; a different `dxc` will lay out the same program differently, which is
-expected and harmless. Behaviour was checked against the artifact it replaces by capturing matched
-input frames through the pass, and the difference sat inside the run-to-run noise of the pass itself
-(see the commit that made the change).
+## Licensing Note
 
-## Licensing note
+The copied or adapted OptiScaler and DLSS-NR portions are GPL-3.0. Distribution of a combined
+derivative must comply with GPL-3.0 for those portions and preserve all applicable third-party
+notices. RenoDX and DLSSNR-Cost-Scaler contributions are MIT; vkBasalt is zlib; Vulkan-Headers and
+stb have the notices described above; and DXVK's license is shipped with its binary.
 
-OptiScaler and both DLSS-NR forks are GPL-3.0, so a build combining this work must be distributed
-under GPL-3.0. The base project carries no licence file of its own; that needs settling with its
-author before any public release.
+The base project has no project-level license file. The licensing status of project-original code
+and permission to redistribute the complete combined work should be resolved with the relevant
+copyright holders before public release.
