@@ -74,7 +74,3 @@ The copied or adapted OptiScaler and DLSS-NR portions are GPL-3.0. Distribution 
 derivative must comply with GPL-3.0 for those portions and preserve all applicable third-party
 notices. RenoDX and DLSSNR-Cost-Scaler contributions are MIT; vkBasalt is zlib; Vulkan-Headers and
 stb have the notices described above; and DXVK's license is shipped with its binary.
-
-The base project has no project-level license file. The licensing status of project-original code
-and permission to redistribute the complete combined work should be resolved with the relevant
-copyright holders before public release.
