@@ -49,16 +49,14 @@ const Setting kSettings[] = {
     { "colour", &ShmHeader::colourStrengthBits, true, "how much of its colour comes with it, 0-4" },
     { "guard", &ShmHeader::maxRatioBits, true, "highlight guard, the most a pixel may move" },
     { "transfer", &ShmHeader::transfer, false, "0 classic, 1 matched residual, 2 native + edit" },
+    { "bypass", &ShmHeader::compositionBypass, false,
       "present the model's raw answer instead of composing its edit, 0 or 1" },
-      "run the model alongside the frame instead of waiting for it, 0 or 1" },
+    { "rebuildms", &ShmHeader::rebuildSettleMs, false,
+      "ms to settle before rebuilding a pass after a model setting changes" },
+    { "ratiosmooth", &ShmHeader::ratioSmoothPercent, false,
       "how much of the relighting ratio comes from the neighbourhood, 0-100 (100 default, 0 = per-pixel)" },
-
     { "colourtrust", &ShmHeader::colourTrustPercent, false,
       "how far the model may move a pixel's colour from the frame's, in hundredths (200 default, 0 = frame's hue)" },
-
-      "how hard the measured displacement is filtered over time, 0-100 (0 = raw, 100 default)" },
-      "radius splitting a stale edit's safe half from the half that ghosts, in thousandths of width" },
-
     { "mvec", &ShmHeader::mvecEnabled, false, "estimate motion vectors from the frames, 0 or 1" },
     { "mvecquality", &ShmHeader::mvecQuality, false, "0 fast, 1 balanced, 2 quality" },
     { "mvecunits", &ShmHeader::mvecScaleMode, false, "0 normalised, 1 pixels, 2 uv 0..1" },

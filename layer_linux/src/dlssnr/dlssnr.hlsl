@@ -33,7 +33,7 @@ cbuffer Params : register(b0)
                            //    white point -- no knee, no sRGB, no ceiling. Off is the SDR path.
     uint  gHdrTransfer;    // 1 with gHdrProxy: the swapchain carries PQ (ST 2084), so the frame is
                            //    PQ-decoded on the way in and PQ-encoded on the way out.
-    float gColourTrust;    // how much of the chroma-agreement gate to apply, 0..1
+    float gColourTrust;    // maximum chroma displacement from the frame, in normalized units
     float gRatioSmooth;    // how much of the relighting ratio to take from the neighbourhood
 
 
@@ -838,7 +838,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         {
             const float2 off = float2(nb == 0 ? -1.0 : nb == 1 ? 1.0 : 0.0,
                                       nb == 2 ? -1.0 : nb == 3 ? 1.0 : 0.0) * texel;
-            const float2 uvn = saturate(editUv + off);
+            const float2 uvn = saturate(cmpUv + off);
             float3 pn = gSource.SampleLevel(gLinear, uvn, 0).rgb;
             float3 mn = gModel.SampleLevel(gLinear, uvn, 0).rgb;
             if (gHdrProxy == 0 && gPassthrough == 0)

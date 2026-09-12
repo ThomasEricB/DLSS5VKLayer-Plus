@@ -118,7 +118,7 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
         }();
         if (forcedCt >= 0) s.colourTrust = float(forcedCt) / 100.0f;
         if (!std::isfinite(s.colourTrust) || s.colourTrust < 0.0f) s.colourTrust = 1.0f;
-        if (s.colourTrust > 1.0f) s.colourTrust = 1.0f;
+        if (s.colourTrust > 8.0f) s.colourTrust = 8.0f;
 
         static const int forced = [] {
             const char* v = getenv("DLSSNR_MOTION_SMOOTH");
