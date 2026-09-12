@@ -35,8 +35,9 @@ struct Setting {
 const Setting kSettings[] = {
     { "enabled", &ShmHeader::enabled, false, "0/1 run the model at all" },
     { "hdrmode", &ShmHeader::hdrMode, false, "0 auto, 1 off, 2 force float16 proxy" },
+    { "sdr16multipass", &ShmHeader::sdr16Multipass, false,
+      "0/1 use 16-bit images between SDR model passes" },
     { "passes", &ShmHeader::passes, false, "how many times the model runs over one frame" },
-    { "unlockpasses", &ShmHeader::unlockPasses, false, "0/1 lift the pass ceiling" },
     { "preset", &ShmHeader::preset, false, "model preset" },
     { "style", &ShmHeader::style, false, "0 default, 1 natural, 2 cinematic" },
     { "automask", &ShmHeader::autoMask, false, "0/1 automatic skin mask" },

@@ -135,7 +135,6 @@ struct SettingEntry {
 static const SettingEntry kSettingsTable[] = {
     {"set_enabled", &ShmHeader::enabled, false},
     {"set_passes", &ShmHeader::passes, false},
-    {"set_unlock_passes", &ShmHeader::unlockPasses, false},
     {"set_rebuild_settle_ms", &ShmHeader::rebuildSettleMs, false},
     {"set_model_resolution", &ShmHeader::workingScaleBits, true},
     {"set_down_leg_filter", &ShmHeader::scalingDownscaler, false},
@@ -157,6 +156,7 @@ static const SettingEntry kSettingsTable[] = {
     {"set_motion_units", &ShmHeader::mvecScaleMode, false},
     {"set_colour_mode", &ShmHeader::colourMode, false},
     {"set_hdr_mode", &ShmHeader::hdrMode, false},
+    {"set_sdr_16bit_multipass", &ShmHeader::sdr16Multipass, false},
     {"set_white_point_source", &ShmHeader::whitePointSource, false},
     {"set_paper_white", &ShmHeader::whitePointBits, true},
     {"set_white_point_scale", &ShmHeader::whitePointScaleBits, true},
@@ -1256,12 +1256,6 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "Every pass is another full run of the model and another feature holding its "
                        "own history, so the cost is close to linear.",
                        ShmBinder::AtCreate);
-        binder->AddBool(f, "Lift the pass limit", &ShmHeader::unlockPasses,
-                         QString("Raises the ceiling from %1 to %2.\n"
-                                 "Past a few passes the model is enhancing its own output, which is "
-                                 "outside what it was trained for.")
-                             .arg(kDefaultMaxPasses)
-                             .arg(kMaxPasses));
         binder->AddPercent(f, "Model resolution", &ShmHeader::workingScaleBits, 25, 200,
                            "What fraction of the frame the model works at. The frame itself is never "
                            "reduced.\n"
@@ -1277,7 +1271,7 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         f->addRow(passBtn);
     }
 
-    scrollTab("Motion", &col);
+    scrollTab("Quality", &col);
     {
         auto* f = group(col, "Motion");
         binder->AddBool(f, "Estimate motion vectors", &ShmHeader::mvecEnabled,
@@ -1294,6 +1288,24 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "What the numbers in the field mean to the model.\n"
                           "Pixels is what the estimate produces; the others are for matching a model "
                           "that expects them.");
+    }
+    {
+        auto* f = group(col, "Input and precision");
+        binder->AddChoice(f, "HDR input", &ShmHeader::hdrMode,
+                          { "Auto", "Off", "Force float16" },
+                          "Let the model see the frame's real light instead of a tone-mapped copy.\n"
+                          "Auto turns it on when the swapchain is HDR -- a float swapchain, or 10-bit "
+                          "with a PQ colour space -- and the proxy then crosses as float16 carrying "
+                          "linear light, PQ-decoded first when the swapchain carries PQ.\n"
+                          "Off keeps the 8-bit proxy whatever the game presents.\n"
+                          "Force feeds the float proxy to an SDR swapchain too, which is an A/B tool "
+                          "rather than a preference.\n"
+                          "The model has the last word: if it refuses float input the pass falls back "
+                          "to 8-bit on its own.");
+        binder->AddBool(f, "16-bit SDR intermediates", &ShmHeader::sdr16Multipass,
+                        "Keep the images between SDR model passes at 16-bit. Disable to keep them "
+                        "8-bit and reduce VRAM and GPU bandwidth use; HDR is always float16.",
+                        ShmBinder::AtCreate);
     }
 
     scrollTab("Composition", &col);
@@ -1397,17 +1409,6 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
     }
     {
         auto* f = group(col, "Color");
-        binder->AddChoice(f, "HDR input", &ShmHeader::hdrMode,
-                          { "Auto", "Off", "Force float16" },
-                          "Let the model see the frame's real light instead of a tone-mapped copy.\n"
-                          "Auto turns it on when the swapchain is HDR -- a float swapchain, or 10-bit "
-                          "with a PQ colour space -- and the proxy then crosses as float16 carrying "
-                          "linear light, PQ-decoded first when the swapchain carries PQ.\n"
-                          "Off keeps the 8-bit proxy whatever the game presents.\n"
-                          "Force feeds the float proxy to an SDR swapchain too, which is an A/B tool "
-                          "rather than a preference.\n"
-                          "The model has the last word: if it refuses float input the pass falls back "
-                          "to 8-bit on its own.");
         binder->AddChoice(f, "Frame holds", &ShmHeader::colourMode,
                           { "Auto", "A finished picture", "Linear light" },
                           "Whether the swapchain carries a frame the game already tone mapped or "

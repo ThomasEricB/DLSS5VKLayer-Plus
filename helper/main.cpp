@@ -1149,6 +1149,7 @@ struct NeuralState {
     // surfaces and the model's feature contract are all float16. It switches only between frames,
     // and the frame that switches is failed on purpose -- its bytes are still the old width.
     uint32_t hdrBuilt = 0;
+    bool sdr16Built = true;
     // The model refused the float contract. Stay 8-bit until HDR is switched off and back on.
     bool hdrRejected = false;
 
@@ -2148,7 +2149,8 @@ static void ApplyMotionScale(NgxSnippet& ngx, uint32_t mode, uint32_t w, uint32_
 }
 
 static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
-    if (ns.ready && ns.w == w && ns.h == h) return true;
+    const bool wantSdr16 = !ns.hdrBuilt && shm.hdr->sdr16Multipass.load() != 0;
+    if (ns.ready && ns.w == w && ns.h == h && ns.sdr16Built == wantSdr16) return true;
     if (ns.ngx.disabled) return false;
 
     if (ns.ngx.snippet) NgxReleaseAllPasses(ns.ngx, ns.vk.device);
@@ -2177,8 +2179,11 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     // downstream has to be told about it, and the model is handed the same numbers it always was with
     // eight times the room between them. The transport stays eight-bit; the chain is brought down to
     // it once, at the end, instead of once per pass.
-    const VkFormat workFmt = ns.hdrBuilt ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R16G16B16A16_UNORM;
+    const VkFormat workFmt = ns.hdrBuilt ? VK_FORMAT_R16G16B16A16_SFLOAT
+                                         : wantSdr16 ? VK_FORMAT_R16G16B16A16_UNORM
+                                                     : VK_FORMAT_R8G8B8A8_UNORM;
     ns.ngx.hdrActive = ns.hdrBuilt != 0;
+    ns.sdr16Built = wantSdr16;
     if (!CreateImage2D(ns.vk, chainFmt, w, h, ns.colorIn) ||
         !CreateImage2D(ns.vk, chainFmt, w, h, ns.colorOut) ||
         !CreateImage2D(ns.vk, workFmt, w, h, ns.workA) ||

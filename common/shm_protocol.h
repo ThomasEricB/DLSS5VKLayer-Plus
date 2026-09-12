@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 18;
+static constexpr uint32_t kShmVersion = 19;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -51,11 +51,9 @@ static constexpr uint32_t kMinW = 64, kMinH = 64;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 8;
 static constexpr size_t kHeaderBytes = 65536;
 
-// The ceiling on how many times the model runs over one frame, and what the slider offers unless the
-// ceiling is lifted. Both are OptiScaler's numbers (DlssNr::kMaxPasses / kDefaultMaxPasses) and the
-// arrays here are sized for the first.
+// The ceiling on how many times the model runs over one frame. It is OptiScaler's
+// DlssNr::kMaxPasses and sizes the per-pass arrays below.
 static constexpr uint32_t kMaxPasses = 30;
-static constexpr uint32_t kDefaultMaxPasses = 5;
 
 static constexpr size_t kReasonBytes = 192;
 static constexpr size_t kNameBytes = 128;
@@ -511,6 +509,10 @@ struct ShmHeader {
     // here, not which pixel is brighter than its neighbour, and the frame already knows that.
     std::atomic<uint32_t> ratioSmoothPercent;
 
+    // SDR uses 8-bit ping-pong images by default. Enable 16-bit UNORM to avoid quantising between
+    // passes at higher memory and bandwidth cost.
+    std::atomic<uint32_t> sdr16Multipass;
+
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -526,7 +528,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1960, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1964, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
@@ -611,6 +613,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->colourTrustPercent.store(200);
 
     h->ratioSmoothPercent.store(100);
+    h->sdr16Multipass.store(0);
 
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
@@ -629,7 +632,8 @@ inline void ShmInitDefaults(ShmHeader* h) {
 }
 
 inline uint32_t ShmPassCeiling(const ShmHeader* h) {
-    return h->unlockPasses.load() ? kMaxPasses : kDefaultMaxPasses;
+    (void)h;
+    return kMaxPasses;
 }
 
 inline uint32_t ShmPasses(const ShmHeader* h) {

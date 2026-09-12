@@ -800,7 +800,7 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
         MakeImage(_frame, width, height, work, sampled | dst) &&
         MakeImage(_keep, width, height, _keepFormat, sampled | storage) &&
         MakeImage(_proxy, width, height, proxyFormat, sampled | storage | src) &&
-        MakeImage(_model, modelW, modelH, proxyFormat, sampled | dst) &&
+        MakeImage(_model, modelW, modelH, proxyFormat, sampled | src | dst) &&
         MakeImage(_composed, width, height, work, storage | src);
 
     // The transport pair is sized to the model raster and rebuilt against whatever mapping is
@@ -985,7 +985,7 @@ bool Composition::ImportAnswerFd(int fd, uint32_t w, uint32_t h) {
     ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (_vk->vkCreateImage(_device, &ci, nullptr, &_answerXfer.image) != VK_SUCCESS) {
@@ -1346,6 +1346,10 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     // The flag is the layer's own decision from before the request went out, so it and the helper
     // agree on which surface holds this frame's answer.
     const bool dmaAnswer = AnswerViaFd();
+    const bool rawCopy = s.compositionBypass != 0 && s.compareMode == 0 && !_capture.Active() &&
+                         !_superSample && !_hdrProxy && !_linearHdr &&
+                         _modelW == _width && _modelH == _height &&
+                         (dmaAnswer ? _answerXfer.format : _model.format) == _workFormat;
     if (dmaAnswer) {
         // Acquire from FOREIGN, then into the layout the resolve samples in. The first barrier's
         // old layout is the one the exporter left it in; the image's own tracking says UNDEFINED
@@ -1353,16 +1357,19 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         VkImageMemoryBarrier acq{};
         acq.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         acq.srcAccessMask = 0;
-        acq.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        acq.dstAccessMask = rawCopy ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_SHADER_READ_BIT;
         acq.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        acq.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        acq.newLayout = rawCopy ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         acq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
         acq.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         acq.image = _answerXfer.image;
         acq.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                  rawCopy ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                   0, 0, nullptr, 0, nullptr, 1, &acq);
-        _answerXfer.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        _answerXfer.layout = rawCopy ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     } else {
         Transition(cb, _model, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy region{};
@@ -1378,6 +1385,31 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     // because from its point of view the model effectively ran at the frame's own resolution.
     Image* answer = dmaAnswer ? &_answerXfer : &_model;
     Image* source = _work.image ? &_work : &_proxy;
+    if (rawCopy) {
+        Transition(cb, *answer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        CopyWholeImage(cb, answer->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, _width, _height);
+        TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+        if (dmaAnswer) {
+            VkImageMemoryBarrier rel{};
+            rel.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            rel.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            rel.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            rel.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            rel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+            rel.image = _answerXfer.image;
+            rel.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &rel);
+            _answerXfer.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        }
+        return true;
+    }
     if (_superSample) {
         Transition(cb, _modelNative, VK_IMAGE_LAYOUT_GENERAL);
         if (!_superDown->Dispatch(cb, answer->view, _modelNative.view, _modelW, _modelH, _width, _height))
