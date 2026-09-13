@@ -1148,6 +1148,19 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
 // ---------------------------------------------------------------------------
 // Leg 1: the frame the model is shown
 // ---------------------------------------------------------------------------
+bool Composition::RecordRestore(VkCommandBuffer cb, VkImage swapchainImage) {
+    if (!_usable || !_frame.image || !_frameCaptured) return false;
+    Transition(cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    CopyWholeImage(cb, _frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, _width, _height);
+    // Back to what the presentation engine requires, on every path out.
+    TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    return true;
+}
+
 bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s) {
     if (!_usable || !_frame.image) return false;
 
