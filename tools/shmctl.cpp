@@ -223,7 +223,10 @@ int main(int argc, char** argv) {
         h->quit.store(0);
         h->controlSeq.fetch_add(1);
     } else if (std::strcmp(cmd, "reset") == 0) {
-        ShmInitDefaults(h);
+        // Settings only, leaving the transport and both sides' status alone. Clearing the whole
+        // header on a live session takes the layer's published presence with it, and the layer
+        // republishes only when it next composes a frame.
+        ShmResetSettings(h);
     } else if (std::strcmp(cmd, "settings") == 0) {
         if (!Initialised(h)) ShmInitDefaults(h);
         PrintSettings(h);

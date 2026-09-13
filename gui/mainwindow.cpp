@@ -715,9 +715,11 @@ void MainWindow::resetAllSettings() {
 // Apply factory defaults directly (no confirmation dialog).
 void MainWindow::applyDefaults() {
     if (!hdr) return;
-    ShmInitDefaults(hdr);
-    hdr->controlSeq.fetch_add(1);
-    hdr->tuningSeq.fetch_add(1);
+    // Settings only. Clearing the whole header here took the transport's sequence numbers and both
+    // sides' status with it, and the layer republishes its own only when it next composes a frame --
+    // which a paused player never does, so resetting left the status reading Inactive over a picture
+    // that was still being edited.
+    ShmResetSettings(hdr);
     if (keyCombo) keyCombo->setCurrentIndex(0);
     if (binder) binder->Reload();
     if (rebuildSpin) {
