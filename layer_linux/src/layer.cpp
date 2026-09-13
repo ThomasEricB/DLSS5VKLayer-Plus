@@ -1401,6 +1401,22 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         return false;
     }
 
+    // A repaint has no picture of its own to fall back on.
+    //
+    // Prepare rebuilds when the model's raster changes, and a rebuild that cannot keep the captured
+    // frame -- a real change of size or working format -- leaves nothing to compose again. The pass
+    // would then read the frame from the swapchain, and on a repaint that image holds the previous
+    // composed output, so the edit would land on top of the edit. Better to draw nothing and wait for
+    // the application to produce a frame of its own.
+    if (repaint && !sc.comp->HasCapturedFrame()) {
+        static std::once_flag said;
+        std::call_once(said, [] {
+            Log("[layer] idle repaint: the rebuild could not keep the captured frame; waiting for a "
+                "real one rather than composing the screen back onto itself");
+        });
+        return false;
+    }
+
     if (dc->shm.hdr) {
         dc->shm.hdr->hdrDetected.store(sc.hdrKind);
         // The intent, not the format-gated decision: the helper builds the float images only for a
