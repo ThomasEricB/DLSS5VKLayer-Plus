@@ -513,6 +513,20 @@ struct DeviceChain {
     std::atomic<bool> repaintRun{true};
     std::atomic<double> lastPresentMs{0.0};
     uint32_t repaintSeenCtrl = 0;
+    uint32_t repaintSeenTuning = 0;
+    // A window to keep asking in, after a change the helper has to rebuild for.
+    //
+    // A model setting is latched when the feature is created, so the helper debounces and rebuilds;
+    // a repaint that runs in the meantime composes with the model still loaded and answers with the
+    // old look. The change is real and the redraw is real, which is what made this hard to see: the
+    // frame counter moves and the picture does not.
+    //
+    // One follow-up is not enough either, because the helper rebuilds one pass at a time and spaces
+    // them -- "pass 2 retuned; rebuilding it (spacing 250 ms)", then the next -- so a four-pass
+    // rebuild runs well past a second. So this asks again every so often until the rebuild has had
+    // time to finish, and the last of those carries the finished model.
+    double repaintUntilMs = 0.0;
+    double repaintNextMs = 0.0;
     bool repaintWasEnabled = true;   // so switching the effect off is itself a change to answer
     bool releaseImages = false;      // VK_EXT_swapchain_maintenance1 was enabled
     std::unordered_map<VkSwapchainKHR, SwapchainState> swapchains;
@@ -936,7 +950,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                 // application draws again.
                 const bool on = ShmNeuralEnabled(dc->shm);
                 const uint32_t ctrl = dc->shm.hdr->controlSeq.load();
-                if (ctrl == dc->repaintSeenCtrl && on == dc->repaintWasEnabled) continue;
+                const uint32_t tune = dc->shm.hdr->tuningSeq.load();
+                const bool changed = ctrl != dc->repaintSeenCtrl || tune != dc->repaintSeenTuning ||
+                                     on != dc->repaintWasEnabled;
+
+                // A change to something the model latches at creation arms a second look. The helper
+                // waits for the setting to stop moving and then rebuilds, so the answer worth
+                // showing arrives after the rebuild, not when the slider was touched. Re-armed on
+                // every tuning change, so dragging a slider asks once at the end rather than at each
+                // tick.
+                const double now2 = NowMs();
+                if (changed && tune != dc->repaintSeenTuning) {
+                    // Long enough for every pass to be rebuilt in turn, plus room for the last
+                    // create itself, which the log measures at around a tenth of a second.
+                    const double perPass = double(dc->shm.hdr->rebuildSettleMs.load()) + 250.0;
+                    const uint32_t passes = dc->shm.hdr->passes.load();
+                    dc->repaintUntilMs = now2 + perPass * double(passes ? passes : 1u) + 800.0;
+                }
+                const bool inWindow = now2 < dc->repaintUntilMs && now2 >= dc->repaintNextMs;
+                if (!changed && !inWindow) continue;
+                // Spaced, so a rebuild window costs a handful of round trips rather than one every
+                // sixty milliseconds. Nothing here is on the application's thread, but each repaint
+                // is a full trip through the model and there is no point running them back to back.
+                dc->repaintNextMs = now2 + 400.0;
 
                 SwapchainState* sc = nullptr;
                 VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -973,7 +1009,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                                                                50ull * 1000ull * 1000ull,
                                                                VK_NULL_HANDLE, sc->repaintFence,
                                                                &index);
-                if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) continue;
+                if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
+                    static std::atomic<uint32_t> n{0};
+                    const uint32_t k = n.fetch_add(1);
+                    if (k < 3 || k == 20 || k == 100)
+                        Log("[layer] idle repaint: acquire gave %d (attempt %u)", (int) acq, k + 1);
+                    continue;
+                }
                 if (dc->vkWaitForFences(dc->self, 1, &sc->repaintFence, VK_TRUE,
                                         500ull * 1000ull * 1000ull) != VK_SUCCESS) {
                     Log("[layer] idle repaint: the acquired image never became ready; stopping");
@@ -993,6 +1035,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                     pi.pImageIndices = &index;
                     dc->vkQueuePresentKHR(sc->queue, &pi);
                     dc->repaintSeenCtrl = ctrl;
+                    dc->repaintSeenTuning = tune;
                     dc->repaintWasEnabled = on;
                 } else if (dc->releaseImages) {
                     // Handed back rather than dropped. An acquired image is released by presenting
