@@ -455,10 +455,17 @@ struct InstanceChain {
     X(vkFreeMemory) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) \
     X(vkMapMemory) X(vkUnmapMemory) X(vkCreateBuffer) X(vkDestroyBuffer) \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkCmdCopyBufferToImage) \
-    X(vkCmdCopyImageToBuffer) X(vkCmdPipelineBarrier) X(vkDeviceWaitIdle)
+    X(vkCmdCopyImageToBuffer) X(vkCmdPipelineBarrier) X(vkDeviceWaitIdle) \
+    X(vkAcquireNextImageKHR) X(vkReleaseSwapchainImagesEXT)
 
 struct SwapchainState {
     std::vector<VkImage> images;
+    // The queue this swapchain was last presented on. A repaint has to submit and present somewhere,
+    // and the only queue known to be right for a swapchain is the one the application itself uses.
+    VkQueue queue = VK_NULL_HANDLE;
+    // Waited on by the repaint after it acquires, so nothing is ever left signalled for the next
+    // acquire to trip over.
+    VkFence repaintFence = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     // HdrKind: what this swapchain's format and colour space say the frame carries. The float
     // swapchain holds linear light; a 10-bit one with a PQ colour space holds ST 2084 code.
@@ -500,6 +507,21 @@ struct DeviceChain {
 #undef X
     std::atomic<bool> inert{false};
     std::mutex lock;
+
+    // Repainting a still frame while the application is idle.
+    //
+    // A paused video presents nothing, so a settings change had nothing to redraw it onto and the
+    // picture kept whatever look it had when the player stopped. This draws it again: when the
+    // application has not presented for a while and the settings have moved since the last repaint,
+    // the layer composes the frame once more and presents it itself.
+    //
+    // Only while idle, and only on a change. It is not a frame source -- an application that is
+    // presenting redraws its own frames and this stays out of the way entirely.
+    std::thread repaintThread;
+    std::atomic<bool> repaintRun{true};
+    std::atomic<double> lastPresentMs{0.0};
+    uint32_t repaintSeenCtrl = 0;
+    bool releaseImages = false;   // VK_EXT_swapchain_maintenance1 was enabled
     std::unordered_map<VkSwapchainKHR, SwapchainState> swapchains;
     std::unordered_map<VkQueue, uint32_t> queueFamilies;
     ShmMap shm;
@@ -543,6 +565,12 @@ static bool ClaimPrimary(VkDevice device, VkSwapchainKHR swapchain, uint32_t w, 
     g_primary.swapchain = swapchain;
     g_primary.area = area;
     return true;
+}
+
+// Whether this swapchain is the one driving the channel, asked without claiming it.
+static bool IsPrimary(VkDevice device, VkSwapchainKHR swapchain) {
+    std::lock_guard<std::mutex> lk(g_primaryMutex);
+    return g_primary.swapchain == swapchain && g_primary.device == device;
 }
 
 static void ReleasePrimary(VkDevice device, VkSwapchainKHR swapchain) {
@@ -694,6 +722,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_EnumeratePhysicalDevices(
 // ---------------------------------------------------------------------------
 // Device hooks
 // ---------------------------------------------------------------------------
+// Declared here for the idle repaint, which composes a frame the application did not ask for.
+static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
+                           VkImage swapchainImage, uint32_t waitCount, const VkSemaphore* pWaits);
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo,
     const VkAllocationCallbacks* pAllocator, VkDevice* pDevice) {
@@ -737,9 +768,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     // is false the composition falls back to the next transport down.
     static const char* const kWantExts[] = { VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
                                              VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-                                             VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME };
+                                             VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+                                             // Last, and checked for by name below: this one is the
+                                             // repaint's, and it only needs to know whether it got it.
+                                             VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME };
     constexpr size_t kWantCount = sizeof(kWantExts) / sizeof(kWantExts[0]);
     const VkDeviceCreateInfo* effective = pCreateInfo;
+    bool addedSwapMaint = false;
     VkDeviceCreateInfo modified = *pCreateInfo;
     std::vector<const char*> enabledExts;
     if (LayerEnabled() && ic && ic->vkEnumerateDeviceExtensionProperties) {
@@ -764,15 +799,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
             }
             enabledExts.push_back(kWantExts[k]);
         }
+        for (const char* e : enabledExts)
+            if (!std::strcmp(e, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) addedSwapMaint = true;
         if (!enabledExts.empty()) {
             modified.enabledExtensionCount = uint32_t(enabledExts.size());
             modified.ppEnabledExtensionNames = enabledExts.data();
             effective = &modified;
         }
     }
+    // The extension does nothing unless its feature is asked for.
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapMaint{};
+    if (addedSwapMaint) {
+        swapMaint.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
+        swapMaint.swapchainMaintenance1 = VK_TRUE;
+        swapMaint.pNext = const_cast<void*>(modified.pNext);
+        modified.pNext = &swapMaint;
+        effective = &modified;
+    }
 
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
+    auto* const nextLayerInfo = link->u.pLayerInfo;
     VkResult res = create(physicalDevice, effective, pAllocator, pDevice);
+    if (res != VK_SUCCESS && effective != pCreateInfo) {
+        // The game's own list was fine; ours was not. Nothing added here is worth failing a device
+        // creation over -- the repaint is a convenience and the transport has its own fallbacks.
+        Log("[layer] vkCreateDevice refused the layer's additions (%d); retrying with the game's list",
+            (int) res);
+        link->u.pLayerInfo = nextLayerInfo;
+        addedSwapMaint = false;
+        res = create(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    }
     if (res != VK_SUCCESS) return res;
 
     DeviceChain* dc = new DeviceChain();
@@ -786,6 +842,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 #undef X
     dc->table.next_dpa = next_dpa;
     dc->table.Load(*pDevice);
+    dc->releaseImages = addedSwapMaint && dc->vkReleaseSwapchainImagesEXT != nullptr;
     if (!dc->vkQueuePresentKHR || !dc->vkCreateSwapchainKHR || !ic) dc->inert = true;
 
     // Neural Rendering is an NGX feature and the helper only ever creates its own device on an
@@ -807,6 +864,147 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     g_devices[*pDevice] = dc;
     Log("[layer] vkCreateDevice -> %p on %s (inert=%d enabled=%d)", (void*)*pDevice, deviceName,
         (int) dc->inert.load(), (int) LayerEnabled());
+
+    // Redraw a still frame when the settings move under it.
+    //
+    // Everything this does is conditional on the application having stopped presenting. While frames
+    // are flowing it wakes, sees a recent present, and goes back to sleep -- it is not a frame source
+    // and never competes with an application for an image. What it is for is the paused case: a video
+    // player that has nothing new to show presents nothing, so until now a settings change had no
+    // frame to land on and the picture kept the look it had when playback stopped.
+    //
+    // DLSSNR_IDLE_REPAINT=0 turns it off.
+    static const bool repaintWanted = [] {
+        const char* v = getenv("DLSSNR_IDLE_REPAINT");
+        return !(v && v[0] == '0');
+    }();
+    if (repaintWanted && !dc->inert) {
+        dc->repaintThread = std::thread([dc] {
+            while (dc->repaintRun.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+                if (!dc->repaintRun.load(std::memory_order_relaxed)) break;
+                if (dc->inert.load() || !dc->shm.hdr || dc->shm.dead) continue;
+
+                // Idle means the application has not presented for a while. Long enough that a
+                // player between frames is not mistaken for one that has stopped, short enough that
+                // a paused picture answers a slider while the hand is still on it.
+                const double idleFor = NowMs() - dc->lastPresentMs.load(std::memory_order_relaxed);
+                if (idleFor < 250.0) continue;
+
+                // And only on a change. Without this it would redraw a still frame forever, which
+                // costs a round trip through the model for a picture nobody asked to see again.
+                const uint32_t ctrl = dc->shm.hdr->controlSeq.load();
+
+                // Tried, never waited for. The application holds this lock across its own present,
+                // and under FIFO that call blocks until the display is ready -- so waiting here
+                // would park this thread inside someone else's frame, and a thread parked there
+                // cannot be joined when the device is destroyed. If the lock is held the application
+                // is presenting, which is exactly when a repaint has no business running.
+                std::unique_lock<std::mutex> lk(dc->lock, std::try_to_lock);
+                if (!lk.owns_lock()) continue;
+                if (!dc->repaintRun.load(std::memory_order_relaxed)) break;
+                if (ctrl == dc->repaintSeenCtrl) continue;
+
+                // The primary swapchain of this device, which is the one driving the channel.
+                SwapchainState* sc = nullptr;
+                VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+                for (auto& kv : dc->swapchains) {
+                    if (!IsPrimary(dc->self, kv.first)) continue;
+                    sc = &kv.second;
+                    swapchain = kv.first;
+                    break;
+                }
+                if (!sc || !sc->ready || !sc->comp || !sc->queue || sc->passThrough) {
+                    static std::once_flag said;
+                    std::call_once(said, [&] {
+                        Log("[layer] idle repaint: nothing to repaint (primary=%d ready=%d comp=%d "
+                            "queue=%d passThrough=%d)", sc != nullptr, sc && sc->ready,
+                            sc && sc->comp != nullptr, sc && sc->queue != VK_NULL_HANDLE,
+                            sc && sc->passThrough);
+                    });
+                    continue;
+                }
+
+                // Checked again with the lock held: the application may have presented between the
+                // test above and here, and if it has, this has no business taking an image.
+                if (NowMs() - dc->lastPresentMs.load(std::memory_order_relaxed) < 250.0) continue;
+
+                // A fence rather than a semaphore, waited on here. Nothing is left signalled for a
+                // later acquire to trip over, and nothing is held past this loop: the image is taken
+                // and given back, one way or the other, before the lock is released.
+                if (sc->repaintFence == VK_NULL_HANDLE) {
+                    VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+                    if (dc->vkCreateFence(dc->self, &fci, nullptr, &sc->repaintFence) != VK_SUCCESS)
+                        continue;
+                }
+                uint32_t index = 0;
+                // A real wait, not a zero timeout. The presentation engine releases an image when
+                // it is finished displaying one, and with the application stopped there is no
+                // present coming to prompt that -- asking for an image at an instant of this
+                // thread's choosing and giving up returns nothing, every time. Bounded, because the
+                // application may resume while this is waiting and its own present blocks on the
+                // same lock until this lets go.
+                const VkResult acq = dc->vkAcquireNextImageKHR(dc->self, swapchain,
+                                                               50ull * 1000ull * 1000ull,
+                                                               VK_NULL_HANDLE, sc->repaintFence,
+                                                               &index);
+                if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
+                    static std::once_flag said;
+                    std::call_once(said, [acq] {
+                        Log("[layer] idle repaint: no image to acquire (%d)", (int) acq);
+                    });
+                    continue;
+                }
+                if (dc->vkWaitForFences(dc->self, 1, &sc->repaintFence, VK_TRUE,
+                                        500ull * 1000ull * 1000ull) != VK_SUCCESS) {
+                    // The image never became ready. Leaving the fence signalled would poison the
+                    // next acquire, so the whole thing stops rather than guess.
+                    Log("[layer] idle repaint: the acquired image never became ready; stopping");
+                    break;
+                }
+                dc->vkResetFences(dc->self, 1, &sc->repaintFence);
+                if (index >= sc->images.size()) continue;
+
+                const bool composed = ProcessPresent(dc, *sc, sc->queue, sc->images[index], 0, nullptr);
+                {
+                    static std::once_flag said;
+                    std::call_once(said, [composed] {
+                        Log("[layer] idle repaint: first repaint %s", composed ? "composed" : "declined");
+                    });
+                }
+                if (composed) {
+                    VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+                    pi.swapchainCount = 1;
+                    pi.pSwapchains = &swapchain;
+                    pi.pImageIndices = &index;
+                    dc->vkQueuePresentKHR(sc->queue, &pi);
+                    dc->repaintSeenCtrl = ctrl;
+                } else if (dc->releaseImages) {
+                    // An acquired image is released by presenting it and by nothing else, so one
+                    // that cannot be composed has to be handed back explicitly or the swapchain is
+                    // one image poorer for good -- and the application stalls when it runs out.
+                    VkReleaseSwapchainImagesInfoEXT rel{
+                        VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_EXT };
+                    rel.swapchain = swapchain;
+                    rel.imageIndexCount = 1;
+                    rel.pImageIndices = &index;
+                    dc->vkReleaseSwapchainImagesEXT(dc->self, &rel);
+                } else {
+                    // Nothing here can give it back, so presenting it is the only way to return it.
+                    // Its contents are undefined, so this shows one bad frame -- once, because the
+                    // repaint gives up on this swapchain afterwards.
+                    VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+                    pi.swapchainCount = 1;
+                    pi.pSwapchains = &swapchain;
+                    pi.pImageIndices = &index;
+                    dc->vkQueuePresentKHR(sc->queue, &pi);
+                    Log("[layer] idle repaint: composition declined and this device cannot release "
+                        "an image; not repainting again");
+                    break;
+                }
+            }
+        });
+    }
     return VK_SUCCESS;
 }
 
@@ -819,6 +1017,11 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
         if (it != g_devices.end()) { dc = it->second; g_devices.erase(it); }
     }
     if (!dc) return;
+    // Before anything it touches is destroyed, and outside the lock it takes.
+    if (dc->repaintThread.joinable()) {
+        dc->repaintRun.store(false);
+        dc->repaintThread.join();
+    }
     {
         std::lock_guard<std::mutex> lk(dc->lock);
         for (auto& kv : dc->swapchains) ReleasePrimary(device, kv.first);
@@ -837,6 +1040,8 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
             sc.comp.reset();
             if (sc.fenceLeg1) dc->vkDestroyFence(device, sc.fenceLeg1, nullptr);
             if (sc.fenceLeg2) dc->vkDestroyFence(device, sc.fenceLeg2, nullptr);
+            if (sc.repaintFence) dc->vkDestroyFence(device, sc.repaintFence, nullptr);
+        if (sc.repaintFence) dc->vkDestroyFence(device, sc.repaintFence, nullptr);
             if (sc.pool) dc->vkDestroyCommandPool(device, sc.pool, nullptr);
         }
         dc->swapchains.clear();
@@ -971,6 +1176,7 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(VkDevice device,
         sc.comp.reset();
         if (sc.fenceLeg1) dc->vkDestroyFence(device, sc.fenceLeg1, nullptr);
         if (sc.fenceLeg2) dc->vkDestroyFence(device, sc.fenceLeg2, nullptr);
+        if (sc.repaintFence) dc->vkDestroyFence(device, sc.repaintFence, nullptr);
         if (sc.pool) dc->vkDestroyCommandPool(device, sc.pool, nullptr);
         dc->swapchains.erase(it);
     }
@@ -1287,6 +1493,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         }
     }
     if (!dc || !dc->vkQueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
+    dc->lastPresentMs.store(NowMs(), std::memory_order_relaxed);
 
     // Whether this call's wait semaphores have already been consumed by a submit of ours. They are
     // handed to the first swapchain we actually process; every path after that presents with none,
@@ -1309,6 +1516,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             if (sc.passThrough || pPresentInfo->pImageIndices[i] >= sc.images.size()) continue;
             // One swapchain drives the channel; the rest present raw. See ClaimPrimary.
             if (!ClaimPrimary(dc->self, pPresentInfo->pSwapchains[i], sc.width, sc.height)) continue;
+            // Which queue this swapchain is presented on, and that it was presented at all. The
+            // repaint needs both: one to submit on, the other to know it should keep out of the way.
+            sc.queue = queue;
             if (!sc.ready && !dc->shm.dead) {
                 if (!CreateResources(dc, sc, family)) {
                     Log("[layer] staging resources failed for swapchain %p (%ux%u, family %u); "
@@ -1351,6 +1561,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         }
     }
 
+    // Under the device lock, because the idle repaint presents to the same swapchain from a thread
+    // of its own and host access to a swapchain has to be externally synchronised. It costs nothing
+    // here: the repaint only ever runs while this hook has not been called for a quarter of a second.
+    std::lock_guard<std::mutex> present(dc->lock);
     if (!waitsConsumed) return dc->vkQueuePresentKHR(queue, pPresentInfo);
 
     // pNext is carried through untouched: present ids, present timing and the rest belong to the
