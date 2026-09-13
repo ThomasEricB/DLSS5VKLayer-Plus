@@ -823,6 +823,12 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
         std::lock_guard<std::mutex> lk(dc->lock);
         for (auto& kv : dc->swapchains) ReleasePrimary(device, kv.first);
     }
+    // Say the layer has gone. A reader that finds a pid here checks it is alive, so a crash is
+    // caught too, but an orderly exit should not need anyone to go looking.
+    if (dc->shm.hdr && dc->shm.hdr->layerPid.load() == uint32_t(getpid())) {
+        dc->shm.hdr->layerPid.store(0);
+        dc->shm.hdr->layerCompositionUp.store(0);
+    }
     if (dc->vkDeviceWaitIdle) dc->vkDeviceWaitIdle(device);
     {
         std::lock_guard<std::mutex> lk(dc->lock);
@@ -1250,6 +1256,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         dc->shm.hdr->layerHeight.store(sc.height);
         dc->shm.hdr->layerFormat.store(uint32_t(sc.format));
         dc->shm.hdr->layerCompositionUp.store(1);
+        dc->shm.hdr->layerPid.store(uint32_t(getpid()));
         dc->shm.hdr->layerMsBits.store(FloatToBits(float(tReturn - t0)));
         dc->shm.hdr->layerMeasuredWhiteBits.store(FloatToBits(sc.comp->MeasuredWhitePoint()));
         dc->shm.hdr->layerHeartbeat.fetch_add(1);

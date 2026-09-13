@@ -346,7 +346,19 @@ struct ShmHeader {
     std::atomic<uint32_t> helperPassCeiling;  // what the VRAM budget currently allows
 
     // --- status, written by the layer ---------------------------------------------------------
-    std::atomic<uint32_t> layerAttached;
+    // The pid of the process the layer is loaded into, or 0 when no layer is attached.
+    //
+    // This field was declared and never written, and that gap is why a paused video read as nothing
+    // running at all: the only evidence of a layer was its frame counter, so "is a layer attached"
+    // and "is it drawing right now" were the same question. They are not. A video that is paused, a
+    // window that is occluded and a game that has exited all present no frames, and only the last of
+    // them means there is nothing there.
+    //
+    // A pid rather than a flag, because a flag cannot survive the process that set it. Nothing clears
+    // this when a game crashes, so a reader checks the pid is still alive rather than trusting the
+    // value. Same width as the flag it replaces, so the layout and the protocol version are
+    // unchanged; an older layer simply leaves it zero, which reads as "no layer" exactly as before.
+    std::atomic<uint32_t> layerPid;
     std::atomic<uint32_t> layerFramesLo;
     std::atomic<uint32_t> layerFramesHi;
     std::atomic<uint32_t> layerWidth;

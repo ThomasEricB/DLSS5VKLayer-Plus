@@ -1,4 +1,6 @@
 #include "mainwindow.h"
+
+#include <csignal>
 #include "passdialog.h"
 #include "../common/runner_discovery.h"
 #include "shm_binder.h"
@@ -1141,6 +1143,7 @@ void MainWindow::updateStatus() {
 
     QString state = "shared memory not attached";
     bool active = false;
+    bool idle = false;
     if (hdr && !mismatch) {
         static const char* kStates[] = { "starting", "no Vulkan device", "no NGX binaries",
                                          "the model would not start", "running", "stopped" };
@@ -1150,15 +1153,29 @@ void MainWindow::updateStatus() {
             ShmLoadString(hdr->helperReasonSeq, hdr->helperReason, kReasonBytes));
         if (!why.isEmpty()) state += " -- " + why;
 
-        // Active means a game is presenting through the layer right now: the composition is up and
-        // the frame counter moved since the last poll. A counter that only ever grows would say
-        // Active forever after one frame; movement is the point.
+        // Three states, because there are three things that can be true.
         //
-        // The first poll seeds the counter rather than judging it. Measured against the zero it was
-        // initialised to, any frame the layer had ever presented before this window opened read as
-        // motion, so the interface opened claiming Active and corrected itself a second later.
+        // Active means frames are moving through the layer right now: the composition is up and the
+        // counter changed since the last poll. A counter that only ever grows would say Active
+        // forever after one frame; movement is the point. The first poll seeds the counter rather
+        // than judging it -- measured against the zero it was initialised to, any frame the layer had
+        // ever presented before this window opened read as motion, so the interface opened claiming
+        // Active and corrected itself a second later.
+        //
+        // Idle is the state that was missing, and its absence is why pausing a video read as nothing
+        // running. A paused player presents no frames, and neither does an occluded window or one
+        // that has been alt-tabbed away from; the layer is still loaded, still attached, still ready
+        // to compose the moment a frame arrives. Calling that Inactive was answering a question
+        // nobody asked -- it reported whether anything was being drawn, under a label that reads as
+        // whether anything is set up.
+        //
+        // Told apart by the pid the layer publishes, checked rather than believed: nothing clears it
+        // when a game crashes, so a pid that names no living process means the layer is gone.
         const quint64 frames = ShmLoad64(hdr->layerFramesLo, hdr->layerFramesHi);
-        active = !firstPoll && hdr->layerCompositionUp.load() && frames != lastFrames;
+        const uint32_t layerPid = hdr->layerPid.load();
+        const bool layerAlive = layerPid != 0 && ::kill(pid_t(layerPid), 0) == 0;
+        idle = layerAlive && hdr->layerCompositionUp.load();
+        active = !firstPoll && idle && frames != lastFrames;
         lastFrames = frames;
         firstPoll = false;
     }
@@ -1171,8 +1188,12 @@ void MainWindow::updateStatus() {
         return;  // do not save into a mapping the other side keeps resetting
     }
 
-    const QString dot = active ? QString("<span style=\"color:#43a047;\">&#9679; Active</span>")
-                               : QString("<span style=\"color:#9e9e9e;\">&#9675; Inactive</span>");
+    const QString dot =
+        active ? QString("<span style=\"color:#43a047;\">&#9679; Active</span>")
+               : idle ? QString("<span style=\"color:#fb8c00;\">&#9679; Idle</span>"
+                                "<span style=\"color:#9e9e9e;\"> &mdash; attached, no frames "
+                                "(paused or in the background)</span>")
+                      : QString("<span style=\"color:#9e9e9e;\">&#9675; Inactive</span>");
     statusLabel->setText(QString("Helper: %1&nbsp;&nbsp;&nbsp;%2").arg(state.toHtmlEscaped(), dot));
 
     saveSettingsIfChanged();

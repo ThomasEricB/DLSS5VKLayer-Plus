@@ -175,7 +175,8 @@ void PrintStatus(const ShmHeader* h) {
     std::printf("helper_state=%u\nmodel_up=%u\nhelper_frames=%llu\n", h->helperState.load(),
                 h->modelUp.load(),
                 (unsigned long long) ShmLoad64(h->helperFramesLo, h->helperFramesHi));
-    std::printf("layer_composition_up=%u\nlayer_frames=%llu\nlayer_ms=%.2f\n",
+    std::printf("layer_pid=%u\nlayer_composition_up=%u\nlayer_frames=%llu\nlayer_ms=%.2f\n",
+                h->layerPid.load(),
                 h->layerCompositionUp.load(),
                 (unsigned long long) ShmLoad64(h->layerFramesLo, h->layerFramesHi),
                 double(BitsToFloat(h->layerMsBits.load())));
