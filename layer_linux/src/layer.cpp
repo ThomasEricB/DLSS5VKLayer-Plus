@@ -515,6 +515,12 @@ struct DeviceChain {
     // Hook_CreateDevice.
     std::thread repaintThread;
     std::atomic<bool> repaintRun{true};
+    // Raised by the swapchain lifecycle, which cannot decline to take the lock the way a present
+    // can. Creating or destroying a swapchain -- which is what going fullscreen does -- has to wait
+    // for whoever holds it, and the repaint can be holding it across a transport rebuild, and that
+    // rebuild waits for the device to go idle. The same cycle the present path had, on a path that
+    // has no fail-open answer. So the repaint stands aside the moment this is up.
+    std::atomic<bool> lifecycleWaiting{false};
     std::atomic<double> lastPresentMs{0.0};
     uint32_t repaintSeenCtrl = 0;
     uint32_t repaintSeenTuning = 0;
@@ -945,8 +951,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                 // and under FIFO that call blocks until the display is ready -- a thread parked
                 // there could not be joined when the device is destroyed. A held lock means the
                 // application is presenting, which is when a repaint has no business running.
+                if (dc->lifecycleWaiting.load(std::memory_order_relaxed)) continue;
                 std::unique_lock<std::mutex> lk(dc->lock, std::try_to_lock);
                 if (!lk.owns_lock()) continue;
+                // Checked again with the lock in hand: a swapchain being created or destroyed cannot
+                // fail open the way a present can, so it must never find this thread in the middle of
+                // a compose.
+                if (dc->lifecycleWaiting.load(std::memory_order_relaxed)) continue;
                 if (!dc->repaintRun.load(std::memory_order_relaxed)) break;
 
                 // Switching the effect off is itself something to answer: the composed result is
@@ -1203,6 +1214,13 @@ static uint32_t DetectHdrKind(VkFormat f, VkColorSpaceKHR cs) {
     return kHdrNone;
 }
 
+// Announces itself before it blocks, so the repaint can get out of the way. See lifecycleWaiting.
+struct LifecycleGuard {
+    DeviceChain* dc;
+    explicit LifecycleGuard(DeviceChain* d) : dc(d) { if (dc) dc->lifecycleWaiting.store(true); }
+    ~LifecycleGuard() { if (dc) dc->lifecycleWaiting.store(false); }
+};
+
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
     VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
     const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain) {
@@ -1235,6 +1253,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
     const bool tooSmall = sc.width < kMinW || sc.height < kMinH;
     sc.passThrough = !SupportedFormat(sc.format) || sc.width > kMaxW || sc.height > kMaxH || tooSmall;
 
+    LifecycleGuard lifecycle(dc);
     std::lock_guard<std::mutex> lk(dc->lock);
     Log("[layer] swapchain %p %ux%u fmt=%d hdr=%u passThrough=%d%s", (void*)*pSwapchain,
         pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
@@ -1255,6 +1274,7 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(VkDevice device,
     }
     if (!dc) return;
     ReleasePrimary(device, swapchain);
+    LifecycleGuard lifecycle(dc);
     std::unique_lock<std::mutex> lk(dc->lock);
     auto it = dc->swapchains.find(swapchain);
     if (it != dc->swapchains.end()) {
