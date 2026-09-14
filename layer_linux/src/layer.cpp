@@ -465,6 +465,10 @@ struct SwapchainState {
     // the one the application itself uses.
     VkQueue queue = VK_NULL_HANDLE;
     VkFence repaintFence = VK_NULL_HANDLE;
+    // The repaint gave up on this swapchain. Its own switch, not passThrough: passThrough turns the
+    // layer off for the swapchain entirely, so using it here stopped the composition for good over a
+    // convenience that had merely run out of road.
+    bool repaintOff = false;
     VkFormat format = VK_FORMAT_UNDEFINED;
     // HdrKind: what this swapchain's format and colour space say the frame carries. The float
     // swapchain holds linear light; a 10-bit one with a PQ colour space holds ST 2084 code.
@@ -982,7 +986,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                     swapchain = kv.first;
                     break;
                 }
-                if (!sc || !sc->ready || !sc->comp || !sc->queue || sc->passThrough) continue;
+                if (!sc || !sc->ready || !sc->comp || !sc->queue || sc->passThrough ||
+                    sc->repaintOff) continue;
                 // Nothing captured means nothing to compose again, and an image taken now would be
                 // an image taken for nothing.
                 if (!sc->comp->HasCapturedFrame()) continue;
@@ -1005,8 +1010,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                         continue;
                 }
                 uint32_t index = 0;
+                // Long enough for a window nobody is looking at, short enough not to be felt.
+                //
+                // An image is released when the presentation engine finishes displaying one, and a
+                // window that is occluded or behind another is composited rarely -- so fifty
+                // milliseconds asks at an instant of this thread's choosing and gives up, which is
+                // the case this feature exists for. Waiting is safe now that the application's
+                // present no longer waits for this lock but passes the frame through instead; the
+                // cost is no longer a stall but the compositions missed while it waits, so an
+                // application resuming mid-acquire goes unedited for this long and no longer.
                 const VkResult acq = dc->vkAcquireNextImageKHR(dc->self, swapchain,
-                                                               50ull * 1000ull * 1000ull,
+                                                               150ull * 1000ull * 1000ull,
                                                                VK_NULL_HANDLE, sc->repaintFence,
                                                                &index);
                 if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
@@ -1027,8 +1041,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                     Log("[layer] idle repaint: the acquired image never became ready; giving up on "
                         "this swapchain rather than presenting an image that is not ready");
                     sc->repaintFence = VK_NULL_HANDLE;   // leaked deliberately; it is still in use
-                    sc->passThrough = true;
-                    break;
+                    sc->repaintOff = true;
+                    continue;
                 }
                 dc->vkResetFences(dc->self, 1, &sc->repaintFence);
                 if (index >= sc->images.size()) {
