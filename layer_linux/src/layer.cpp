@@ -448,7 +448,7 @@ struct InstanceChain {
 
 #define DEVICE_FN_LIST(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkGetDeviceQueue2) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) \
-    X(vkGetSwapchainImagesKHR) X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkCreateCommandPool) \
+    X(vkGetSwapchainImagesKHR) X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkQueueSubmit2) X(vkCreateCommandPool) \
     X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) \
@@ -1611,7 +1611,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
-                                                           const VkPresentInfoKHR* pPresentInfo) {
+                                                            const VkPresentInfoKHR* pPresentInfo) {
     DeviceChain* dc = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_stateMutex);
@@ -1633,29 +1633,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
     // overlay among them, turns from a latent bug into a hang.
     bool waitsConsumed = false;
 
-    // Held from here to the present at the end, so the repaint cannot be acquiring or presenting on
-    // the same swapchain at the same time. Empty when the layer is doing nothing this frame.
+    // Held from here to the present at the end, alongside Hook_QueueSubmit{,2}. Vulkan requires
+    // external synchronization for every operation on a queue; the repaint uses the application's
+    // queue, so its acquire/submit/present must not overlap Dolphin's GPU submission thread.
     std::unique_lock<std::mutex> lk;
     if (!dc->inert && LayerEnabled()) {
-        // Tried, never waited for, and the difference is a frozen picture.
-        //
-        // The repaint holds this lock for a whole compose, and a compose can rebuild the transport,
-        // and that rebuild calls vkDeviceWaitIdle -- which waits for work this thread has in flight.
-        // Waiting here for the repaint to finish therefore closed a cycle: the repaint waited for the
-        // device to go idle, the device could not go idle until this thread presented, and this
-        // thread was waiting for the repaint. mpv froze with its audio still playing.
-        //
-        // Exclusion is what the lock is for and try_lock still provides it. What it gives up is the
-        // composition on the rare frame that collides with a repaint -- and the layer's answer to
-        // anything it cannot do this frame has always been to present the frame unchanged.
-        lk = std::unique_lock<std::mutex>(dc->lock, std::try_to_lock);
-        if (!lk.owns_lock()) {
-            static std::atomic<uint32_t> n{0};
-            const uint32_t k = n.fetch_add(1);
-            if (k < 3 || k == 100 || k == 1000)
-                Log("[layer] present: device busy, passing through (%u)", k + 1);
-            return dc->vkQueuePresentKHR(queue, pPresentInfo);
-        }
+        lk = std::unique_lock<std::mutex>(dc->lock);
         PollHotkeys(dc);
         if (!ShmNeuralEnabled(dc->shm)) return dc->vkQueuePresentKHR(queue, pPresentInfo);
         uint32_t family = 0;
@@ -1727,6 +1710,46 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
     return dc->vkQueuePresentKHR(queue, &pi);
 }
 
+static DeviceChain* DeviceForQueue(VkQueue queue) {
+    std::lock_guard<std::mutex> lk(g_stateMutex);
+    if (g_devices.size() == 1) return g_devices.begin()->second;
+    for (auto& kv : g_devices) {
+        std::lock_guard<std::mutex> dl(kv.second->lock);
+        if (kv.second->queueFamilies.count(queue)) return kv.second;
+    }
+    return nullptr;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit(VkQueue queue, uint32_t submitCount,
+                                                        const VkSubmitInfo* pSubmits, VkFence fence) {
+    DeviceChain* dc = DeviceForQueue(queue);
+    if (!dc || !dc->vkQueueSubmit) return VK_ERROR_INITIALIZATION_FAILED;
+    std::lock_guard<std::mutex> lk(dc->lock);
+    return dc->vkQueueSubmit(queue, submitCount, pSubmits, fence);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit2(VkQueue queue, uint32_t submitCount,
+                                                         const VkSubmitInfo2* pSubmits, VkFence fence) {
+    DeviceChain* dc = DeviceForQueue(queue);
+    if (!dc || !dc->vkQueueSubmit2) return VK_ERROR_INITIALIZATION_FAILED;
+    std::lock_guard<std::mutex> lk(dc->lock);
+    return dc->vkQueueSubmit2(queue, submitCount, pSubmits, fence);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
+                                                                uint64_t timeout, VkSemaphore semaphore,
+                                                                VkFence fence, uint32_t* pImageIndex) {
+    DeviceChain* dc = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMutex);
+        auto it = g_devices.find(device);
+        if (it != g_devices.end()) dc = it->second;
+    }
+    if (!dc || !dc->vkAcquireNextImageKHR) return VK_ERROR_INITIALIZATION_FAILED;
+    std::lock_guard<std::mutex> lk(dc->lock);
+    return dc->vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+}
+
 // ---------------------------------------------------------------------------
 // Loader entry points
 // ---------------------------------------------------------------------------
@@ -1740,6 +1763,9 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
     if (!std::strcmp(n, "vkGetDeviceQueue2")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue2;
     if (!std::strcmp(n, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction)Hook_CreateSwapchainKHR;
     if (!std::strcmp(n, "vkDestroySwapchainKHR")) return (PFN_vkVoidFunction)Hook_DestroySwapchainKHR;
+    if (!std::strcmp(n, "vkAcquireNextImageKHR")) return (PFN_vkVoidFunction)Hook_AcquireNextImageKHR;
+    if (!std::strcmp(n, "vkQueueSubmit")) return (PFN_vkVoidFunction)Hook_QueueSubmit;
+    if (!std::strcmp(n, "vkQueueSubmit2")) return (PFN_vkVoidFunction)Hook_QueueSubmit2;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
     return nullptr;
 }
@@ -1750,6 +1776,9 @@ static PFN_vkVoidFunction LookupDeviceHook(const char* n) {
     if (!std::strcmp(n, "vkGetDeviceQueue2")) return (PFN_vkVoidFunction)Hook_GetDeviceQueue2;
     if (!std::strcmp(n, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction)Hook_CreateSwapchainKHR;
     if (!std::strcmp(n, "vkDestroySwapchainKHR")) return (PFN_vkVoidFunction)Hook_DestroySwapchainKHR;
+    if (!std::strcmp(n, "vkAcquireNextImageKHR")) return (PFN_vkVoidFunction)Hook_AcquireNextImageKHR;
+    if (!std::strcmp(n, "vkQueueSubmit")) return (PFN_vkVoidFunction)Hook_QueueSubmit;
+    if (!std::strcmp(n, "vkQueueSubmit2")) return (PFN_vkVoidFunction)Hook_QueueSubmit2;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
     return nullptr;
 }

@@ -35,6 +35,7 @@ namespace dlssnr {
     X(vkGetSwapchainImagesKHR)                                                                     \
     X(vkQueuePresentKHR)                                                                           \
     X(vkQueueSubmit)                                                                               \
+    X(vkQueueSubmit2)                                                                              \
     X(vkQueueWaitIdle)                                                                             \
     X(vkCreateCommandPool)                                                                         \
     X(vkDestroyCommandPool)                                                                        \
