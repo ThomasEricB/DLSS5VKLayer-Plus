@@ -22,6 +22,14 @@ SHM_FILE="$RUNTIME_DIR/shm.bin"
 LOG_FILE="$STATE_DIR/helper.log"
 DXVK_CONFIG_FILE="$STATE_DIR/dxvk.conf"
 
+# These are open-source runtime components, not NVIDIA NGX binaries. Keep the versions pinned so a
+# future upstream release cannot silently change the helper's runtime ABI; update the digests when
+# deliberately changing either version.
+DXVK_VERSION="3.1"
+DXVK_SHA256="30f9cc326874be344285582275446968cfa4c069db31ce56df312d6644179154"
+DXVK_NVAPI_VERSION="0.9.2"
+DXVK_NVAPI_SHA256="60c284223530d643c446c263f1e1a96c6de7b5ff21796219646da734d97a70d6"
+
 runner_type=""
 runner_path=""
 binaries=""
@@ -188,6 +196,102 @@ detect_dxvk_dll() {
     fi
   done
   return 1
+}
+
+# Proton ships the two DLLs needed for DXVK-NVAPI in separate subdirectories. They are
+# open-source runner components, unlike the NVIDIA NGX binaries, and are safe to copy into
+# the managed system-Wine prefix.
+detect_runner_dll() {
+  local name="$1" proton root c
+  proton="$(detect_proton || true)"
+  if [ -n "$proton" ]; then
+    root="$(dirname "$proton")"
+    for c in "$root/files/lib/wine/dxvk/x86_64-windows/$name" \
+             "$root/files/lib/wine/nvapi/x86_64-windows/$name"; do
+      [ -f "$c" ] && { readlink -f "$c"; return 0; }
+    done
+  fi
+  return 1
+}
+
+download_runtime_dll() {
+  local name="$1" url archive digest member tmp archive_path extracted target actual
+  case "$name" in
+    dxgi.dll)
+      archive="dxvk-${DXVK_VERSION}.tar.gz"
+      url="https://github.com/doitsujin/dxvk/releases/download/v${DXVK_VERSION}/${archive}"
+      digest="$DXVK_SHA256"
+      member="dxvk-${DXVK_VERSION}/x64/dxgi.dll"
+      ;;
+    nvapi64.dll)
+      archive="dxvk-nvapi-v${DXVK_NVAPI_VERSION}.tar.gz"
+      url="https://github.com/jp7677/dxvk-nvapi/releases/download/v${DXVK_NVAPI_VERSION}/${archive}"
+      digest="$DXVK_NVAPI_SHA256"
+      member="./x64/nvapi64.dll"
+      ;;
+    *) return 1 ;;
+  esac
+
+  target="$DATA_DIR/binaries/$name"
+  [ -f "$target" ] && return 0
+  if [ "${DLSSNR_AUTO_DOWNLOAD:-1}" = "0" ]; then
+    echo "automatic download disabled; supply $name in $DATA_DIR/binaries" >&2
+    return 1
+  fi
+  if ! command -v sha256sum >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+    echo "error: sha256sum and tar are required to download $name safely" >&2
+    return 1
+  fi
+
+  tmp="$(mktemp -d "$STATE_DIR/dxvk-download.XXXXXX")" || return 1
+  archive_path="$tmp/$archive"
+  extracted="$tmp/$name"
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --silent --show-error --retry 2 --output "$archive_path" "$url" || {
+      rm -rf "$tmp"; return 1;
+    }
+  elif command -v wget >/dev/null 2>&1; then
+    wget --quiet --output-document="$archive_path" "$url" || {
+      rm -rf "$tmp"; return 1;
+    }
+  else
+    echo "error: curl or wget is required to download $name" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  actual="$(sha256sum "$archive_path" | awk '{print $1}')"
+  if [ "$actual" != "$digest" ]; then
+    echo "error: checksum mismatch for $archive" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! tar -xOf "$archive_path" "$member" > "$extracted"; then
+    echo "error: $name was not found in $archive" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  mkdir -p "$DATA_DIR/binaries"
+  mv "$extracted" "$target"
+  chmod 644 "$target"
+  rm -rf "$tmp"
+  echo "downloaded $name to $target" >&2
+}
+
+install_wine_runtime_dll() {
+  local name="$1" source target
+  target="$WINE_PREFIX_DIR/drive_c/windows/system32/$name"
+
+  source=""
+  for source_candidate in "$binaries/$name" "$DATA_DIR/binaries/$name"; do
+    if [ -f "$source_candidate" ]; then source="$source_candidate"; break; fi
+  done
+  if [ -z "$source" ]; then source="$(detect_runner_dll "$name" || true)"; fi
+  if [ -z "$source" ]; then
+    download_runtime_dll "$name" || return 1
+    source="$DATA_DIR/binaries/$name"
+  fi
+  cp "$source" "$target"
+  return 0
 }
 
 detect_binaries() {
@@ -433,7 +537,7 @@ EOF
 setup_prefix() {
   ensure_dirs
   set_prefix_dirs
-  local wine dll
+  local wine dll target
   if [ "$runner_type" = "wine" ]; then
     wine="$runner_path"
   else
@@ -459,6 +563,16 @@ setup_prefix() {
   else
     echo "warning: vendored DXVK vulkan-1.dll not found" >&2
   fi
+
+  # A system-Wine helper has no Proton prefix to provide NVAPI. DXVK-NVAPI needs
+  # DXVK's dxgi.dll to discover the Vulkan device. Prefer user/runner files, then
+  # download verified open-source releases into the user binaries directory.
+  target="$WINE_PREFIX_DIR/drive_c/windows/system32"
+  mkdir -p "$target"
+  install_wine_runtime_dll nvapi64.dll ||
+    echo "warning: unable to provide nvapi64.dll; Feature 18 may not initialize" >&2
+  install_wine_runtime_dll dxgi.dll ||
+    echo "warning: unable to provide dxgi.dll; DXVK-NVAPI cannot discover the Vulkan device" >&2
 }
 
 helper_pids() {
@@ -525,6 +639,10 @@ cmd_start() {
   helper_dir="$(dirname "$helper")"
 
   if [ "$runner_type" = "wine" ]; then
+    if [ -z "$binaries" ]; then
+      binaries="$(detect_binaries)"
+      write_config
+    fi
     setup_prefix || return 1
   fi
 
@@ -593,7 +711,9 @@ cmd_start() {
     fi
   fi
   if [ "$runner_type" = "wine" ]; then
-    export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-vulkan-1=n,b}"
+    export DXVK_ENABLE_NVAPI=1
+    unset DLSSNR_SKIP_NVAPI
+    export WINEDLLOVERRIDES="vulkan-1=n,b;nvapi64=n,b;dxgi=n,b;d3d11=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
   fi
 
   local -a cmd
@@ -820,7 +940,7 @@ cmd_runners() {
 cmd_doctor() {
   ensure_dirs
   load_config
-  local ok=0 helper dll det_runner_type det_runner_path det_binaries det_prefix
+  local ok=0 helper dll nvapi dxgi det_runner_type det_runner_path det_binaries det_prefix
   helper="$(detect_helper_exe || true)"
   dll="$(detect_dxvk_dll || true)"
   det_runner_type="$runner_type"
@@ -850,6 +970,9 @@ cmd_doctor() {
   else
     det_prefix="$PREFIX_DIR/wine"
   fi
+
+  nvapi="$(detect_runner_dll nvapi64.dll || true)"
+  dxgi="$(detect_runner_dll dxgi.dll || true)"
 
   printf 'config: %s\n' "$CONFIG_FILE"
   if [ -f "$CONFIG_FILE" ]; then echo "  ok"; else echo "  missing"; ok=1; fi
@@ -892,6 +1015,19 @@ cmd_doctor() {
     echo "  nvapi64.dll: ok"
   else
     echo "  nvapi64.dll: warning -- missing (optional under Proton; DXVK-NVAPI supplies NVAPI)"
+  fi
+  if [ "$det_runner_type" = "wine" ]; then
+    if [ -z "$nvapi" ] && [ -f "$det_binaries/nvapi64.dll" ]; then nvapi="$det_binaries/nvapi64.dll"; fi
+    if [ -z "$dxgi" ] && [ -f "$det_binaries/dxgi.dll" ]; then dxgi="$det_binaries/dxgi.dll"; fi
+    if [ -z "$nvapi" ] && [ -f "$DATA_DIR/binaries/nvapi64.dll" ]; then nvapi="$DATA_DIR/binaries/nvapi64.dll"; fi
+    if [ -z "$dxgi" ] && [ -f "$DATA_DIR/binaries/dxgi.dll" ]; then dxgi="$DATA_DIR/binaries/dxgi.dll"; fi
+    printf 'wine DXVK-NVAPI nvapi64.dll: %s\n' "${nvapi:-missing (downloaded on start)}"
+    printf 'wine DXVK dxgi.dll: %s\n' "${dxgi:-missing (downloaded on start)}"
+    if [ -n "$nvapi" ] && [ -n "$dxgi" ]; then
+      echo "  ok"
+    else
+      echo "  will be downloaded from official upstream releases on Wine start"
+    fi
   fi
 
   printf 'runtime dir: %s\n' "$RUNTIME_DIR"

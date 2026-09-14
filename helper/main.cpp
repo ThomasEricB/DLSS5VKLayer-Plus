@@ -2199,14 +2199,11 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     // Depth stays zero: a present-time layer has none, and the model treats a flat depth buffer as
     // "no parallax to reason about" rather than as a lie about the scene.
     //
-    // Motion is a different matter. It used to be zero for the same reason, which is what made the
-    // pass weaker in motion than OptiScaler's -- the model judged every frame on its own with no
-    // idea what had moved. It is now estimated here instead, with the optical-flow engine, from the
-    // two frames the helper has anyway. bmitch87's work; DLSSNR_MVEC=0 turns it off.
-    const char* mvecMode = getenv("DLSSNR_MVEC");
-    const bool wantFlow = ns.mvecEnabled != 0 && !(mvecMode && !_stricmp(mvecMode, "0"));
-    if (wantFlow && !SetupOpticalFlow(ns.vk, ns, w, h, ns.mvecQuality))
-        Log("[helper] estimated motion vectors unavailable; falling back to a zero field");
+    // Motion is initialized after the first successful model frame. Some games create transient
+    // probe swapchains during startup; creating an NVOF session for those rasters can race the
+    // game's own Vulkan initialization on Proton-GE. The first frame already has a valid zero field,
+    // and ProcessFrame enables NVOF on the following frame once this raster has proved stable.
+    ns.flow.attemptedQuality = UINT32_MAX;
 
     std::vector<uint8_t> zeros(size_t(w) * h * 4, 0);
     if (!UploadPixels(ns.vk, ns.mv, zeros.data(), zeros.size()) ||
@@ -2558,7 +2555,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     }
     if (mvecJustEnabled) {
         if (ReactivateMotionVectors(ns, w, h, ns.mvecQuality) < 0) return false;
-    } else if (ns.mvecEnabled && !ns.flow.enabled &&
+    } else if (ns.mvecEnabled && !ns.firstFrame && !ns.flow.enabled &&
                (ns.flow.userDisabled || ns.flow.attemptedQuality != ns.mvecQuality)) {
         ns.flow.userDisabled = false;
         if (!SetupOpticalFlow(ns.vk, ns, w, h, ns.mvecQuality)) {
@@ -2779,6 +2776,10 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
 }
 
 int main() {
+    // Wine delivers OutputDebugString through a debug-print exception. Install the
+    // filter before the first log call so that exception can never reach an older or
+    // runner-installed handler while the helper is starting.
+    InstallGuard();
     Log("=== dlssnr_helper starting ===");
     char exePath[MAX_PATH];
     if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) > 0) {
@@ -2789,7 +2790,6 @@ int main() {
             SetCurrentDirectoryA(dir.c_str());
         }
     }
-    InstallGuard();
     g_layerModule = GetModuleHandleW(nullptr);
 
     ShmMap shm{};

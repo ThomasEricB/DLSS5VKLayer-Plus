@@ -42,7 +42,17 @@ This project is experimental. It is intended for local testing and research.
   - a custom Steam compatibility tool that bundles DXVK-NVAPI, such as Proton-CachyOS or Proton-GE
   - system Wine for the fallback path
 
-Valve's official Proton releases and Proton Experimental are not targeted as primary runners because they do not bundle the required DXVK-NVAPI stack.
+Valve's official Proton releases and Proton Experimental are not targeted as primary runners because they do not bundle the required DXVK-NVAPI stack. System Wine can obtain the open-source runtime DLLs automatically.
+
+## Wine Runtime DLLs
+
+The system-Wine path needs `dxgi.dll` from DXVK and `nvapi64.dll` from DXVK-NVAPI. The helper resolves them in this order:
+
+1. Existing files in the configured binaries folder (`$XDG_DATA_HOME/dlssnr/binaries` by default).
+2. An installed compatible Proton tool.
+3. Pinned releases downloaded from the official DXVK and DXVK-NVAPI GitHub projects, with SHA256 verification.
+
+Downloaded files are cached in `$XDG_DATA_HOME/dlssnr/binaries` and are not NVIDIA NGX files. Set `DLSSNR_AUTO_DOWNLOAD=0` to require users to provide them manually. The upstream projects' licenses apply to these components; the project does not redistribute them in its packages.
 
 ## NVIDIA NGX DLLs
 

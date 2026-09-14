@@ -23,6 +23,7 @@ Eric, for the respective changes.
 | [xenmods/DLSSNR-Cost-Scaler](https://github.com/xenmods/DLSSNR-Cost-Scaler) | MIT | The native + edit enlargement technique only. No code was copied. |
 | [vkBasalt](https://github.com/DadSchoorse/vkBasalt) | zlib | Consulted for layer-structure and input-handling ideas. No vkBasalt code is identified in this repository. |
 | [DXVK](https://github.com/doitsujin/dxvk) | zlib | Vendored runtime `third_party/dxvk/2.7.1/x64/vulkan-1.dll`; its license is shipped as `third_party/dxvk/2.7.1/LICENSE.txt` and included in packages. |
+| [DXVK-NVAPI](https://github.com/jp7677/dxvk-nvapi) | MIT | The Wine runtime may download its unmodified `x64/nvapi64.dll` release asset at runtime; it is not bundled in this repository or packages. |
 | [Khronos Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | Apache-2.0 / applicable header notices | Vendored Vulkan and video headers under `standalone_runner/third_party/`; the headers retain their Khronos copyright and SPDX notices. |
 | [stb](https://github.com/nothings/stb) | Public domain / applicable embedded notice | Vendored `stb_image.h` and `stb_image_write.h`; their author and license notices remain in the headers. |
 
@@ -73,4 +74,5 @@ changes the layout, that file stops compiling on purpose.
 The copied or adapted OptiScaler and DLSS-NR portions are GPL-3.0. Distribution of a combined
 derivative must comply with GPL-3.0 for those portions and preserve all applicable third-party
 notices. RenoDX and DLSSNR-Cost-Scaler contributions are MIT; vkBasalt is zlib; Vulkan-Headers and
-stb have the notices described above; and DXVK's license is shipped with its binary.
+stb have the notices described above; and DXVK's license is shipped with its binary. DXVK-NVAPI is
+downloaded only as an unmodified upstream runtime and remains under its MIT license.
