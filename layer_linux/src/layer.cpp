@@ -448,7 +448,7 @@ struct InstanceChain {
 
 #define DEVICE_FN_LIST(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkGetDeviceQueue2) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) \
-    X(vkGetSwapchainImagesKHR) X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkQueueSubmit2) X(vkCreateCommandPool) \
+    X(vkGetSwapchainImagesKHR) X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkQueueSubmit2) X(vkQueueWaitIdle) X(vkCreateCommandPool) \
     X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) \
@@ -1736,6 +1736,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit2(VkQueue queue, uint32_t 
     return dc->vkQueueSubmit2(queue, submitCount, pSubmits, fence);
 }
 
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueWaitIdle(VkQueue queue) {
+    DeviceChain* dc = DeviceForQueue(queue);
+    if (!dc || !dc->vkQueueWaitIdle) return VK_ERROR_INITIALIZATION_FAILED;
+    std::lock_guard<std::mutex> lk(dc->lock);
+    return dc->vkQueueWaitIdle(queue);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
                                                                 uint64_t timeout, VkSemaphore semaphore,
                                                                 VkFence fence, uint32_t* pImageIndex) {
@@ -1766,6 +1773,7 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
     if (!std::strcmp(n, "vkAcquireNextImageKHR")) return (PFN_vkVoidFunction)Hook_AcquireNextImageKHR;
     if (!std::strcmp(n, "vkQueueSubmit")) return (PFN_vkVoidFunction)Hook_QueueSubmit;
     if (!std::strcmp(n, "vkQueueSubmit2")) return (PFN_vkVoidFunction)Hook_QueueSubmit2;
+    if (!std::strcmp(n, "vkQueueWaitIdle")) return (PFN_vkVoidFunction)Hook_QueueWaitIdle;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
     return nullptr;
 }
@@ -1779,6 +1787,7 @@ static PFN_vkVoidFunction LookupDeviceHook(const char* n) {
     if (!std::strcmp(n, "vkAcquireNextImageKHR")) return (PFN_vkVoidFunction)Hook_AcquireNextImageKHR;
     if (!std::strcmp(n, "vkQueueSubmit")) return (PFN_vkVoidFunction)Hook_QueueSubmit;
     if (!std::strcmp(n, "vkQueueSubmit2")) return (PFN_vkVoidFunction)Hook_QueueSubmit2;
+    if (!std::strcmp(n, "vkQueueWaitIdle")) return (PFN_vkVoidFunction)Hook_QueueWaitIdle;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
     return nullptr;
 }
