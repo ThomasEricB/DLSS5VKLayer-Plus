@@ -856,7 +856,12 @@ static bool CreateImage2DUsage(VkCtx& c, VkFormat fmt, uint32_t w, uint32_t h,
     ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = usage;
-    ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    const uint32_t queueFamilies[] = { c.queueFamily, c.opticalQueueFamily };
+    const bool crossQueue = c.opticalFlow && c.opticalQueueFamily != UINT32_MAX &&
+                            c.opticalQueueFamily != c.queueFamily;
+    ci.sharingMode = crossQueue ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    ci.queueFamilyIndexCount = crossQueue ? 2u : 0u;
+    ci.pQueueFamilyIndices = crossQueue ? queueFamilies : nullptr;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(c.device, &ci, nullptr, &out.image) != VK_SUCCESS) return false;
     out.format = fmt; out.width = w; out.height = h; out.layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -902,7 +907,12 @@ static bool CreateImage2DOpticalFlow(VkCtx& c, VkFormat fmt, uint32_t w, uint32_
     // optical-flow output, which the driver cannot sample/copy as bits).
     ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-    ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    const uint32_t queueFamilies[] = { c.queueFamily, c.opticalQueueFamily };
+    const bool crossQueue = c.opticalFlow && c.opticalQueueFamily != UINT32_MAX &&
+                            c.opticalQueueFamily != c.queueFamily;
+    ci.sharingMode = crossQueue ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    ci.queueFamilyIndexCount = crossQueue ? 2u : 0u;
+    ci.pQueueFamilyIndices = crossQueue ? queueFamilies : nullptr;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(c.device, &ci, nullptr, &out.image) != VK_SUCCESS) return false;
     out.format = fmt; out.width = w; out.height = h; out.layout = VK_IMAGE_LAYOUT_UNDEFINED;
