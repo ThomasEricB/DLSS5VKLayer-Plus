@@ -434,6 +434,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
 // ---------------------------------------------------------------------------
 struct InstanceChain {
     PFN_vkGetInstanceProcAddr next_gipa = nullptr;
+    bool surfaceMaintenance1 = false;
 
     // The instance-level entry points the composition needs, resolved once. Kept here rather than on
     // the device chain because this is where the VkInstance handle is in scope.
@@ -691,6 +692,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(
 
     InstanceChain chain{};
     chain.next_gipa = next_gipa;
+    for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
+        if (!std::strcmp(pCreateInfo->ppEnabledExtensionNames[i],
+                         VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)) {
+            chain.surfaceMaintenance1 = true;
+            break;
+        }
+    }
     chain.vkDestroyInstance = (PFN_vkDestroyInstance)next_gipa(*pInstance, "vkDestroyInstance");
     chain.vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)next_gipa(*pInstance, "vkEnumeratePhysicalDevices");
     chain.vkGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)next_gipa(*pInstance, "vkGetPhysicalDeviceProperties");
@@ -816,30 +824,39 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     // pass is on, the device offers them, and the app did not already enable them. If any of that
     // is false the composition falls back to the next transport down.
     static const char* const kWantExts[] = { VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
-                                             VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-                                             VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-                                             // The repaint's, for handing an image back unpresented.
-                                             VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME };
+                                              VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+                                              VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+                                              // The repaint's, for handing an image back unpresented.
+                                              VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME };
     constexpr size_t kWantCount = sizeof(kWantExts) / sizeof(kWantExts[0]);
+    constexpr size_t kExternalMemoryFd = 1;
     const VkDeviceCreateInfo* effective = pCreateInfo;
     bool addedSwapMaint = false;
     VkDeviceCreateInfo modified = *pCreateInfo;
     std::vector<const char*> enabledExts;
     if (LayerEnabled() && ic && ic->vkEnumerateDeviceExtensionProperties) {
-        bool have[kWantCount] = {};
+        bool available[kWantCount] = {};
+        bool enabled[kWantCount] = {};
         uint32_t n = 0;
         ic->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &n, nullptr);
         std::vector<VkExtensionProperties> avail(n);
         if (n && ic->vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &n, avail.data()) == VK_SUCCESS) {
             for (uint32_t i = 0; i < n; ++i)
                 for (size_t k = 0; k < kWantCount; ++k)
-                    if (!std::strcmp(avail[i].extensionName, kWantExts[k])) have[k] = true;
+                    if (!std::strcmp(avail[i].extensionName, kWantExts[k])) available[k] = true;
         }
         for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i)
             for (size_t k = 0; k < kWantCount; ++k)
-                if (!std::strcmp(pCreateInfo->ppEnabledExtensionNames[i], kWantExts[k])) have[k] = false;
+                    if (!std::strcmp(pCreateInfo->ppEnabledExtensionNames[i], kWantExts[k])) enabled[k] = true;
         for (size_t k = 0; k < kWantCount; ++k) {
-            if (!have[k]) continue;
+            if (!ic->surfaceMaintenance1 &&
+                !std::strcmp(kWantExts[k], VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))
+                continue;
+            if (!available[k] || enabled[k]) continue;
+            // VK_EXT_external_memory_dma_buf requires this device extension.
+            if (!std::strcmp(kWantExts[k], VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) &&
+                !available[kExternalMemoryFd] && !enabled[kExternalMemoryFd])
+                continue;
             if (enabledExts.empty()) {
                 enabledExts.reserve(pCreateInfo->enabledExtensionCount + kWantCount);
                 for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i)
