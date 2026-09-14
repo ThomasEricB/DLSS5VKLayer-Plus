@@ -165,7 +165,7 @@ VK_FN(vkCmdCopyImage) VK_FN(vkCmdPipelineBarrier) VK_FN(vkDeviceWaitIdle)
 VK_FN(vkGetPhysicalDeviceProperties2) VK_FN(vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
 VK_FN(vkCreateOpticalFlowSessionNV) VK_FN(vkDestroyOpticalFlowSessionNV)
 VK_FN(vkBindOpticalFlowSessionImageNV) VK_FN(vkCmdOpticalFlowExecuteNV) VK_FN(vkCmdBlitImage)
-VK_FN(vkCmdPipelineBarrier2) VK_FN(vkCmdWriteTimestamp2)
+VK_FN(vkCmdPipelineBarrier2) VK_FN(vkQueueSubmit2) VK_FN(vkCmdWriteTimestamp2)
 VK_FN(vkCreateQueryPool) VK_FN(vkDestroyQueryPool) VK_FN(vkCmdResetQueryPool)
 VK_FN(vkCmdWriteTimestamp) VK_FN(vkCmdCopyQueryPoolResults)
 VK_FN(vkCreateSemaphore) VK_FN(vkDestroySemaphore) VK_FN(vkCmdClearColorImage)
@@ -317,7 +317,7 @@ static bool CreateContext(VkCtx& c) {
     LOAD(vkGetPhysicalDeviceProperties2) LOAD(vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
     LOAD(vkCreateOpticalFlowSessionNV) LOAD(vkDestroyOpticalFlowSessionNV)
     LOAD(vkBindOpticalFlowSessionImageNV) LOAD(vkCmdOpticalFlowExecuteNV) LOAD(vkCmdBlitImage)
-    LOAD(vkCmdPipelineBarrier2) LOAD(vkCmdWriteTimestamp2)
+    LOAD(vkCmdPipelineBarrier2) LOAD(vkQueueSubmit2) LOAD(vkCmdWriteTimestamp2)
     LOAD(vkCreateQueryPool) LOAD(vkDestroyQueryPool) LOAD(vkCmdResetQueryPool)
     LOAD(vkCmdWriteTimestamp) LOAD(vkCmdCopyQueryPoolResults)
     LOAD(vkCreateSemaphore) LOAD(vkDestroySemaphore) LOAD(vkCmdClearColorImage)
@@ -1020,15 +1020,42 @@ static bool BeginCmd(VkCommandBuffer cb) {
 // blocks on intermediate stages (upload, NVOF prep, flow post).
 static int SubmitAsync(VkCtx& c, VkCommandBuffer cb, VkQueue queue,
                        uint32_t waitCount, const VkSemaphore* waits,
-                       const VkPipelineStageFlags* waitStages, VkSemaphore signal) {
+                       VkPipelineStageFlags2 waitStage, VkSemaphore signal) {
     if (vkEndCommandBuffer(cb) != VK_SUCCESS) return -1;
+    if ((waitCount || signal) && (!c.sync2 || !vkQueueSubmit2)) return -1;
+    if (waitCount || signal) {
+        VkCommandBufferSubmitInfo cbi{};
+        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+        cbi.commandBuffer = cb;
+        VkSemaphoreSubmitInfo wsi{};
+        if (waitCount) {
+            wsi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+            wsi.semaphore = waits[0];
+            wsi.stageMask = waitStage;
+        }
+        VkSemaphoreSubmitInfo ssi{};
+        if (signal) {
+            ssi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+            ssi.semaphore = signal;
+            ssi.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        }
+        VkSubmitInfo2 si2{};
+        si2.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+        si2.waitSemaphoreInfoCount = waitCount;
+        si2.pWaitSemaphoreInfos = waitCount ? &wsi : nullptr;
+        si2.commandBufferInfoCount = 1;
+        si2.pCommandBufferInfos = &cbi;
+        si2.signalSemaphoreInfoCount = signal ? 1u : 0u;
+        si2.pSignalSemaphoreInfos = signal ? &ssi : nullptr;
+        const uint32_t idx = c.fenceCursor;
+        const VkResult sr = vkQueueSubmit2(queue, 1, &si2, c.fences[idx]);
+        if (sr != VK_SUCCESS) { Log("[vk] queue submit2 failed: %d", (int)sr); return -1; }
+        c.fenceCursor = (c.fenceCursor + 1) % VkCtx::kFenceRing;
+        return (int)idx;
+    }
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.waitSemaphoreCount = waitCount;
-    si.pWaitSemaphores = waits;
-    si.pWaitDstStageMask = waitStages;
     si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-    if (signal) { si.signalSemaphoreCount = 1; si.pSignalSemaphores = &signal; }
     const uint32_t idx = c.fenceCursor;
     const VkResult sr = vkQueueSubmit(queue, 1, &si, c.fences[idx]);
     if (sr != VK_SUCCESS) { Log("[vk] queue submit failed: %d", (int)sr); return -1; }
@@ -1044,7 +1071,7 @@ static bool WaitFence(VkCtx& c, int idx) {
 }
 
 static bool SubmitAndWaitQueue(VkCtx& c, VkCommandBuffer cb, VkQueue queue) {
-    const int idx = SubmitAsync(c, cb, queue, 0, nullptr, nullptr, nullptr);
+    const int idx = SubmitAsync(c, cb, queue, 0, nullptr, 0, nullptr);
     return idx >= 0 && WaitFence(c, idx);
 }
 
@@ -1876,7 +1903,8 @@ static bool RunOpticalFlow(NeuralState& ns) {
                      VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV);
 
     WriteFlowTimestampBegin(ns.vk, cb);
-    const int prepFence = SubmitAsync(ns.vk, cb, ns.vk.queue, 0, nullptr, nullptr,
+    const int prepFence = SubmitAsync(ns.vk, cb, ns.vk.queue, 0, nullptr,
+                                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                       async ? ns.vk.semPrep : nullptr);
     if (prepFence < 0) return false;
     if (!async && !WaitFence(ns.vk, prepFence)) return false;
@@ -1892,10 +1920,9 @@ static bool RunOpticalFlow(NeuralState& ns) {
     // invalid in pWaitDstStageMask on the optical-flow-only queue (VUID-00066)
     // and the driver silently drops it; TOP_OF_PIPE releases only after the
     // signaling submit's full first sync scope, ordering everything.
-    const VkPipelineStageFlags flowWaitStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     const int flowFence = SubmitAsync(ns.vk, fcb, ns.vk.opticalQueue,
                                       async ? 1u : 0u, async ? &ns.vk.semPrep : nullptr,
-                                      async ? &flowWaitStage : nullptr,
+                                      VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV,
                                       async ? ns.vk.semFlow : nullptr);
     if (flowFence < 0) { WaitFence(ns.vk, prepFence); return false; }
     if (!async && !WaitFence(ns.vk, flowFence)) { WaitFence(ns.vk, prepFence); return false; }
@@ -1941,10 +1968,9 @@ static bool RunOpticalFlow(NeuralState& ns) {
                        f.prev.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
 
-    const VkPipelineStageFlags postWaitStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     const int postFence = SubmitAsync(ns.vk, cb, ns.vk.queue,
                                       async ? 1u : 0u, async ? &ns.vk.semFlow : nullptr,
-                                      async ? &postWaitStage : nullptr, nullptr);
+                                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, nullptr);
     if (postFence < 0) {
         WaitFence(ns.vk, prepFence); WaitFence(ns.vk, flowFence);
         return false;
