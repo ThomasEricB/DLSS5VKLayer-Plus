@@ -1256,9 +1256,7 @@ void MainWindow::updateStatus() {
 
     const QString dot =
         active ? QString("<span style=\"color:#43a047;\">&#9679; Active</span>")
-               : idle ? QString("<span style=\"color:#fb8c00;\">&#9679; Idle</span>"
-                                "<span style=\"color:#9e9e9e;\"> &mdash; attached, no frames "
-                                "(paused or in the background)</span>")
+               : idle ? QString("<span style=\"color:#fb8c00;\">&#9679; Idle</span>")
                       : QString("<span style=\"color:#9e9e9e;\">&#9675; Inactive</span>");
     statusLabel->setText(QString("Helper: %1&nbsp;&nbsp;&nbsp;%2").arg(state.toHtmlEscaped(), dot));
 
