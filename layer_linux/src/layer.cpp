@@ -1141,7 +1141,6 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
             if (sc.fenceLeg1) dc->vkDestroyFence(device, sc.fenceLeg1, nullptr);
             if (sc.fenceLeg2) dc->vkDestroyFence(device, sc.fenceLeg2, nullptr);
             if (sc.repaintFence) dc->vkDestroyFence(device, sc.repaintFence, nullptr);
-        if (sc.repaintFence) dc->vkDestroyFence(device, sc.repaintFence, nullptr);
             if (sc.pool) dc->vkDestroyCommandPool(device, sc.pool, nullptr);
         }
         dc->swapchains.clear();
